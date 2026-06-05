@@ -1,6 +1,6 @@
-# IKIDE 1.0
+# IKIDE
 
-The **IKIDE** is the official Integrated Development Environment (IDE) for the **ik8b** language. It provides an intuitive, graphical interface equipped with real-time diagnostics, an integrated AVR simulator, and direct microcontroller flashing via `avrdude`.
+The **IKIDE** is the official Integrated Development Environment (IDE) for the **ik** language. It provides an intuitive, graphical interface equipped with real-time diagnostics, an integrated AVR simulator, and direct microcontroller flashing via `avrdude`.
 
 ---
 
