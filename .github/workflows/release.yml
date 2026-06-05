@@ -3,7 +3,7 @@ name: Build Release
 on:
   push:
     branches: [ "master" ]
-  workflow_dispatch: # Allows you to manually trigger the build from the GitHub UI
+  workflow_dispatch:
 
 jobs:
   build:
@@ -29,7 +29,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          submodules: recursive # Automatically pulls ik8b and avr-vm tools
+          submodules: recursive
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -45,8 +45,37 @@ jobs:
       - name: Build Release Binary
         run: cargo build --release --target ${{ matrix.target }}
 
+      - name: Rename Binary
+        shell: bash
+        run: mv target/${{ matrix.target }}/release/${{ matrix.binary }} target/${{ matrix.target }}/release/${{ matrix.artifact_name }}
+
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact_name }}
-          path: target/${{ matrix.target }}/release/${{ matrix.binary }}
+          path: target/${{ matrix.target }}/release/${{ matrix.artifact_name }}
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release_assets
+          merge-multiple: true
+
+      - name: Get Short SHA
+        id: short_sha
+        run: echo "sha=$(echo ${{ github.sha }} | cut -c1-7)" >> $GITHUB_OUTPUT
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ikide-0.1.0-${{ steps.short_sha.outputs.sha }}
+          name: IKIDE 0.1.0 (${{ steps.short_sha.outputs.sha }})
+          files: release_assets/*
+          generate_release_notes: true
