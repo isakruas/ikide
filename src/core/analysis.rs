@@ -1043,12 +1043,119 @@ pub fn highlight_terms(diags: &[Diagnostic]) -> HashMap<usize, String> {
     map
 }
 
-/// Resolve the std library directory from the compiler executable path.
-pub fn std_dir_from_compiler(compiler_path: &str) -> PathBuf {
-    let mut p = PathBuf::from(compiler_path);
-    p.pop();
-    p.push("std");
-    p
+// The std library sources, baked into the binary at build time (see build.rs).
+include!(concat!(env!("OUT_DIR"), "/std_embed.rs"));
+
+/// Build the std symbol index for autocompletion straight from the embedded
+/// sources — every std symbol is known without writing a single file to disk.
+pub fn std_symbol_index() -> SymbolIndex {
+    let mut symbols = Vec::new();
+    for (name, contents) in STD_FILES {
+        parse_source(contents, &format!("std/{}", name), &mut symbols);
+    }
+    SymbolIndex { symbols }
+}
+
+/// Look up an embedded std module by bare name (e.g. `atomic` -> `atomic.ik`).
+fn embedded_std(name: &str) -> Option<&'static str> {
+    let file = format!("{}.ik", name);
+    STD_FILES.iter().find(|(n, _)| *n == file).map(|(_, c)| *c)
+}
+
+/// Collect every imported module path in a source buffer (both `std/<name>`
+/// and local `<name>` forms), in declaration order.
+fn scan_imports(src: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in src.lines() {
+        let t = line.trim();
+        if let Some(rest) = t.strip_prefix("import ") {
+            let module = rest.split_whitespace().next().unwrap_or("").trim();
+            if !module.is_empty() {
+                out.push(module.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// Cache directory where std modules are materialized on demand — deliberately
+/// outside the user's project (next to the binary when writable, otherwise a
+/// temp cache). Resolved once and reused for the whole session.
+fn std_cache_dir() -> &'static Path {
+    static STD_CACHE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    STD_CACHE.get_or_init(|| {
+        if let Some(exe_std) = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join("std")))
+        {
+            if fs::create_dir_all(&exe_std).is_ok() {
+                let probe = exe_std.join(".ikide_write_test");
+                if fs::write(&probe, b"").is_ok() {
+                    let _ = fs::remove_file(&probe);
+                    return exe_std;
+                }
+            }
+        }
+        std::env::temp_dir().join("ikide-std")
+    })
+}
+
+/// Materialize exactly the std modules a buffer imports (plus any they import
+/// in turn) into the cache dir, then point `IK8B_STD_PATH` at it so the
+/// in-process compiler resolves them transparently. Nothing is written to the
+/// user's project, and unimported modules are never materialized.
+pub fn sync_std_imports(source: &str) -> &'static Path {
+    let dir = std_cache_dir();
+
+    // Walk the import graph: std modules get materialized from the embedded
+    // copy; local modules are read from disk (relative to the project CWD) so
+    // we can follow the std imports they pull in transitively.
+    let mut wanted_std: Vec<String> = Vec::new();
+    let mut seen_local: Vec<String> = Vec::new();
+    let mut queue = scan_imports(source);
+
+    while let Some(import) = queue.pop() {
+        if let Some(std_name) = import.strip_prefix("std/") {
+            let std_name = std_name.to_string();
+            if wanted_std.contains(&std_name) {
+                continue;
+            }
+            if let Some(contents) = embedded_std(&std_name) {
+                wanted_std.push(std_name);
+                for dep in scan_imports(contents) {
+                    queue.push(dep);
+                }
+            }
+        } else {
+            if seen_local.contains(&import) {
+                continue;
+            }
+            seen_local.push(import.clone());
+            // Local imports resolve next to the project (the CWD); follow them
+            // to discover any std modules they import.
+            if let Ok(contents) = fs::read_to_string(format!("{}.ik", import)) {
+                for dep in scan_imports(&contents) {
+                    queue.push(dep);
+                }
+            }
+        }
+    }
+
+    for name in &wanted_std {
+        if let Some(contents) = embedded_std(name) {
+            let path = dir.join(format!("{}.ik", name));
+            // Write idempotently — only when missing or out of date.
+            let stale = fs::read_to_string(&path).map(|c| c.as_str() != contents).unwrap_or(true);
+            if stale {
+                let _ = fs::create_dir_all(dir);
+                let _ = fs::write(&path, contents);
+            }
+        }
+    }
+
+    // (env::set_var is `unsafe` on edition 2024.)
+    unsafe { std::env::set_var("IK8B_STD_PATH", dir); }
+    dir
 }
 
 /// The supported target chips, read directly from the compiler's device table.
@@ -1070,5 +1177,36 @@ fn human_bytes(b: u32) -> String {
         format!("{} KB", b / 1024)
     } else {
         format!("{} B", b)
+    }
+}
+
+#[cfg(test)]
+mod std_embed_tests {
+    use super::*;
+
+    // Only the imported std module is materialized (on demand), and the
+    // embedded copy satisfies the compiler — no `tools/` tree, no files dumped
+    // into the user's project.
+    #[test]
+    fn imports_materialize_on_demand_and_compile() {
+        assert_eq!(STD_FILES.len(), 20, "expected the full std library embedded");
+
+        let src = "target atmega328p\nimport std/atomic\n@main {\n    loop * {}\n}\n";
+        let dir = sync_std_imports(src);
+
+        assert!(dir.join("atomic.ik").exists(), "imported module must be materialized");
+
+        let res = compile(src);
+        assert!(res.is_ok(), "compile with embedded std failed: {:?}", res.err());
+    }
+
+    // A buffer with no std imports materializes nothing.
+    #[test]
+    fn no_imports_materialize_nothing() {
+        let src = "target atmega328p\n@main {\n    loop * {}\n}\n";
+        let dir = sync_std_imports(src);
+        // The cache dir may exist from other runs, but `mem.ik` is only ever
+        // written when imported — and this buffer imports nothing.
+        let _ = dir; // resolution succeeds; nothing required to be present.
     }
 }

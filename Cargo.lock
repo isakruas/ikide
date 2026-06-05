@@ -1635,12 +1635,17 @@ name = "ik8b"
 version = "0.1.0"
 
 [[package]]
+name = "ik8bvm"
+version = "0.1.0"
+
+[[package]]
 name = "ikide"
 version = "0.1.0"
 dependencies = [
  "eframe",
  "egui_extras",
  "ik8b",
+ "ik8bvm",
  "rfd",
  "serde",
  "serde_json",

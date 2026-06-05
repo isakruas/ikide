@@ -66,9 +66,14 @@ pub struct IkIdeApp {
     pub show_preferences: bool,
     pub is_busy: bool,
     
-    pub compiler_path: String,
-    pub vm_path: String,
+    // In-process simulation preferences.
     pub vm_max_cycles: u32,
+    pub sim_trace: bool,
+    pub sim_dump_regs: bool,
+    pub sim_peek_addr: String,
+    pub sim_peek_len: u32,
+    /// Structured snapshot from the most recent simulation run.
+    pub vm_result: Option<crate::core::runner::VmResult>,
 
     // Avrdude upload preferences
     pub avrdude_path: String,
@@ -91,16 +96,11 @@ pub struct IkIdeApp {
 impl Default for IkIdeApp {
     fn default() -> Self {
         let (tx, rx) = mpsc::channel();
-        let compiler_path = std::fs::canonicalize("tools/ik8b")
-            .unwrap_or_else(|_| PathBuf::from("tools/ik8b"))
-            .to_string_lossy()
-            .into_owned();
-        let std_dir = analysis::std_dir_from_compiler(&compiler_path);
-        // Let the in-process compiler front end resolve `import`s against std.
-        // (env::set_var is `unsafe` on edition 2024.)
-        unsafe { std::env::set_var("IK8B_STD_PATH", &std_dir); }
-        // Index the std library once at startup (cheap line scan).
-        let std_index = SymbolIndex::from_dir(&std_dir);
+        // Index the std library straight from the sources baked into the binary
+        // — every std symbol is known for completion without writing any file.
+        // Modules are only materialized to disk on demand, when imported, by
+        // `analysis::sync_std_imports` (kept out of the user's project).
+        let std_index = analysis::std_symbol_index();
         // Supported target chips, straight from the compiler's device table.
         let devices = analysis::load_devices();
 
@@ -123,9 +123,12 @@ impl Default for IkIdeApp {
             show_minimap: true,
             show_preferences: false,
             is_busy: false,
-            compiler_path,
-            vm_path: std::fs::canonicalize("tools/avr-vm/bin/avr_vm").unwrap_or_else(|_| PathBuf::from("tools/avr-vm/bin/avr_vm")).to_string_lossy().into_owned(),
             vm_max_cycles: 2000000,
+            sim_trace: true,
+            sim_dump_regs: true,
+            sim_peek_addr: String::new(),
+            sim_peek_len: 1,
+            vm_result: None,
             avrdude_path: "avrdude".to_string(),
             avrdude_programmer: "usbasp".to_string(),
             avrdude_port: "usb".to_string(),
@@ -153,6 +156,28 @@ impl IkIdeApp {
                 let folder = rfd::FileDialog::new().pick_folder();
                 let _ = tx.send(folder);
             });
+        }
+    }
+
+    /// Assemble the simulation knobs from the current preferences, parsing the
+    /// optional memory-peek address (accepts `0x`-hex or decimal; blank = off).
+    pub fn sim_config(&self) -> crate::core::runner::SimConfig {
+        let peek_addr = {
+            let s = self.sim_peek_addr.trim();
+            if s.is_empty() {
+                None
+            } else if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+                u32::from_str_radix(hex, 16).ok()
+            } else {
+                s.parse::<u32>().ok()
+            }
+        };
+        crate::core::runner::SimConfig {
+            max_instr: self.vm_max_cycles,
+            trace: self.sim_trace,
+            dump_regs: self.sim_dump_regs,
+            peek_addr,
+            peek_len: self.sim_peek_len.max(1),
         }
     }
 
@@ -190,6 +215,9 @@ impl IkIdeApp {
         }
         match self.last_edit {
             Some(t) if t.elapsed() >= CHECK_DEBOUNCE => {
+                // Materialize any std modules this buffer imports so the
+                // in-process front end can resolve them, then type-check.
+                analysis::sync_std_imports(&content);
                 // Fast and synchronous: it's the real lexer + parser, in-process.
                 self.diagnostics = analysis::check(&content);
                 self.last_checked_content = content;
@@ -256,6 +284,9 @@ impl IkIdeApp {
                 }
                 TaskMsg::Vm(out) => {
                     self.vm_output.push_str(&out);
+                }
+                TaskMsg::VmResult(res) => {
+                    self.vm_result = Some(res);
                 }
                 TaskMsg::Upload(out) => {
                     self.terminal_output.push_str(&out);
@@ -432,13 +463,14 @@ impl eframe::App for IkIdeApp {
                 self.is_busy = true;
                 self.show_vm_trace = true;
                 self.vm_output.clear();
-                self.vm_output.push_str("--- VM Trace Starting ---\n");
+                self.vm_result = None;
+                self.vm_output.push_str("--- Simulation Starting ---\n");
                 let (path, text) = if let Some(idx) = self.active_tab {
                     (Some(self.open_tabs[idx].path.clone()), self.open_tabs[idx].content.clone())
                 } else {
                     (None, String::new())
                 };
-                runner::spawn_simulate(self.workspace_dir.clone(), path, text, self.task_tx.clone(), self.vm_path.clone(), self.vm_max_cycles);
+                runner::spawn_simulate(self.workspace_dir.clone(), path, text, self.task_tx.clone(), self.sim_config());
             }
         }
 
@@ -447,6 +479,10 @@ impl eframe::App for IkIdeApp {
             if let Ok(folder_opt) = rx.try_recv() {
                 self.dialog_rx = None;
                 if let Some(folder) = folder_opt {
+                    // Make the project root the process CWD so the compiler
+                    // resolves local `import <module>` (resolved relative to the
+                    // current directory) against the user's project.
+                    let _ = std::env::set_current_dir(&folder);
                     self.workspace_dir = Some(folder);
                     self.open_tabs.clear();
                     self.active_tab = None;
@@ -506,7 +542,7 @@ impl eframe::App for IkIdeApp {
                 
                 ui.menu_button("View", |ui| {
                     ui.checkbox(&mut self.show_terminal, "Output");
-                    ui.checkbox(&mut self.show_vm_trace, "VM Trace");
+                    ui.checkbox(&mut self.show_vm_trace, "Simulation");
                     ui.checkbox(&mut self.show_stats, "Resource Stats");
                     ui.checkbox(&mut self.show_minimap, "Minimap");
                     ui.separator();
@@ -533,11 +569,12 @@ impl eframe::App for IkIdeApp {
                         self.is_busy = true;
                         self.show_vm_trace = true;
                         self.vm_output.clear();
-                        self.vm_output.push_str("--- VM Trace Starting ---\n");
+                        self.vm_result = None;
+                        self.vm_output.push_str("--- Simulation Starting ---\n");
                         let (path, text) = if let Some(idx) = self.active_tab {
                             (Some(self.open_tabs[idx].path.clone()), self.open_tabs[idx].content.clone())
                         } else { (None, String::new()) };
-                        runner::spawn_simulate(self.workspace_dir.clone(), path, text, self.task_tx.clone(), self.vm_path.clone(), self.vm_max_cycles);
+                        runner::spawn_simulate(self.workspace_dir.clone(), path, text, self.task_tx.clone(), self.sim_config());
                         ui.close_menu();
                     }
                     if ui.add_enabled(!self.is_busy && self.active_tab.is_some(), egui::Button::new("🔌 Upload to Board")).clicked() {
@@ -578,23 +615,39 @@ impl eframe::App for IkIdeApp {
                 .open(&mut show)
                 .show(ctx, |ui| {
                     ui.label(egui::RichText::new("⚙ Preferences").strong());
+                    ui.label(egui::RichText::new("Compiler & simulator are built in — only their settings are exposed.").weak().small());
                     ui.separator();
-                    egui::Grid::new("prefs_grid").num_columns(2).spacing([10.0, 10.0]).show(ui, |ui| {
-                        ui.label("Compiler Path:");
-                        ui.text_edit_singleline(&mut self.compiler_path);
-                        ui.end_row();
-                        
-                        ui.label("VM Path:");
-                        ui.text_edit_singleline(&mut self.vm_path);
-                        ui.end_row();
-                        
-                        ui.label("VM Max Cycles:");
-                        ui.add(egui::DragValue::new(&mut self.vm_max_cycles).speed(1000).range(1..=100_000_000));
-                        ui.end_row();
+
+                    egui::CollapsingHeader::new("Simulation").default_open(true).show(ui, |ui| {
+                        ui.label(egui::RichText::new("Runs in-process — no external VM binary.").weak().small());
+                        egui::Grid::new("sim_grid").num_columns(2).spacing([10.0, 10.0]).show(ui, |ui| {
+                            ui.label("Max Instructions:");
+                            ui.add(egui::DragValue::new(&mut self.vm_max_cycles).speed(1000).range(0..=1_000_000_000))
+                                .on_hover_text("Stop after this many executed instructions. 0 = run until the core halts.");
+                            ui.end_row();
+
+                            ui.label("Instruction Trace:");
+                            ui.checkbox(&mut self.sim_trace, "Log each executed instruction (-t)")
+                                .on_hover_text("Capture a per-instruction trace into the log. Capped to keep the UI responsive.");
+                            ui.end_row();
+
+                            ui.label("Dump Registers:");
+                            ui.checkbox(&mut self.sim_dump_regs, "Append register/flag dump to the log");
+                            ui.end_row();
+
+                            ui.label("Memory Peek Addr:");
+                            ui.text_edit_singleline(&mut self.sim_peek_addr)
+                                .on_hover_text("Data-space address to read at the end of the run (0x-hex or decimal). Blank = off.");
+                            ui.end_row();
+
+                            ui.label("Peek Length:");
+                            ui.add(egui::DragValue::new(&mut self.sim_peek_len).speed(1).range(1..=256));
+                            ui.end_row();
+                        });
                     });
-                    
+
                     ui.add_space(5.0);
-                    
+
                     egui::CollapsingHeader::new("Avrdude Configuration").default_open(true).show(ui, |ui| {
                         egui::Grid::new("avrdude_grid").num_columns(2).spacing([10.0, 10.0]).show(ui, |ui| {
                             ui.label("Executable Path:");

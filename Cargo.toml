@@ -13,3 +13,5 @@ serde_json = "1.0"
 # The ik8b compiler, linked as a library so the IDE shares the exact same
 # lexer/parser/device table (vendored as a submodule under tools/).
 ik8b = { path = "tools/ik8b" }
+# The ik8bvm AVR simulator, linked as a library so the IDE runs simulations
+ik8bvm = { path = "tools/ik8bvm" }
