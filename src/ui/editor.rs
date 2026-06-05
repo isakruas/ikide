@@ -1,0 +1,405 @@
+// Copyright 2026 The IKIDE Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use std::collections::{HashMap, HashSet};
+use std::time::Instant;
+use eframe::egui;
+use crate::app::IkIdeApp;
+use crate::core::analysis;
+use crate::syntax;
+
+pub fn render(app: &mut IkIdeApp, ctx: &egui::Context) {
+    // Build per-line lookups from the live diagnostics (compiler + lints).
+    let diags = app.all_diagnostics();
+    let error_terms: HashMap<usize, String> = analysis::highlight_terms(&diags);
+    let error_lines: HashSet<usize> = diags.iter().filter(|d| d.line > 0).map(|d| d.line).collect();
+
+    egui::CentralPanel::default().show(ctx, |ui| {
+        if app.open_tabs.is_empty() {
+            ui.centered_and_justified(|ui| {
+                ui.label("No file open");
+            });
+            return;
+        }
+
+        // Tab bar
+        egui::ScrollArea::horizontal().id_salt("tabs_scroll").show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let mut close_tab = None;
+                for (idx, tab) in app.open_tabs.iter().enumerate() {
+                    let is_active = app.active_tab == Some(idx);
+                    let title = tab.path.file_name().unwrap_or_default().to_string_lossy();
+                    let display_title = if tab.is_modified { format!("{} *", title) } else { title.into_owned() };
+                    
+                    let response = ui.selectable_label(is_active, display_title);
+                    if response.clicked() {
+                        app.active_tab = Some(idx);
+                    }
+                    // Middle click to close tab
+                    if response.middle_clicked() {
+                        close_tab = Some(idx);
+                    }
+                    
+                    // Add a small X button for closing
+                    if ui.button("✖").clicked() {
+                        close_tab = Some(idx);
+                    }
+                    ui.separator();
+                }
+                
+                if let Some(idx) = close_tab {
+                    app.open_tabs.remove(idx);
+                    if let Some(active) = app.active_tab {
+                        if active == idx {
+                            app.active_tab = if app.open_tabs.is_empty() { None } else { Some(app.open_tabs.len().saturating_sub(1)) };
+                        } else if active > idx {
+                            app.active_tab = Some(active - 1);
+                        }
+                    }
+                }
+            });
+        });
+        
+        ui.separator();
+
+        if let Some(idx) = app.active_tab {
+            if idx < app.open_tabs.len() {
+                let tab = &mut app.open_tabs[idx];
+                
+                let theme = syntax::CodeTheme::default();
+
+
+                let offset_y: f32 = ui.data(|d| d.get_temp(egui::Id::new("editor_y_offset")).unwrap_or(0.0));
+                let content_h: f32 = ui.data(|d| d.get_temp(egui::Id::new("editor_content_h")).unwrap_or(1.0));
+                let view_h: f32 = ui.data(|d| d.get_temp(egui::Id::new("editor_view_h")).unwrap_or(1.0));
+
+                if app.show_minimap {
+                    egui::SidePanel::right("minimap_panel")
+                        .resizable(true)
+                        .default_width(120.0)
+                        .show_inside(ui, |ui| {
+                            egui::ScrollArea::both()
+                                .id_salt("minimap_scroll")
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    let layout_job = syntax::highlight(&tab.content, &theme, 3.5, &error_terms, None);
+                                    let label_resp = ui.add(
+                                        egui::Label::new(layout_job)
+                                            .selectable(false)
+                                            .sense(egui::Sense::click_and_drag())
+                                    );
+                                    
+                                    if content_h > 0.0 {
+                                        let ratio_y = offset_y / content_h;
+                                        let ratio_h = view_h / content_h;
+                                        
+                                        let rect_y = label_resp.rect.top() + label_resp.rect.height() * ratio_y;
+                                        let rect_h = label_resp.rect.height() * ratio_h;
+                                        
+                                        let highlight_rect = egui::Rect::from_min_size(
+                                            egui::pos2(label_resp.rect.left(), rect_y),
+                                            egui::vec2(label_resp.rect.width(), rect_h)
+                                        );
+                                        
+                                        ui.painter().rect_filled(highlight_rect, 0.0, egui::Color32::from_white_alpha(30));
+                                        
+                                        if label_resp.dragged() || label_resp.clicked() {
+                                            if let Some(pos) = label_resp.interact_pointer_pos() {
+                                                let local_y = pos.y - label_resp.rect.top();
+                                                let minimap_h = label_resp.rect.height();
+                                                let target_ratio = local_y / minimap_h;
+                                                
+                                                let target_offset = (target_ratio * content_h) - (view_h / 2.0);
+                                                let target_offset = target_offset.clamp(0.0, (content_h - view_h).max(0.0));
+                                                
+                                                ui.data_mut(|d| d.insert_temp(egui::Id::new("editor_force_scroll"), target_offset));
+                                            }
+                                        }
+                                    }
+                                });
+                        });
+                }
+
+                let force_scroll: Option<f32> = ui.data_mut(|d| {
+                    let val = d.get_temp(egui::Id::new("editor_force_scroll"));
+                    if val.is_some() {
+                        d.remove_temp::<f32>(egui::Id::new("editor_force_scroll"));
+                    }
+                    val
+                });
+
+                let mut editor_scroll = egui::ScrollArea::both().id_salt("editor_scroll");
+                if let Some(target) = force_scroll {
+                    editor_scroll = editor_scroll.vertical_scroll_offset(target);
+                }
+
+                let output = editor_scroll.show(ui, |ui| {
+                    // Top-align the row so the line-number column and the code
+                    // share the same first-row baseline (default horizontal()
+                    // centers them, which misaligns when their heights differ).
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {
+                        let lines_count = tab.content.lines().count().max(1);
+                        let extra_line = if tab.content.ends_with('\n') || tab.content.is_empty() { 1 } else { 0 };
+                        let total_lines = lines_count + extra_line;
+                        
+                        let digits = total_lines.to_string().len().max(3);
+                        let mut line_numbers = egui::text::LayoutJob::default();
+                        let format_normal = egui::TextFormat::simple(egui::FontId::monospace(14.0), egui::Color32::from_gray(100));
+                        let mut format_error = egui::TextFormat::simple(egui::FontId::monospace(14.0), egui::Color32::RED);
+                        format_error.background = egui::Color32::from_rgba_unmultiplied(255, 0, 0, 50);
+                        
+                        for i in 1..=total_lines {
+                            // No trailing newline on the last row, so the gutter
+                            // is exactly as tall as the text and rows line up.
+                            let text = if i == total_lines {
+                                format!("{:>width$}", i, width = digits)
+                            } else {
+                                format!("{:>width$}\n", i, width = digits)
+                            };
+                            if error_lines.contains(&i) {
+                                line_numbers.append(&text, 0.0, format_error.clone());
+                            } else {
+                                line_numbers.append(&text, 0.0, format_normal.clone());
+                            }
+                        }
+
+                        ui.add(egui::Label::new(line_numbers).wrap_mode(egui::TextWrapMode::Extend));
+
+                        ui.separator();
+                        
+                        let text_edit_id = ui.id().with("editor_multiline");
+                        let mut layouter = |ui: &egui::Ui, string: &str, wrap_width: f32| {
+                            let mut selection = None;
+                            if let Some(state) = egui::TextEdit::load_state(ui.ctx(), text_edit_id) {
+                                if let Some(range) = state.cursor.char_range() {
+                                    let min_idx = range.primary.index.min(range.secondary.index);
+                                    let max_idx = range.primary.index.max(range.secondary.index);
+                                    if min_idx != max_idx {
+                                        selection = Some((min_idx, max_idx));
+                                    }
+                                }
+                            }
+                            let mut layout_job = syntax::highlight(string, &theme, 14.0, &error_terms, selection);
+                            layout_job.wrap.max_width = wrap_width;
+                            ui.fonts(|f| f.layout_job(layout_job))
+                        };
+                        
+                        let mut text = tab.content.clone();
+                        let text_edit_output = egui::TextEdit::multiline(&mut text)
+                            .id(text_edit_id)
+                            .font(egui::TextStyle::Monospace)
+                            .code_editor()
+                            .frame(false) // removes the dark background block
+                            .desired_width(f32::INFINITY)
+                            .margin(egui::vec2(0.0, 0.0)) // Disable all margin for perfect alignment
+                            .layouter(&mut layouter)
+                            .show(ui);
+                            
+                        let response = text_edit_output.response;
+                        
+                        if response.changed() {
+                            if text.contains('\t') {
+                                // Tab inserts 4 spaces. A plain global replace would
+                                // leave the cursor 3 chars behind each converted tab,
+                                // so move it to *after* the inserted spaces.
+                                if let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), response.id) {
+                                    let cursor = state.cursor.char_range()
+                                        .map(|r| r.primary.index)
+                                        .unwrap_or_else(|| text.chars().count());
+                                    let tabs_before = text.chars().take(cursor).filter(|&c| c == '\t').count();
+                                    text = text.replace('\t', "    ");
+                                    let c = egui::text::CCursor::new(cursor + tabs_before * 3);
+                                    state.cursor.set_char_range(Some(egui::text::CCursorRange { primary: c, secondary: c }));
+                                    egui::TextEdit::store_state(ui.ctx(), response.id, state);
+                                } else {
+                                    text = text.replace('\t', "    ");
+                                }
+                            }
+                            crate::syntax::auto_import(&mut text);
+                            tab.content = text.clone();
+                            tab.is_modified = true;
+                            // Restart the live type-check debounce timer.
+                            app.last_edit = Some(Instant::now());
+                        }
+
+                        if let Some(state) = egui::TextEdit::load_state(ui.ctx(), response.id) {
+                            if let Some(range) = state.cursor.char_range() {
+                                let cursor_idx = range.primary.index;
+                                let text_up_to_cursor: String = text.chars().take(cursor_idx).collect();
+                                let force_autocomplete = ui.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Space));
+                                let key = egui::Id::new("autocomplete_sugs");
+                                let is_sug_open = ui.data_mut(|d| d.get_temp::<(usize, usize, Vec<analysis::CompletionItem>)>(key)).is_some();
+
+                                if force_autocomplete || is_sug_open {
+                                    // Split the prefix into tokens to find the word under the
+                                    // cursor and the token before it (for context completions).
+                                    let parts: Vec<&str> = text_up_to_cursor
+                                        .split(|c: char| c.is_whitespace() || "{}[]()".contains(c))
+                                        .collect();
+                                    let word = parts.last().copied().unwrap_or("");
+                                    let nonempty: Vec<&str> = parts.iter().copied().filter(|s| !s.is_empty()).collect();
+                                    let prev_word = if word.is_empty() {
+                                        nonempty.last().copied().unwrap_or("")
+                                    } else {
+                                        nonempty.get(nonempty.len().saturating_sub(2)).copied().unwrap_or("")
+                                    };
+
+                                    let index = app.std_index.with_buffer(&text);
+                                    let items = analysis::completions(&index, word, prev_word, &app.devices, force_autocomplete || is_sug_open);
+                                    if items.is_empty() {
+                                        ui.data_mut(|d| d.remove_temp::<(usize, usize, Vec<analysis::CompletionItem>)>(key));
+                                    } else {
+                                        ui.data_mut(|d| d.insert_temp(key, (word.chars().count(), cursor_idx, items)));
+                                    }
+                                }
+                            }
+                        }
+
+                        // Close popup if Escape is pressed
+                        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                            ui.data_mut(|d| d.remove_temp::<(usize, usize, Vec<analysis::CompletionItem>)>(egui::Id::new("autocomplete_sugs")));
+                        }
+
+                        // Detect a selected single word so a keyword reference card
+                        // can be shown for it (e.g. select `flash` or `switch`).
+                        let mut selected: Option<(usize, usize, String)> = None;
+                        if let Some(state) = egui::TextEdit::load_state(ui.ctx(), response.id) {
+                            if let Some(range) = state.cursor.char_range() {
+                                let a = range.primary.index.min(range.secondary.index);
+                                let b = range.primary.index.max(range.secondary.index);
+                                if b > a && b - a <= 12 {
+                                    let sel: String = text.chars().skip(a).take(b - a).collect();
+                                    selected = Some((a, b, sel.trim().to_string()));
+                                }
+                            }
+                        }
+                        ui.data_mut(|d| match selected {
+                            Some(t) => d.insert_temp(egui::Id::new("kw_help_word"), t),
+                            None => {
+                                d.remove_temp::<(usize, usize, String)>(egui::Id::new("kw_help_word"));
+                            }
+                        });
+
+                        if let Some(cursor_range) = text_edit_output.cursor_range {
+                            let rect = text_edit_output.galley.pos_from_cursor(&cursor_range.primary);
+                            let screen_pos = text_edit_output.galley_pos + rect.min.to_vec2();
+                            ui.data_mut(|d| {
+                                d.insert_temp(egui::Id::new("cursor_screen_pos"), screen_pos);
+                                d.insert_temp(egui::Id::new("cursor_idx"), cursor_range.primary.ccursor.index);
+                            });
+                        }
+                    });
+                });
+                
+                let key = egui::Id::new("autocomplete_sugs");
+                let sugs: Option<(usize, usize, Vec<analysis::CompletionItem>)> = ui.data_mut(|d| d.get_temp(key));
+                if let Some((word_len, cursor_idx, items)) = sugs {
+                    let mut pos = ui.data_mut(|d| d.get_temp::<egui::Pos2>(egui::Id::new("cursor_screen_pos"))).unwrap_or(ctx.pointer_latest_pos().unwrap_or(egui::pos2(100.0, 100.0)));
+                    pos.y += 20.0;
+                    egui::Window::new("Assistant")
+                        .title_bar(false)
+                        .resizable(false)
+                        .collapsible(false)
+                        .fixed_pos(pos)
+                        .show(ctx, |ui| {
+                            ui.label(egui::RichText::new("💡 Suggestions").strong().color(egui::Color32::YELLOW));
+                            ui.separator();
+                            egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+                                for item in &items {
+                                    let clicked = ui.horizontal(|ui| {
+                                        let mut btn = ui.button(
+                                            egui::RichText::new(&item.label).monospace().color(egui::Color32::from_rgb(100, 200, 255))
+                                        );
+                                        if !item.doc.is_empty() {
+                                            btn = btn.on_hover_text(&item.doc);
+                                        }
+                                        if !item.detail.is_empty() {
+                                            ui.label(
+                                                egui::RichText::new(&item.detail).monospace().color(egui::Color32::from_gray(150))
+                                            );
+                                        }
+                                        btn.clicked()
+                                    }).inner;
+
+                                    if clicked {
+                                        let start_idx = cursor_idx.saturating_sub(word_len);
+                                        let prefix: String = tab.content.chars().take(start_idx).collect();
+                                        let suffix: String = tab.content.chars().skip(cursor_idx).collect();
+                                        tab.content = format!("{}{}{}", prefix, item.insert, suffix);
+                                        tab.is_modified = true;
+                                        app.last_edit = Some(Instant::now());
+                                        ui.data_mut(|d| d.remove_temp::<(usize, usize, Vec<analysis::CompletionItem>)>(key));
+                                    }
+                                }
+                            });
+                        });
+                }
+
+                // Keyword reference card: shown when a single keyword/type is
+                // selected and no completion popup is open.
+                let autocomplete_open = ui
+                    .data_mut(|d| d.get_temp::<(usize, usize, Vec<analysis::CompletionItem>)>(egui::Id::new("autocomplete_sugs")))
+                    .is_some();
+                if !autocomplete_open {
+                    if let Some((sel_start, sel_end, word)) = ui.data_mut(|d| d.get_temp::<(usize, usize, String)>(egui::Id::new("kw_help_word"))) {
+                        if let Some(help) = analysis::keyword_help(&word) {
+                            let mut pos = ui
+                                .data_mut(|d| d.get_temp::<egui::Pos2>(egui::Id::new("cursor_screen_pos")))
+                                .unwrap_or(egui::pos2(120.0, 120.0));
+                            pos.y += 20.0;
+                            egui::Window::new("KeywordHelp")
+                                .title_bar(false)
+                                .resizable(false)
+                                .collapsible(false)
+                                .fixed_pos(pos)
+                                .show(ctx, |ui| {
+                                    ui.set_max_width(380.0);
+                                    ui.label(egui::RichText::new(&help.title).strong().color(egui::Color32::from_rgb(120, 200, 255)));
+                                    ui.separator();
+                                    ui.label(egui::RichText::new(&help.doc).small());
+                                    ui.add_space(6.0);
+                                    ui.label(egui::RichText::new("Example").small().weak());
+                                    let theme = syntax::CodeTheme::default();
+                                    let empty: HashMap<usize, String> = HashMap::new();
+                                    let job = syntax::highlight(&help.snippet, &theme, 13.0, &empty, None);
+                                    egui::Frame::none()
+                                        .fill(egui::Color32::from_gray(28))
+                                        .inner_margin(egui::Margin::same(6.0))
+                                        .show(ui, |ui| {
+                                            ui.add(egui::Label::new(job).wrap_mode(egui::TextWrapMode::Extend));
+                                        });
+                                    ui.add_space(6.0);
+                                    // Insert the example, replacing the selected keyword.
+                                    if ui.button(egui::RichText::new("📋 Insert example").color(egui::Color32::from_rgb(120, 220, 140))).clicked() {
+                                        let prefix: String = tab.content.chars().take(sel_start).collect();
+                                        let suffix: String = tab.content.chars().skip(sel_end).collect();
+                                        tab.content = format!("{}{}{}", prefix, help.snippet, suffix);
+                                        tab.is_modified = true;
+                                        app.last_edit = Some(Instant::now());
+                                        ui.data_mut(|d| d.remove_temp::<(usize, usize, String)>(egui::Id::new("kw_help_word")));
+                                    }
+                                });
+                        }
+                    }
+                }
+
+                ui.data_mut(|d| {
+                    d.insert_temp(egui::Id::new("editor_y_offset"), output.state.offset.y);
+                    d.insert_temp(egui::Id::new("editor_content_h"), output.content_size.y);
+                    d.insert_temp(egui::Id::new("editor_view_h"), output.inner_rect.height());
+                });
+            }
+        }
+    });
+}
