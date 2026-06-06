@@ -116,6 +116,8 @@ pub struct IkIdeApp {
 impl Default for IkIdeApp {
     fn default() -> Self {
         let (tx, rx) = mpsc::channel();
+        // Restore persisted preferences / last project from the config file.
+        let settings = crate::core::settings::Settings::load();
         // Index the std library straight from the sources baked into the binary
         // — every std symbol is known for completion without writing any file.
         // Modules are only materialized to disk on demand, when imported, by
@@ -124,9 +126,21 @@ impl Default for IkIdeApp {
         // Supported target chips, straight from the compiler's device table.
         let devices = analysis::load_devices();
 
+        // Reopen the last project if its folder still exists, making it the CWD
+        // so local `import <module>` resolves against it.
+        let workspace_dir = settings.last_workspace.clone().filter(|p| p.is_dir());
+        if let Some(dir) = &workspace_dir {
+            let _ = std::env::set_current_dir(dir);
+        }
+        let workspace_tree = workspace_dir.as_ref().map(|dir| {
+            let mut tree = workspace::scan_workspace(dir);
+            tree.name = dir.file_name().unwrap_or_default().to_string_lossy().into_owned();
+            tree
+        });
+
         let app = Self {
-            workspace_dir: None,
-            workspace_tree: None,
+            workspace_dir,
+            workspace_tree,
             open_tabs: Vec::new(),
             active_tab: None,
             terminal_output: "Welcome to IKIDE!\n".to_string(),
@@ -135,26 +149,26 @@ impl Default for IkIdeApp {
             task_rx: rx,
             task_tx: tx,
             dialog_rx: None,
-            left_panel_width: 250.0,
-            right_panel_width: 350.0,
-            show_terminal: true,
-            show_vm_trace: false,
-            show_stats: true,
-            show_minimap: true,
+            left_panel_width: settings.left_panel_width,
+            right_panel_width: settings.right_panel_width,
+            show_terminal: settings.show_terminal,
+            show_vm_trace: settings.show_vm_trace,
+            show_stats: settings.show_stats,
+            show_minimap: settings.show_minimap,
             show_preferences: false,
             is_busy: false,
-            vm_max_cycles: 2000000,
-            sim_trace: true,
-            sim_dump_regs: true,
-            sim_peek_addr: String::new(),
-            sim_peek_len: 1,
+            vm_max_cycles: settings.vm_max_cycles,
+            sim_trace: settings.sim_trace,
+            sim_dump_regs: settings.sim_dump_regs,
+            sim_peek_addr: settings.sim_peek_addr.clone(),
+            sim_peek_len: settings.sim_peek_len,
             vm_result: None,
-            avrdude_path: "avrdude".to_string(),
-            avrdude_programmer: "usbasp".to_string(),
-            avrdude_port: "usb".to_string(),
-            avrdude_baudrate: "".to_string(),
-            avrdude_additional_flags: "".to_string(),
-            avrdude_target: "atmega32a".to_string(),
+            avrdude_path: settings.avrdude_path.clone(),
+            avrdude_programmer: settings.avrdude_programmer.clone(),
+            avrdude_port: settings.avrdude_port.clone(),
+            avrdude_baudrate: settings.avrdude_baudrate.clone(),
+            avrdude_additional_flags: settings.avrdude_additional_flags.clone(),
+            avrdude_target: settings.avrdude_target.clone(),
             std_index,
             devices,
             diagnostics: Vec::new(),
@@ -177,6 +191,35 @@ impl IkIdeApp {
                 let _ = tx.send(folder);
             });
         }
+    }
+
+    /// Snapshot the current preferences / layout / open project for saving.
+    pub fn current_settings(&self) -> crate::core::settings::Settings {
+        crate::core::settings::Settings {
+            last_workspace: self.workspace_dir.clone(),
+            vm_max_cycles: self.vm_max_cycles,
+            sim_trace: self.sim_trace,
+            sim_dump_regs: self.sim_dump_regs,
+            sim_peek_addr: self.sim_peek_addr.clone(),
+            sim_peek_len: self.sim_peek_len,
+            avrdude_path: self.avrdude_path.clone(),
+            avrdude_programmer: self.avrdude_programmer.clone(),
+            avrdude_port: self.avrdude_port.clone(),
+            avrdude_baudrate: self.avrdude_baudrate.clone(),
+            avrdude_additional_flags: self.avrdude_additional_flags.clone(),
+            avrdude_target: self.avrdude_target.clone(),
+            left_panel_width: self.left_panel_width,
+            right_panel_width: self.right_panel_width,
+            show_terminal: self.show_terminal,
+            show_vm_trace: self.show_vm_trace,
+            show_stats: self.show_stats,
+            show_minimap: self.show_minimap,
+        }
+    }
+
+    /// Persist the current settings to the config file (best effort).
+    pub fn persist(&self) {
+        self.current_settings().save();
     }
 
     /// Assemble the simulation knobs from the current preferences, parsing the
@@ -532,6 +575,8 @@ impl eframe::App for IkIdeApp {
                     self.open_tabs.clear();
                     self.active_tab = None;
                     self.refresh_files();
+                    // Remember this project for the next launch.
+                    self.persist();
                 }
             }
         }
@@ -741,6 +786,8 @@ impl eframe::App for IkIdeApp {
                     });
                 });
             if close {
+                // Write the updated preferences to disk.
+                self.persist();
                 show = false;
             }
             self.show_preferences = show;
@@ -754,5 +801,10 @@ impl eframe::App for IkIdeApp {
             right_panel::render(self, ctx);
         }
         editor::render(self, ctx);
+    }
+
+    /// Persist preferences, layout and the open project when the window closes.
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.persist();
     }
 }
