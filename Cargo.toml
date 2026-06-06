@@ -12,6 +12,10 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 # Local wall-clock timestamps for the Output log.
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# Serial monitor. default-features off drops the libudev build dependency so
+# the Docker build needs no extra system packages; ports are still openable and
+# enumerated via the sysfs fallback.
+serialport = { version = "4", default-features = false }
 # The ik8b compiler, linked as a library so the IDE shares the exact same
 # lexer/parser/device table (vendored as a submodule under tools/).
 ik8b = { path = "tools/ik8b" }

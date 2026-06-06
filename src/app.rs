@@ -84,7 +84,16 @@ pub struct IkIdeApp {
     pub show_stats: bool,
     pub show_minimap: bool,
     pub show_preferences: bool,
+    pub show_serial: bool,
     pub is_busy: bool,
+
+    // Serial monitor.
+    pub serial: Option<crate::core::serial::SerialConn>,
+    pub serial_port: String,
+    pub serial_baud: u32,
+    pub serial_output: String,
+    pub serial_input: String,
+    pub serial_ending: crate::core::serial::LineEnding,
     
     // In-process simulation preferences.
     pub vm_max_cycles: u32,
@@ -156,7 +165,14 @@ impl Default for IkIdeApp {
             show_stats: settings.show_stats,
             show_minimap: settings.show_minimap,
             show_preferences: false,
+            show_serial: false,
             is_busy: false,
+            serial: None,
+            serial_port: settings.serial_port.clone(),
+            serial_baud: settings.serial_baud,
+            serial_output: String::new(),
+            serial_input: String::new(),
+            serial_ending: crate::core::serial::LineEnding::Lf,
             vm_max_cycles: settings.vm_max_cycles,
             sim_trace: settings.sim_trace,
             sim_dump_regs: settings.sim_dump_regs,
@@ -208,6 +224,8 @@ impl IkIdeApp {
             avrdude_baudrate: self.avrdude_baudrate.clone(),
             avrdude_additional_flags: self.avrdude_additional_flags.clone(),
             avrdude_target: self.avrdude_target.clone(),
+            serial_port: self.serial_port.clone(),
+            serial_baud: self.serial_baud,
             left_panel_width: self.left_panel_width,
             right_panel_width: self.right_panel_width,
             show_terminal: self.show_terminal,
@@ -220,6 +238,30 @@ impl IkIdeApp {
     /// Persist the current settings to the config file (best effort).
     pub fn persist(&self) {
         self.current_settings().save();
+    }
+
+    /// Drain whatever the serial reader thread produced into the monitor log.
+    pub fn pump_serial(&mut self) {
+        let mut msgs = Vec::new();
+        if let Some(conn) = &self.serial {
+            while let Ok(m) = conn.rx.try_recv() {
+                msgs.push(m);
+            }
+        }
+        let mut closed = false;
+        for m in msgs {
+            match m {
+                crate::core::serial::SerialMsg::Data(s) => self.serial_output.push_str(&s),
+                crate::core::serial::SerialMsg::Error(e) => {
+                    self.serial_output.push_str(&format!("\n[serial error] {}\n", e));
+                    closed = true;
+                }
+                crate::core::serial::SerialMsg::Closed => closed = true,
+            }
+        }
+        if closed {
+            self.serial = None;
+        }
     }
 
     /// Assemble the simulation knobs from the current preferences, parsing the
@@ -526,6 +568,12 @@ impl eframe::App for IkIdeApp {
 
         self.handle_background_tasks();
 
+        // Stream any bytes the board sent into the serial monitor.
+        self.pump_serial();
+        if self.serial.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(50));
+        }
+
         // Live, debounced background type-check of the active buffer.
         if let Some(wait) = self.maybe_run_check() {
             ctx.request_repaint_after(wait);
@@ -635,6 +683,7 @@ impl eframe::App for IkIdeApp {
                     ui.checkbox(&mut self.show_vm_trace, "Simulation");
                     ui.checkbox(&mut self.show_stats, "Resource Stats");
                     ui.checkbox(&mut self.show_minimap, "Minimap");
+                    ui.checkbox(&mut self.show_serial, "Serial Monitor");
                     ui.separator();
                     if ui.add_enabled(!self.is_busy, egui::Button::new("🔄 Refresh Explorer")).clicked() {
                         self.refresh_files();
@@ -800,6 +849,7 @@ impl eframe::App for IkIdeApp {
         if self.show_vm_trace {
             right_panel::render(self, ctx);
         }
+        crate::ui::serial::render(self, ctx);
         editor::render(self, ctx);
     }
 

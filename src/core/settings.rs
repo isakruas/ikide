@@ -43,6 +43,10 @@ pub struct Settings {
     pub avrdude_additional_flags: String,
     pub avrdude_target: String,
 
+    // Serial monitor preferences.
+    pub serial_port: String,
+    pub serial_baud: u32,
+
     // UI layout.
     pub left_panel_width: f32,
     pub right_panel_width: f32,
@@ -67,6 +71,8 @@ impl Default for Settings {
             avrdude_baudrate: String::new(),
             avrdude_additional_flags: String::new(),
             avrdude_target: "atmega32a".to_string(),
+            serial_port: String::new(),
+            serial_baud: 9600,
             left_panel_width: 250.0,
             right_panel_width: 350.0,
             show_terminal: true,

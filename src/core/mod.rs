@@ -14,5 +14,6 @@
 
 pub mod analysis;
 pub mod runner;
+pub mod serial;
 pub mod settings;
 pub mod workspace;

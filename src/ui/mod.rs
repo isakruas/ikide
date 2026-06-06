@@ -14,5 +14,6 @@
 
 pub mod editor;
 pub mod explorer;
+pub mod serial;
 pub mod terminal;
 pub mod right_panel;
