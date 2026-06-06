@@ -39,6 +39,13 @@ pub fn render(app: &mut IkIdeApp, ctx: &egui::Context) {
                     if ui.button("🗑 Clear").clicked() {
                         app.terminal_output.clear();
                     }
+                    // Copy the whole output/VM log to the clipboard — handy when it
+                    // is long enough that selecting it by hand is awkward.
+                    ui.add_enabled_ui(!app.terminal_output.is_empty(), |ui| {
+                        if ui.button("📋 Copy").on_hover_text("Copy all output to the clipboard").clicked() {
+                            ui.ctx().copy_text(app.terminal_output.clone());
+                        }
+                    });
                 });
             });
             ui.separator();
