@@ -237,9 +237,6 @@ pub fn render(app: &mut IkIdeApp, ctx: &egui::Context) {
                                     text = text.replace('\t', "    ");
                                 }
                             }
-                            if is_ik {
-                                crate::syntax::auto_import(&mut text);
-                            }
                             tab.content = text.clone();
                             tab.is_modified = true;
                             // Restart the live type-check debounce timer.

@@ -236,17 +236,21 @@ fn parse_function(line: &str, doc: &str, source: &str) -> Option<Symbol> {
 }
 
 fn parse_const(trimmed: &str, doc: &str, source: &str) -> Option<Symbol> {
-    // const %NAME: type = value
+    // const %NAME: type = value   (hardware register / memory-mapped address)
+    // const  NAME: type = value   (plain value constant — folds to an immediate)
     let rest = trimmed["const ".len()..].trim_start();
-    if !rest.starts_with('%') {
+    // An optional `%` sigil followed by an identifier. The symbol name keeps the
+    // sigil for register constants and is bare for value constants.
+    let ident = rest.strip_prefix('%').unwrap_or(rest);
+    if !ident.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') {
         return None;
     }
-    let name_end = rest[1..]
+    let id_len = ident
         .find(|c: char| !c.is_alphanumeric() && c != '_')
-        .map(|i| i + 1)
-        .unwrap_or(rest.len());
+        .unwrap_or(ident.len());
+    let name_end = if rest.starts_with('%') { id_len + 1 } else { id_len };
     let name = &rest[..name_end];
-    if name.len() <= 1 {
+    if name.is_empty() {
         return None;
     }
     // Signature: everything up to '=' (the typed declaration), trimmed.
@@ -331,7 +335,25 @@ const KEYWORDS: &[&str] = &[
 const TYPES: &[&str] = &["u8", "u16", "i8", "i16", "bool", "char", "r8", "r16", "void"];
 const STD_MODULES: &[&str] = &[
     "delay", "math", "gpio", "adc", "uart", "spi", "twi", "eeprom", "timer", "sleep", "wdt",
-    "pwm", "bits", "crc", "string", "conv", "mem", "ringbuf", "atomic", "font",
+    "pwm", "bits", "crc", "string", "conv", "mem", "ringbuf", "atomic", "font", "boot",
+];
+
+/// Compiler intrinsics: `@`-builtins with no standard-library `.ik` body, so they
+/// never appear in the parsed symbol index. Surfaced directly in `@`-completion.
+/// `(name, one-line signature/detail)`.
+const INTRINSICS: &[(&str, &str)] = &[
+    ("@nop", "@nop() — emit NOP (one idle cycle)"),
+    ("@cli", "@cli() — clear the global interrupt enable"),
+    ("@sei", "@sei() — set the global interrupt enable"),
+    ("@wdr", "@wdr() — reset the watchdog timer"),
+    ("@sleep", "@sleep() — enter the selected sleep mode"),
+    ("@break", "@break() — on-chip debug breakpoint"),
+    ("@burn", "@burn($cycles) — calibrated busy-wait"),
+    ("@swap", "@swap($reg) — swap the nibbles of a literal register"),
+    ("@movw", "@movw($rd, $rr) — 16-bit register-pair move"),
+    ("@mul", "@mul($rd, $rr) — hardware MUL (not on AVRrc)"),
+    ("@goto", "@goto($word_addr) — absolute JMP to a flash word address"),
+    ("@spm", "@spm($spmcsr, $cmd, $zaddr, $word) — store-program-memory"),
 ];
 
 /// Produce ranked completions for `prefix` given the current buffer's index.
@@ -372,6 +394,17 @@ pub fn completions(index: &SymbolIndex, prefix: &str, prev_word: &str, devices: 
 
     if prefix.starts_with('@') {
         symbol_matches(index, prefix, SymbolKind::Function, &mut items);
+        // Compiler intrinsics are not in the symbol index; offer them too.
+        for (name, detail) in INTRINSICS {
+            if name.starts_with(prefix) {
+                items.push(CompletionItem {
+                    label: name.to_string(),
+                    detail: detail.to_string(),
+                    doc: String::new(),
+                    insert: name.to_string(),
+                });
+            }
+        }
     } else if prefix.starts_with('%') {
         symbol_matches(index, prefix, SymbolKind::Const, &mut items);
     } else if prefix.starts_with('$') {
@@ -394,11 +427,17 @@ pub fn completions(index: &SymbolIndex, prefix: &str, prev_word: &str, devices: 
             }
         }
         // Also surface function names by bare prefix (common when typing the
-        // name before remembering the `@`).
+        // name before remembering the `@`), and value constants (bare `const`
+        // names, no `%` sigil).
         if !pref.is_empty() {
             for s in &index.symbols {
                 if s.kind == SymbolKind::Function && s.name[1..].starts_with(pref) {
                     items.push(symbol_to_item(s, true));
+                } else if s.kind == SymbolKind::Const
+                    && !s.name.starts_with('%')
+                    && s.name.starts_with(pref)
+                {
+                    items.push(symbol_to_item(s, false));
                 }
             }
         }
@@ -476,9 +515,9 @@ pub fn keyword_help(word: &str) -> Option<KeywordHelp> {
             "import std/gpio",
         ),
         "const" => card(
-            "const — register alias",
-            "Binds a `%` name to a peripheral register's I/O address for the current target. Used to talk to hardware.",
-            "const %PORTB: u16 = 0x0025",
+            "const — register alias or value constant",
+            "`const %NAME` binds a `%` name to a peripheral register's address (read/written at run time). `const NAME` (no `%`) is a plain value constant — a bit mask or command word — that folds to an immediate.",
+            "const %PORTB: u16 = 0x0025\nconst LED_PIN: u8 = 0x20",
         ),
         "isr" => card(
             "isr — interrupt service routine",
@@ -560,7 +599,15 @@ pub fn keyword_help(word: &str) -> Option<KeywordHelp> {
         "r16" => card("r16 — fixed-point real (Q8.8)", "Fractional number in two bytes: 8 integer + 8 fractional bits (~-128.0..127.996, step 1/256). See the math library.", "ram mut $v: r16 = 3.14"),
         "void" => card("void — no value", "Used only as a function return type for functions that return nothing.", "@setup() -> void {\n    @init()\n}"),
         "true" | "false" => card("bool literal", "`true` is 1 and `false` is 0; both have type `bool`.", "ram mut $ok: bool = true"),
-        _ => None,
+        other => {
+            // Compiler intrinsics (the word may or may not include the leading `@`).
+            let at = if other.starts_with('@') { other.to_string() } else { format!("@{}", other) };
+            if let Some((name, detail)) = INTRINSICS.iter().find(|(n, _)| *n == at) {
+                let (sig, desc) = detail.split_once(" — ").unwrap_or((detail, *detail));
+                return card(&format!("{} — compiler intrinsic", name), desc, sig);
+            }
+            None
+        }
     }
 }
 
@@ -694,9 +741,29 @@ pub fn compile(src: &str) -> Result<BuildArtifact, Diagnostic> {
     let insts = cg
         .compile(&ast)
         .map_err(|e| diag_from_src(src, &format!("Compilation Error: {}", e)))?;
-    let opcodes = ik8b::codegen::resolve_labels(&insts)
-        .map_err(|e| diag_from_src(src, &format!("Assembly Error: {}", e)))?;
-    let hex = ik8b::codegen::generate_intel_hex(&opcodes);
+
+    // A `boot <addr>` program is located at the Boot Loader Section start so it
+    // can run as a bootloader (and legally execute SPM); everything else at 0.
+    let (opcodes, hex) = if let Some(byte_base) = parser.boot_origin {
+        if byte_base % 2 != 0 || byte_base >= device.flash_size {
+            return Err(diag_from_src(
+                src,
+                &format!(
+                    "Device Error: boot address 0x{:X} must be even and within {}'s {} KB flash.",
+                    byte_base, device.name, device.flash_size / 1024
+                ),
+            ));
+        }
+        let opcodes = ik8b::codegen::resolve_labels_at(&insts, (byte_base / 2) as i64)
+            .map_err(|e| diag_from_src(src, &format!("Assembly Error: {}", e)))?;
+        let hex = ik8b::codegen::generate_intel_hex_at(&opcodes, byte_base);
+        (opcodes, hex)
+    } else {
+        let opcodes = ik8b::codegen::resolve_labels(&insts)
+            .map_err(|e| diag_from_src(src, &format!("Assembly Error: {}", e)))?;
+        let hex = ik8b::codegen::generate_intel_hex(&opcodes);
+        (opcodes, hex)
+    };
 
     Ok(BuildArtifact {
         hex,
@@ -725,8 +792,18 @@ pub fn friendly(raw: &str) -> String {
     let has = |needle: &str| m.contains(needle);
 
     // --- Sigil rules ---------------------------------------------------------
-    if has("Constant name must start with %") {
-        return "Constant names must start with `%` — e.g. `const %MAX: u8 = 10`.".into();
+    if has("Expected constant name") {
+        return "A `const` needs a name: `const %REG: u16 = 0x25` for a hardware register, or `const NAME: u8 = 0x80` for a value constant.".into();
+    }
+    // --- Self-programming (@spm / std/boot) ---------------------------------
+    if has("@spm requires SPM") {
+        return "`@spm` (flash self-programming) isn't supported on this target's core.".into();
+    }
+    if has("@spm: unknown hardware register constant") {
+        return "`@spm`'s first argument must be the SPMCSR register constant for this device — prefer the `@boot_*` helpers from `std/boot`, which pass it for you.".into();
+    }
+    if has("@spm: zaddr and word must be 16-bit") {
+        return "`@spm`'s address and data word must be 16-bit (`u16`) values.".into();
     }
     if has("Function name must start with @") {
         return "Function names must start with `@` — e.g. `@main() -> void { ... }`.".into();
@@ -1189,7 +1266,7 @@ mod std_embed_tests {
     // into the user's project.
     #[test]
     fn imports_materialize_on_demand_and_compile() {
-        assert_eq!(STD_FILES.len(), 20, "expected the full std library embedded");
+        assert_eq!(STD_FILES.len(), 21, "expected the full std library embedded");
 
         let src = "target atmega328p\nimport std/atomic\n@main {\n    loop * {}\n}\n";
         let dir = sync_std_imports(src);

@@ -1668,6 +1668,9 @@ dependencies = [
 [[package]]
 name = "ik8b"
 version = "0.1.0"
+dependencies = [
+ "ik8bvm",
+]
 
 [[package]]
 name = "ik8bvm"

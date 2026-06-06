@@ -20,4 +20,4 @@ serialport = { version = "4", default-features = false }
 # lexer/parser/device table (vendored as a submodule under tools/).
 ik8b = { path = "tools/ik8b" }
 # The ik8bvm AVR simulator, linked as a library so the IDE runs simulations
-ik8bvm = { path = "tools/ik8bvm" }
+ik8bvm = { path = "tools/ik8b/tools/ik8bvm" }

@@ -25,6 +25,8 @@ __pycache__
 *.tmp
 *.temp
 /tmp/
+*.pdf
+*.txt
 
 # Local environment files
 .env
