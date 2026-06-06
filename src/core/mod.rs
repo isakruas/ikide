@@ -13,6 +13,7 @@
 // limitations under the License.
 
 pub mod analysis;
+pub mod bootloader;
 pub mod runner;
 pub mod serial;
 pub mod settings;

@@ -104,6 +104,8 @@ pub struct IkIdeApp {
     /// Structured snapshot from the most recent simulation run.
     pub vm_result: Option<crate::core::runner::VmResult>,
 
+    // Upload method: bootloader (default) vs avrdude.
+    pub use_bootloader: bool,
     // Avrdude upload preferences
     pub avrdude_path: String,
     pub avrdude_programmer: String,
@@ -111,6 +113,10 @@ pub struct IkIdeApp {
     pub avrdude_baudrate: String,
     pub avrdude_additional_flags: String,
     pub avrdude_target: String,
+
+    // Serial-bootloader upload preferences.
+    pub bootloader_port: String,
+    pub bootloader_baud: u32,
 
     // Language intelligence (compiler-backed).
     pub std_index: SymbolIndex,
@@ -179,12 +185,15 @@ impl Default for IkIdeApp {
             sim_peek_addr: settings.sim_peek_addr.clone(),
             sim_peek_len: settings.sim_peek_len,
             vm_result: None,
+            use_bootloader: settings.use_bootloader,
             avrdude_path: settings.avrdude_path.clone(),
             avrdude_programmer: settings.avrdude_programmer.clone(),
             avrdude_port: settings.avrdude_port.clone(),
             avrdude_baudrate: settings.avrdude_baudrate.clone(),
             avrdude_additional_flags: settings.avrdude_additional_flags.clone(),
             avrdude_target: settings.avrdude_target.clone(),
+            bootloader_port: settings.bootloader_port.clone(),
+            bootloader_baud: settings.bootloader_baud,
             std_index,
             devices,
             diagnostics: Vec::new(),
@@ -218,12 +227,15 @@ impl IkIdeApp {
             sim_dump_regs: self.sim_dump_regs,
             sim_peek_addr: self.sim_peek_addr.clone(),
             sim_peek_len: self.sim_peek_len,
+            use_bootloader: self.use_bootloader,
             avrdude_path: self.avrdude_path.clone(),
             avrdude_programmer: self.avrdude_programmer.clone(),
             avrdude_port: self.avrdude_port.clone(),
             avrdude_baudrate: self.avrdude_baudrate.clone(),
             avrdude_additional_flags: self.avrdude_additional_flags.clone(),
             avrdude_target: self.avrdude_target.clone(),
+            bootloader_port: self.bootloader_port.clone(),
+            bootloader_baud: self.bootloader_baud,
             serial_port: self.serial_port.clone(),
             serial_baud: self.serial_baud,
             left_panel_width: self.left_panel_width,
@@ -721,9 +733,14 @@ impl eframe::App for IkIdeApp {
                         self.is_busy = true;
                         self.show_terminal = true;
                         self.terminal_output.clear();
-                        self.terminal_output.push_str(&format!("{} --- Uploading ---\n", now_ts()));
                         let path = self.active_tab.map(|idx| self.open_tabs[idx].path.clone());
-                        runner::spawn_upload(self.workspace_dir.clone(), path, self.avrdude_path.clone(), self.avrdude_target.clone(), self.avrdude_programmer.clone(), self.avrdude_port.clone(), self.avrdude_baudrate.clone(), self.avrdude_additional_flags.clone(), self.task_tx.clone());
+                        if self.use_bootloader {
+                            self.terminal_output.push_str(&format!("{} --- Uploading (bootloader) ---\n", now_ts()));
+                            runner::spawn_bootloader_upload(self.workspace_dir.clone(), path, self.bootloader_port.clone(), self.bootloader_baud, self.task_tx.clone());
+                        } else {
+                            self.terminal_output.push_str(&format!("{} --- Uploading (avrdude) ---\n", now_ts()));
+                            runner::spawn_upload(self.workspace_dir.clone(), path, self.avrdude_path.clone(), self.avrdude_target.clone(), self.avrdude_programmer.clone(), self.avrdude_port.clone(), self.avrdude_baudrate.clone(), self.avrdude_additional_flags.clone(), self.task_tx.clone());
+                        }
                         ui.close_menu();
                     }
                 });
@@ -787,7 +804,18 @@ impl eframe::App for IkIdeApp {
 
                     ui.add_space(5.0);
 
-                    egui::CollapsingHeader::new("Avrdude Configuration").default_open(true).show(ui, |ui| {
+                    ui.label(egui::RichText::new("Upload method").strong());
+                    ui.horizontal(|ui| {
+                        ui.radio_value(&mut self.use_bootloader, true, "Bootloader")
+                            .on_hover_text("Flash through the ik serial bootloader running on the board.");
+                        ui.radio_value(&mut self.use_bootloader, false, "avrdude")
+                            .on_hover_text("Flash with an external programmer via avrdude.");
+                    });
+                    ui.label(egui::RichText::new("\"Upload to Board\" uses the selected method.").small().weak());
+                    ui.add_space(5.0);
+
+                    egui::CollapsingHeader::new("Avrdude Configuration").default_open(!self.use_bootloader).show(ui, |ui| {
+                        ui.add_enabled_ui(!self.use_bootloader, |ui| {
                         egui::Grid::new("avrdude_grid").num_columns(2).spacing([10.0, 10.0]).show(ui, |ui| {
                             ui.label("Executable Path:");
                             ui.text_edit_singleline(&mut self.avrdude_path);
@@ -825,7 +853,51 @@ impl eframe::App for IkIdeApp {
                             ui.text_edit_singleline(&mut self.avrdude_additional_flags);
                             ui.end_row();
                         });
+                        });
                     });
+
+                    ui.add_space(5.0);
+                    egui::CollapsingHeader::new("Bootloader Upload").default_open(true).show(ui, |ui| {
+                        ui.label(egui::RichText::new(
+                            "Flash through the ik serial bootloader running on the board.",
+                        ).small().weak());
+                        egui::Grid::new("bootloader_grid").num_columns(2).spacing([10.0, 10.0]).show(ui, |ui| {
+                            ui.label("Serial Port:");
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.bootloader_port)
+                                        .desired_width(160.0)
+                                        .hint_text("/dev/ttyUSB0"),
+                                );
+                                egui::ComboBox::from_id_salt("bootloader_port_pick")
+                                    .selected_text("▾")
+                                    .width(16.0)
+                                    .show_ui(ui, |ui| {
+                                        let ports = crate::core::serial::list_ports();
+                                        if ports.is_empty() {
+                                            ui.label(egui::RichText::new("no ports found").weak());
+                                        }
+                                        for p in ports {
+                                            ui.selectable_value(&mut self.bootloader_port, p.clone(), p);
+                                        }
+                                    });
+                            });
+                            ui.end_row();
+
+                            ui.label("Baud:");
+                            let mut baud_str = self.bootloader_baud.to_string();
+                            if ui.text_edit_singleline(&mut baud_str).changed() {
+                                if let Ok(b) = baud_str.trim().parse::<u32>() {
+                                    self.bootloader_baud = b;
+                                }
+                            }
+                            ui.end_row();
+                        });
+                        ui.label(egui::RichText::new(
+                            "Baud must match the bootloader's BL_UBRR (default 9600 @ 8 MHz).",
+                        ).small().weak());
+                    });
+
                     ui.add_space(10.0);
                     ui.separator();
                     ui.horizontal(|ui| {

@@ -35,6 +35,9 @@ pub struct Settings {
     pub sim_peek_addr: String,
     pub sim_peek_len: u32,
 
+    // Upload method: bootloader (default) vs avrdude.
+    pub use_bootloader: bool,
+
     // avrdude upload preferences.
     pub avrdude_path: String,
     pub avrdude_programmer: String,
@@ -42,6 +45,10 @@ pub struct Settings {
     pub avrdude_baudrate: String,
     pub avrdude_additional_flags: String,
     pub avrdude_target: String,
+
+    // Serial-bootloader upload preferences.
+    pub bootloader_port: String,
+    pub bootloader_baud: u32,
 
     // Serial monitor preferences.
     pub serial_port: String,
@@ -65,12 +72,15 @@ impl Default for Settings {
             sim_dump_regs: true,
             sim_peek_addr: String::new(),
             sim_peek_len: 1,
+            use_bootloader: true,
             avrdude_path: "avrdude".to_string(),
             avrdude_programmer: "usbasp".to_string(),
             avrdude_port: "usb".to_string(),
             avrdude_baudrate: String::new(),
             avrdude_additional_flags: String::new(),
             avrdude_target: "atmega32a".to_string(),
+            bootloader_port: String::new(),
+            bootloader_baud: 9600,
             serial_port: String::new(),
             serial_baud: 9600,
             left_panel_width: 250.0,

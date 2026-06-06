@@ -420,6 +420,33 @@ mod avrdude_tests {
     }
 }
 
+/// Flash the already-built HEX through the ik serial bootloader running on the
+/// board, instead of an external programmer.
+pub fn spawn_bootloader_upload(workspace_dir: Option<PathBuf>, selected_file: Option<PathBuf>, port: String, baud: u32, tx: Sender<TaskMsg>) {
+    thread::spawn(move || {
+        if let Some(path) = selected_file {
+            let out_hex = out_hex_path(&workspace_dir, &path);
+            let _ = tx.send(TaskMsg::Upload(format!(
+                "Flashing {:?} via the serial bootloader on {} @ {} baud…\n",
+                out_hex, port, baud
+            )));
+            let log_tx = tx.clone();
+            let log = move |line: String| {
+                let _ = log_tx.send(TaskMsg::Upload(format!("{}\n", line)));
+            };
+            match crate::core::bootloader::upload(&port, baud, &out_hex, &log) {
+                Ok(()) => {}
+                Err(e) => {
+                    let _ = tx.send(TaskMsg::Upload(format!("Bootloader upload failed: {}\n", e)));
+                }
+            }
+        } else {
+            let _ = tx.send(TaskMsg::Upload("No file selected to upload.\n".to_string()));
+        }
+        let _ = tx.send(TaskMsg::Done);
+    });
+}
+
 pub fn spawn_upload(workspace_dir: Option<PathBuf>, selected_file: Option<PathBuf>, avrdude_path: String, target: String, programmer: String, port: String, baudrate: String, additional_flags: String, tx: Sender<TaskMsg>) {
     thread::spawn(move || {
         if let Some(path) = selected_file {
