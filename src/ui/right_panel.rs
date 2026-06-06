@@ -30,6 +30,12 @@ pub fn render(app: &mut IkIdeApp, ctx: &egui::Context) {
                         app.vm_output.clear();
                         app.vm_result = None;
                     }
+                    // Copy the full simulation log (handy for long traces).
+                    ui.add_enabled_ui(!app.vm_output.is_empty(), |ui| {
+                        if ui.button("📋 Copy").on_hover_text("Copy the simulation log to the clipboard").clicked() {
+                            ui.ctx().copy_text(app.vm_output.clone());
+                        }
+                    });
                 });
             });
             ui.separator();
