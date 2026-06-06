@@ -76,7 +76,10 @@ pub fn render(app: &mut IkIdeApp, ctx: &egui::Context) {
         if let Some(idx) = app.active_tab {
             if idx < app.open_tabs.len() {
                 let tab = &mut app.open_tabs[idx];
-                
+                // Only ik8b sources get syntax styling and language features;
+                // any other file is shown as plain text.
+                let is_ik = crate::app::is_ik_file(&tab.path);
+
                 let theme = syntax::CodeTheme::default();
 
 
@@ -93,7 +96,11 @@ pub fn render(app: &mut IkIdeApp, ctx: &egui::Context) {
                                 .id_salt("minimap_scroll")
                                 .auto_shrink([false, false])
                                 .show(ui, |ui| {
-                                    let layout_job = syntax::highlight(&tab.content, &theme, 3.5, &error_terms, None);
+                                    let layout_job = if is_ik {
+                                        syntax::highlight(&tab.content, &theme, 3.5, &error_terms, None)
+                                    } else {
+                                        syntax::plain_job(&tab.content, 3.5)
+                                    };
                                     let label_resp = ui.add(
                                         egui::Label::new(layout_job)
                                             .selectable(false)
@@ -190,7 +197,11 @@ pub fn render(app: &mut IkIdeApp, ctx: &egui::Context) {
                                     }
                                 }
                             }
-                            let mut layout_job = syntax::highlight(string, &theme, 14.0, &error_terms, selection);
+                            let mut layout_job = if is_ik {
+                                syntax::highlight(string, &theme, 14.0, &error_terms, selection)
+                            } else {
+                                syntax::plain_job(string, 14.0)
+                            };
                             layout_job.wrap.max_width = wrap_width;
                             ui.fonts(|f| f.layout_job(layout_job))
                         };
@@ -226,7 +237,9 @@ pub fn render(app: &mut IkIdeApp, ctx: &egui::Context) {
                                     text = text.replace('\t', "    ");
                                 }
                             }
-                            crate::syntax::auto_import(&mut text);
+                            if is_ik {
+                                crate::syntax::auto_import(&mut text);
+                            }
                             tab.content = text.clone();
                             tab.is_modified = true;
                             // Restart the live type-check debounce timer.
@@ -237,11 +250,14 @@ pub fn render(app: &mut IkIdeApp, ctx: &egui::Context) {
                             if let Some(range) = state.cursor.char_range() {
                                 let cursor_idx = range.primary.index;
                                 let text_up_to_cursor: String = text.chars().take(cursor_idx).collect();
-                                let force_autocomplete = ui.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Space));
+                                let force_autocomplete = is_ik && ui.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Space));
                                 let key = egui::Id::new("autocomplete_sugs");
                                 let is_sug_open = ui.data_mut(|d| d.get_temp::<(usize, usize, Vec<analysis::CompletionItem>)>(key)).is_some();
 
-                                if force_autocomplete || is_sug_open {
+                                if !is_ik {
+                                    // Plain-text file: never offer code completion.
+                                    ui.data_mut(|d| d.remove_temp::<(usize, usize, Vec<analysis::CompletionItem>)>(key));
+                                } else if force_autocomplete || is_sug_open {
                                     // Split the prefix into tokens to find the word under the
                                     // cursor and the token before it (for context completions).
                                     let parts: Vec<&str> = text_up_to_cursor
@@ -278,7 +294,7 @@ pub fn render(app: &mut IkIdeApp, ctx: &egui::Context) {
                             if let Some(range) = state.cursor.char_range() {
                                 let a = range.primary.index.min(range.secondary.index);
                                 let b = range.primary.index.max(range.secondary.index);
-                                if b > a && b - a <= 12 {
+                                if is_ik && b > a && b - a <= 12 {
                                     let sel: String = text.chars().skip(a).take(b - a).collect();
                                     selected = Some((a, b, sel.trim().to_string()));
                                 }

@@ -361,15 +361,75 @@ pub fn spawn_simulate(workspace_dir: Option<PathBuf>, selected_file: Option<Path
     });
 }
 
+/// Translate a compiler/device-table name (e.g. `atmega32a`, `attiny85`) into
+/// the part id avrdude expects on `-p` (e.g. `m32`, `t85`). avrdude does not
+/// accept the long device names, so we map family prefixes to its short ids
+/// and collapse the silicon-revision `a` variants that share a base part.
+pub fn avrdude_part(name: &str) -> String {
+    let n = name.trim().to_lowercase();
+
+    // Revision variants avrdude folds into one base part id.
+    const COLLAPSE: &[(&str, &str)] = &[
+        ("atmega8a", "m8"),
+        ("atmega16a", "m16"),
+        ("atmega32a", "m32"),
+        ("atmega64a", "m64"),
+        ("atmega128a", "m128"),
+        ("atmega8515", "m8515"),
+        ("atmega8535", "m8535"),
+    ];
+    if let Some((_, id)) = COLLAPSE.iter().find(|(k, _)| *k == n) {
+        return id.to_string();
+    }
+
+    // Family prefix → avrdude short prefix.
+    const FAMILIES: &[(&str, &str)] = &[
+        ("atxmega", "x"),
+        ("atmega", "m"),
+        ("attiny", "t"),
+        ("at90usb", "usb"),
+        ("at90can", "c"),
+        ("at90pwm", "pwm"),
+        ("at90s", ""),
+    ];
+    for (prefix, short) in FAMILIES {
+        if let Some(rest) = n.strip_prefix(prefix) {
+            return format!("{}{}", short, rest);
+        }
+    }
+
+    // Unknown shape: pass through (also covers ids already in avrdude form).
+    n
+}
+
+#[cfg(test)]
+mod avrdude_tests {
+    use super::avrdude_part;
+
+    #[test]
+    fn maps_families_and_revisions_to_avrdude_part_ids() {
+        assert_eq!(avrdude_part("atmega32a"), "m32"); // revision collapses to base
+        assert_eq!(avrdude_part("atmega328p"), "m328p");
+        assert_eq!(avrdude_part("atmega2560"), "m2560");
+        assert_eq!(avrdude_part("attiny85"), "t85");
+        assert_eq!(avrdude_part("atxmega128a1"), "x128a1");
+        assert_eq!(avrdude_part("at90usb1286"), "usb1286");
+        assert_eq!(avrdude_part("at90can128"), "c128");
+        assert_eq!(avrdude_part("at90s8515"), "8515");
+        assert_eq!(avrdude_part("m328p"), "m328p"); // already an id: pass through
+    }
+}
+
 pub fn spawn_upload(workspace_dir: Option<PathBuf>, selected_file: Option<PathBuf>, avrdude_path: String, target: String, programmer: String, port: String, baudrate: String, additional_flags: String, tx: Sender<TaskMsg>) {
     thread::spawn(move || {
         if let Some(path) = selected_file {
             let out_hex = out_hex_path(&workspace_dir, &path);
-            let _ = tx.send(TaskMsg::Upload(format!("Uploading {:?} to board...\n", out_hex)));
-            
-            // avrdude command using the correct target and preferences
+            let part = avrdude_part(&target);
+            let _ = tx.send(TaskMsg::Upload(format!("Uploading {:?} to board (target {} -> avrdude -p{})...\n", out_hex, target, part)));
+
+            // avrdude command using the converted part id and preferences
             let mut cmd = Command::new(avrdude_path);
-            cmd.arg(format!("-p{}", target))
+            cmd.arg(format!("-p{}", part))
                .arg(format!("-c{}", programmer));
                
             if !port.is_empty() {

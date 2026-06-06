@@ -25,6 +25,26 @@ use crate::core::workspace::{self, FileNode};
 const CHECK_DEBOUNCE: Duration = Duration::from_millis(500);
 use crate::ui::{editor, explorer, right_panel, terminal};
 
+/// Current local wall-clock time, formatted for an Output log prefix.
+pub fn now_ts() -> String {
+    chrono::Local::now().format("[%Y-%m-%d %H:%M:%S]").to_string()
+}
+
+/// Prefix a log chunk with the current timestamp (no-op for empty chunks, so
+/// blank stderr fragments don't add noise).
+fn stamp(msg: &str) -> String {
+    if msg.trim().is_empty() {
+        msg.to_string()
+    } else {
+        format!("{} {}", now_ts(), msg)
+    }
+}
+
+/// True when `path` is an ik8b source the IDE should compile, lint and style.
+pub fn is_ik_file(path: &std::path::Path) -> bool {
+    path.extension().and_then(|e| e.to_str()) == Some("ik")
+}
+
 pub struct OpenTab {
     pub path: PathBuf,
     pub content: String,
@@ -181,10 +201,23 @@ impl IkIdeApp {
         }
     }
 
+    /// Whether the active tab is an ik8b source. Only `.ik` files get compiled,
+    /// linted and syntax-styled; any other file opens as plain text.
+    pub fn active_is_ik(&self) -> bool {
+        self.active_tab
+            .and_then(|i| self.open_tabs.get(i))
+            .map(|t| is_ik_file(&t.path))
+            .unwrap_or(false)
+    }
+
     /// All diagnostics to display: the compiler's (debounced) plus the IDE's
     /// instant lints on the active buffer. When both flag the same line, the
     /// precise lint wins so the squiggle lands on the exact token.
     pub fn all_diagnostics(&self) -> Vec<Diagnostic> {
+        // Non-ik files are plain text: no language analysis at all.
+        if !self.active_is_ik() {
+            return Vec::new();
+        }
         let lints = match self.active_tab.and_then(|i| self.open_tabs.get(i)) {
             Some(tab) => analysis::lint_buffer(&tab.content),
             None => Vec::new(),
@@ -208,7 +241,13 @@ impl IkIdeApp {
     /// caller can schedule a repaint (egui is event-driven).
     pub fn maybe_run_check(&mut self) -> Option<Duration> {
         let idx = self.active_tab?;
-        let content = self.open_tabs.get(idx)?.content.clone();
+        let tab = self.open_tabs.get(idx)?;
+        // Plain-text files are never type-checked; clear any stale diagnostics.
+        if !is_ik_file(&tab.path) {
+            self.diagnostics.clear();
+            return None;
+        }
+        let content = tab.content.clone();
 
         if content == self.last_checked_content {
             return None;
@@ -250,7 +289,7 @@ impl IkIdeApp {
             });
             self.active_tab = Some(self.open_tabs.len() - 1);
         } else {
-            self.terminal_output.push_str(&format!("Failed to load file: {:?}\n", path));
+            self.terminal_output.push_str(&format!("{} Failed to load file: {:?}\n", now_ts(), path));
             self.show_terminal = true;
         }
     }
@@ -258,16 +297,22 @@ impl IkIdeApp {
     pub fn save_active_file(&mut self) {
         if let Some(idx) = self.active_tab {
             let tab = &mut self.open_tabs[idx];
-            // Auto-format on save so the on-disk file is always tidy.
-            tab.content = crate::syntax::format_code(&tab.content);
+            let is_ik = is_ik_file(&tab.path);
+            // Auto-format only ik8b sources — other files are saved verbatim so
+            // the ik formatter never mangles them.
+            if is_ik {
+                tab.content = crate::syntax::format_code(&tab.content);
+            }
             if let Err(e) = std::fs::write(&tab.path, &tab.content) {
-                self.terminal_output.push_str(&format!("Failed to save file: {}\n", e));
+                self.terminal_output.push_str(&format!("{} Failed to save file: {}\n", now_ts(), e));
                 self.show_terminal = true;
             } else {
                 tab.is_modified = false;
-                self.terminal_output.push_str(&format!("Saved {:?}\n", tab.path));
-                // Trigger stats update on save (in-process build).
-                runner::spawn_stats(tab.content.clone(), self.task_tx.clone());
+                self.terminal_output.push_str(&format!("{} Saved {:?}\n", now_ts(), tab.path));
+                // Resource stats only make sense for ik8b sources.
+                if is_ik {
+                    runner::spawn_stats(tab.content.clone(), self.task_tx.clone());
+                }
             }
         }
     }
@@ -280,16 +325,16 @@ impl IkIdeApp {
                     self.refresh_files();
                 }
                 TaskMsg::Compile(out) => {
-                    self.terminal_output.push_str(&out);
+                    self.terminal_output.push_str(&stamp(&out));
                 }
                 TaskMsg::Vm(out) => {
-                    self.vm_output.push_str(&out);
+                    self.vm_output.push_str(&stamp(&out));
                 }
                 TaskMsg::VmResult(res) => {
                     self.vm_result = Some(res);
                 }
                 TaskMsg::Upload(out) => {
-                    self.terminal_output.push_str(&out);
+                    self.terminal_output.push_str(&stamp(&out));
                     self.show_terminal = true;
                 }
                 TaskMsg::Stats(res) => {
@@ -445,12 +490,12 @@ impl eframe::App for IkIdeApp {
 
         // Check shortcuts
         if ctx.input(|i| i.modifiers.shift && i.key_pressed(egui::Key::R)) {
-            if !self.is_busy && self.active_tab.is_some() {
+            if !self.is_busy && self.active_is_ik() {
                 self.save_active_file();
                 self.is_busy = true;
                 self.show_terminal = true;
                 self.terminal_output.clear();
-                self.terminal_output.push_str("--- Compiling ---\n");
+                self.terminal_output.push_str(&format!("{} --- Compiling ---\n", now_ts()));
                 let (path, content) = self.active_tab
                     .map(|idx| (Some(self.open_tabs[idx].path.clone()), self.open_tabs[idx].content.clone()))
                     .unwrap_or((None, String::new()));
@@ -459,12 +504,12 @@ impl eframe::App for IkIdeApp {
         }
         
         if ctx.input(|i| i.modifiers.shift && i.key_pressed(egui::Key::S)) {
-            if !self.is_busy && self.active_tab.is_some() {
+            if !self.is_busy && self.active_is_ik() {
                 self.is_busy = true;
                 self.show_vm_trace = true;
                 self.vm_output.clear();
                 self.vm_result = None;
-                self.vm_output.push_str("--- Simulation Starting ---\n");
+                self.vm_output.push_str(&format!("{} --- Simulation Starting ---\n", now_ts()));
                 let (path, text) = if let Some(idx) = self.active_tab {
                     (Some(self.open_tabs[idx].path.clone()), self.open_tabs[idx].content.clone())
                 } else {
@@ -530,7 +575,7 @@ impl eframe::App for IkIdeApp {
                 });
                 
                 ui.menu_button("Edit", |ui| {
-                    if ui.add_enabled(!self.is_busy && self.active_tab.is_some(), egui::Button::new("✨ Format Code")).clicked() {
+                    if ui.add_enabled(!self.is_busy && self.active_is_ik(), egui::Button::new("✨ Format Code")).clicked() {
                         if let Some(idx) = self.active_tab {
                             let unformatted = self.open_tabs[idx].content.clone();
                             self.open_tabs[idx].content = crate::syntax::format_code(&unformatted);
@@ -553,36 +598,36 @@ impl eframe::App for IkIdeApp {
                 });
                 
                 ui.menu_button("Run", |ui| {
-                    if ui.add_enabled(!self.is_busy && self.active_tab.is_some(), egui::Button::new("🔨 Compile (Shift+R)")).clicked() {
+                    if ui.add_enabled(!self.is_busy && self.active_is_ik(), egui::Button::new("🔨 Compile (Shift+R)")).clicked() {
                         self.save_active_file();
                         self.is_busy = true;
                         self.show_terminal = true;
                         self.terminal_output.clear();
-                        self.terminal_output.push_str("--- Compiling ---\n");
+                        self.terminal_output.push_str(&format!("{} --- Compiling ---\n", now_ts()));
                         let (path, content) = self.active_tab
                             .map(|idx| (Some(self.open_tabs[idx].path.clone()), self.open_tabs[idx].content.clone()))
                             .unwrap_or((None, String::new()));
                         runner::spawn_compile(self.workspace_dir.clone(), path, content, self.task_tx.clone());
                         ui.close_menu();
                     }
-                    if ui.add_enabled(!self.is_busy && self.active_tab.is_some(), egui::Button::new("🚀 Simulate (Shift+S)")).clicked() {
+                    if ui.add_enabled(!self.is_busy && self.active_is_ik(), egui::Button::new("🚀 Simulate (Shift+S)")).clicked() {
                         self.is_busy = true;
                         self.show_vm_trace = true;
                         self.vm_output.clear();
                         self.vm_result = None;
-                        self.vm_output.push_str("--- Simulation Starting ---\n");
+                        self.vm_output.push_str(&format!("{} --- Simulation Starting ---\n", now_ts()));
                         let (path, text) = if let Some(idx) = self.active_tab {
                             (Some(self.open_tabs[idx].path.clone()), self.open_tabs[idx].content.clone())
                         } else { (None, String::new()) };
                         runner::spawn_simulate(self.workspace_dir.clone(), path, text, self.task_tx.clone(), self.sim_config());
                         ui.close_menu();
                     }
-                    if ui.add_enabled(!self.is_busy && self.active_tab.is_some(), egui::Button::new("🔌 Upload to Board")).clicked() {
+                    if ui.add_enabled(!self.is_busy && self.active_is_ik(), egui::Button::new("🔌 Upload to Board")).clicked() {
                         self.save_active_file();
                         self.is_busy = true;
                         self.show_terminal = true;
                         self.terminal_output.clear();
-                        self.terminal_output.push_str("--- Uploading ---\n");
+                        self.terminal_output.push_str(&format!("{} --- Uploading ---\n", now_ts()));
                         let path = self.active_tab.map(|idx| self.open_tabs[idx].path.clone());
                         runner::spawn_upload(self.workspace_dir.clone(), path, self.avrdude_path.clone(), self.avrdude_target.clone(), self.avrdude_programmer.clone(), self.avrdude_port.clone(), self.avrdude_baudrate.clone(), self.avrdude_additional_flags.clone(), self.task_tx.clone());
                         ui.close_menu();

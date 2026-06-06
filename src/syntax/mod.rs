@@ -20,6 +20,17 @@ pub struct CodeTheme {
     // Extensible for future custom colors
 }
 
+/// A plain, unstyled monospace layout — used for non-`.ik` files, which the
+/// IDE opens as plain text without any ik8b syntax styling.
+pub fn plain_job(code: &str, font_size: f32) -> egui::text::LayoutJob {
+    egui::text::LayoutJob::simple(
+        code.to_owned(),
+        egui::FontId::monospace(font_size),
+        egui::Color32::from_gray(220),
+        f32::INFINITY,
+    )
+}
+
 /// Highlight `code`. `error_terms` maps a 1-based line number to the offending
 /// identifier reported by the compiler on that line; matching tokens are drawn
 /// with an error background so every diagnostic is visible at once.

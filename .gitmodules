@@ -1,9 +1,6 @@
 [submodule "ik8b"]
 	path = tools/ik8b
 	url = https://github.com/isakruas/ik8b
-[submodule "avr-vm"]
-	path = tools/avr-vm
-	url = https://github.com/isakruas/avr-vm
 [submodule "ik8bvm"]
 	path = tools/ik8bvm
 	url = https://github.com/isakruas/ik8bvm
