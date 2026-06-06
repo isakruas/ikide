@@ -1277,6 +1277,28 @@ mod std_embed_tests {
         assert!(res.is_ok(), "compile with embedded std failed: {:?}", res.err());
     }
 
+    // The recently added std/boot module is embedded, indexed for completion,
+    // and resolves through the in-process front end (a regression guard for
+    // "the IDE doesn't recognize new std modules").
+    #[test]
+    fn boot_module_is_embedded_indexed_and_compiles() {
+        assert!(
+            embedded_std("boot").is_some(),
+            "std/boot must be embedded (build.rs scans tools/ik8b/std)"
+        );
+
+        let idx = std_symbol_index();
+        assert!(
+            idx.symbols.iter().any(|s| s.name == "@boot_page_erase"),
+            "std/boot functions must be in the symbol index for completion/hover"
+        );
+
+        let src = "target atmega328p\nimport std/boot\n\n@main {\n    @cli()\n    @boot_page_erase(0x0000)\n    loop * {}\n}\n";
+        sync_std_imports(src);
+        let diags = check(src);
+        assert!(diags.is_empty(), "boot program should type-check clean: {:?}", diags);
+    }
+
     // A buffer with no std imports materializes nothing.
     #[test]
     fn no_imports_materialize_nothing() {

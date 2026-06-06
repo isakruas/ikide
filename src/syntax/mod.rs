@@ -39,7 +39,7 @@ pub fn highlight(code: &str, _theme: &CodeTheme, font_size: f32, error_terms: &H
     let mut current_line = 1;
     let mut char_idx = 0;
     
-    let keywords = ["target", "import", "const", "mut", "imut", "ram", "eeprom", "flash", "return", "loop", "switch", "ptr", "str", "fn", "isr"];
+    let keywords = ["target", "import", "const", "mut", "imut", "ram", "eeprom", "flash", "return", "loop", "switch", "ptr", "str", "fn", "isr", "boot"];
     let types = ["u8", "u16", "i8", "i16", "bool", "char", "r8", "r16", "void"];
     let booleans = ["true", "false"];
 
