@@ -40,7 +40,17 @@ pub fn render(app: &mut IkIdeApp, ctx: &egui::Context) {
                 for (idx, tab) in app.open_tabs.iter().enumerate() {
                     let is_active = app.active_tab == Some(idx);
                     let title = tab.path.file_name().unwrap_or_default().to_string_lossy();
-                    let display_title = if tab.is_modified { format!("{} *", title) } else { title.into_owned() };
+                    let display_title = if tab.is_modified {
+                        if tab.is_disk_different {
+                            format!("{} * ⚠", title)
+                        } else {
+                            format!("{} *", title)
+                        }
+                    } else if tab.is_disk_different {
+                        format!("{} ⚠", title)
+                    } else {
+                        title.into_owned()
+                    };
                     
                     let response = ui.selectable_label(is_active, display_title);
                     if response.clicked() {
@@ -76,6 +86,20 @@ pub fn render(app: &mut IkIdeApp, ctx: &egui::Context) {
         if let Some(idx) = app.active_tab {
             if idx < app.open_tabs.len() {
                 let tab = &mut app.open_tabs[idx];
+                if tab.is_disk_different {
+                    ui.horizontal(|ui| {
+                        ui.colored_label(egui::Color32::from_rgb(255, 170, 0), "⚠ File modified externally.");
+                        if ui.button("Reload from disk").clicked() {
+                            if let Ok(new_content) = std::fs::read_to_string(&tab.path) {
+                                tab.content = new_content;
+                                tab.is_modified = false;
+                                tab.is_disk_different = false;
+                                tab.last_mtime = std::fs::metadata(&tab.path).ok().and_then(|m| m.modified().ok());
+                            }
+                        }
+                    });
+                    ui.separator();
+                }
                 // Only ik8b sources get syntax styling and language features;
                 // any other file is shown as plain text.
                 let is_ik = crate::app::is_ik_file(&tab.path);

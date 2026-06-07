@@ -45,10 +45,26 @@ pub fn is_ik_file(path: &std::path::Path) -> bool {
     path.extension().and_then(|e| e.to_str()) == Some("ik")
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SerialTab {
+    Console,
+    Plotter,
+}
+
 pub struct OpenTab {
     pub path: PathBuf,
     pub content: String,
     pub is_modified: bool,
+    pub last_mtime: Option<std::time::SystemTime>,
+    pub is_disk_different: bool,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct ExampleInfo {
+    pub title: String,
+    pub description: String,
+    #[serde(skip)]
+    pub path: PathBuf,
 }
 
 pub enum ActionPopup {
@@ -96,6 +112,17 @@ pub struct IkIdeApp {
     pub serial_output: String,
     pub serial_input: String,
     pub serial_ending: crate::core::serial::LineEnding,
+    pub serial_tab: SerialTab,
+    pub serial_line_buf: String,
+    pub plot_history: Vec<Vec<f32>>,
+    pub plot_labels: Vec<String>,
+    pub plot_visible: Vec<bool>,
+    pub plot_grid: bool,
+    pub plot_center_line: bool,
+    pub plot_window_size: usize,
+    pub plot_show_stats: bool,
+    pub examples: Vec<ExampleInfo>,
+    pub last_disk_check: Instant,
     
     // In-process simulation preferences.
     pub vm_max_cycles: u32,
@@ -155,7 +182,7 @@ impl Default for IkIdeApp {
             tree
         });
 
-        let app = Self {
+        let mut app = Self {
             workspace_dir,
             workspace_tree,
             open_tabs: Vec::new(),
@@ -183,6 +210,17 @@ impl Default for IkIdeApp {
             serial_output: String::new(),
             serial_input: String::new(),
             serial_ending: crate::core::serial::LineEnding::Lf,
+            serial_tab: SerialTab::Console,
+            serial_line_buf: String::new(),
+            plot_history: Vec::new(),
+            plot_labels: Vec::new(),
+            plot_visible: Vec::new(),
+            plot_grid: true,
+            plot_center_line: true,
+            plot_window_size: 500,
+            plot_show_stats: true,
+            examples: Vec::new(),
+            last_disk_check: Instant::now(),
             vm_max_cycles: settings.vm_max_cycles,
             sim_trace: settings.sim_trace,
             sim_dump_regs: settings.sim_dump_regs,
@@ -206,6 +244,7 @@ impl Default for IkIdeApp {
             action_popup: ActionPopup::None,
         };
 
+        app.scan_examples();
         app
     }
 }
@@ -267,7 +306,46 @@ impl IkIdeApp {
         let mut closed = false;
         for m in msgs {
             match m {
-                crate::core::serial::SerialMsg::Data(s) => self.serial_output.push_str(&s),
+                crate::core::serial::SerialMsg::Data(s) => {
+                    self.serial_output.push_str(&s);
+                    if self.serial_output.len() > 100_000 {
+                        self.serial_output = self.serial_output[self.serial_output.len() - 50_000..].to_string();
+                    }
+                    self.serial_line_buf.push_str(&s);
+                    while let Some(pos) = self.serial_line_buf.find('\n') {
+                        let line = self.serial_line_buf[..pos].trim();
+                        let mut values: Vec<f32> = Vec::new();
+                        let mut labels: Vec<String> = Vec::new();
+                        for part in line.split(|c: char| c == ',' || c == ';' || c.is_whitespace()).filter(|s| !s.is_empty()) {
+                            if let Some(idx) = part.find(':') {
+                                let label = part[..idx].trim().to_string();
+                                let val_str = part[idx + 1..].trim();
+                                if let Ok(val) = val_str.parse::<f32>() {
+                                    values.push(val);
+                                    labels.push(label);
+                                }
+                            } else if let Ok(val) = part.parse::<f32>() {
+                                values.push(val);
+                                labels.push(format!("Ch {}", values.len()));
+                            }
+                        }
+                        if !values.is_empty() {
+                            for (ch_idx, label) in labels.into_iter().enumerate() {
+                                if ch_idx >= self.plot_labels.len() {
+                                    self.plot_labels.push(label);
+                                    self.plot_visible.push(true);
+                                } else if label != format!("Ch {}", ch_idx + 1) {
+                                    self.plot_labels[ch_idx] = label;
+                                }
+                            }
+                            self.plot_history.push(values);
+                            if self.plot_history.len() > 100_000 {
+                                self.plot_history.remove(0);
+                            }
+                        }
+                        self.serial_line_buf = self.serial_line_buf[pos + 1..].to_string();
+                    }
+                }
                 crate::core::serial::SerialMsg::Error(e) => {
                     self.serial_output.push_str(&format!("\n[serial error] {}\n", e));
                     closed = true;
@@ -383,10 +461,13 @@ impl IkIdeApp {
         }
         
         if let Ok(content) = std::fs::read_to_string(&path) {
+            let last_mtime = std::fs::metadata(&path).ok().and_then(|m| m.modified().ok());
             self.open_tabs.push(OpenTab {
                 path,
                 content,
                 is_modified: false,
+                last_mtime,
+                is_disk_different: false,
             });
             self.active_tab = Some(self.open_tabs.len() - 1);
         } else {
@@ -409,6 +490,8 @@ impl IkIdeApp {
                 self.show_terminal = true;
             } else {
                 tab.is_modified = false;
+                tab.is_disk_different = false;
+                tab.last_mtime = std::fs::metadata(&tab.path).ok().and_then(|m| m.modified().ok());
                 self.terminal_output.push_str(&format!("{} Saved {:?}\n", now_ts(), tab.path));
                 // Resource stats only make sense for ik8b sources.
                 if is_ik {
@@ -575,8 +658,95 @@ impl IkIdeApp {
     }
 }
 
+fn copy_dir_all(src: impl AsRef<std::path::Path>, dst: impl AsRef<std::path::Path>) -> std::io::Result<()> {
+    std::fs::create_dir_all(&dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        if ty.is_dir() {
+            copy_dir_all(entry.path(), dst.as_ref().join(entry.file_name()))?;
+        } else {
+            std::fs::copy(entry.path(), dst.as_ref().join(entry.file_name()))?;
+        }
+    }
+    Ok(())
+}
+
+impl IkIdeApp {
+    pub fn scan_examples(&mut self) {
+        self.examples.clear();
+        let paths_to_try = [
+            std::env::current_dir().unwrap_or_default().join("assets/examples"),
+            std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|p| p.join("assets/examples")))
+                .unwrap_or_default(),
+            PathBuf::from("assets/examples"),
+        ];
+        let mut examples_dir = None;
+        for path in &paths_to_try {
+            if path.is_dir() {
+                examples_dir = Some(path.clone());
+                break;
+            }
+        }
+        let Some(dir) = examples_dir else {
+            return;
+        };
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    let info_json = path.join("info.json");
+                    if info_json.is_file() {
+                        if let Ok(content) = std::fs::read_to_string(&info_json) {
+                            if let Ok(mut info) = serde_json::from_str::<ExampleInfo>(&content) {
+                                info.path = path;
+                                self.examples.push(info);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        self.examples.sort_by(|a, b| a.title.cmp(&b.title));
+    }
+}
+
 impl eframe::App for IkIdeApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Periodically check if files have been modified on disk
+        let now = Instant::now();
+        if self.last_disk_check.elapsed() >= Duration::from_secs(1) {
+            self.last_disk_check = now;
+            let mut tabs_to_reload = Vec::new();
+            for (idx, tab) in self.open_tabs.iter_mut().enumerate() {
+                if let Ok(metadata) = std::fs::metadata(&tab.path) {
+                    if let Ok(mtime) = metadata.modified() {
+                        if let Some(last_time) = tab.last_mtime {
+                            if mtime > last_time {
+                                if !tab.is_modified {
+                                    tabs_to_reload.push((idx, mtime));
+                                } else {
+                                    tab.is_disk_different = true;
+                                }
+                            }
+                        } else {
+                            tab.last_mtime = Some(mtime);
+                        }
+                    }
+                }
+            }
+            for (idx, mtime) in tabs_to_reload {
+                let tab = &mut self.open_tabs[idx];
+                if let Ok(new_content) = std::fs::read_to_string(&tab.path) {
+                    tab.content = new_content;
+                    tab.last_mtime = Some(mtime);
+                }
+            }
+        }
+        ctx.request_repaint_after(Duration::from_secs(1));
+
         // Keyboard shortcuts
         if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::S)) {
             self.save_active_file();
@@ -758,6 +928,7 @@ impl eframe::App for IkIdeApp {
                 
                 ui.menu_button("Help", |ui| {
                     if ui.button("📚 Built-in Examples").clicked() {
+                        self.scan_examples();
                         self.show_examples = true;
                         ui.close_menu();
                     }
@@ -985,7 +1156,7 @@ impl eframe::App for IkIdeApp {
 
         if self.show_examples {
             let mut show = self.show_examples;
-            let mut do_add = false;
+            let mut load_example_idx = None;
             egui::Window::new("Examples Library")
                 .title_bar(false)
                 .collapsible(false)
@@ -997,25 +1168,48 @@ impl eframe::App for IkIdeApp {
                     ui.label(egui::RichText::new("Click an example to load it into your current workspace.").weak().small());
                     ui.separator();
                     
-                    ui.group(|ui| {
-                        ui.label(egui::RichText::new("🚀 ATmega32 Bootloader & Blink").strong());
-                        ui.label("A complete, tested serial bootloader (9600 baud) written entirely in IK, alongside a blink application. Includes a detailed README with flashing instructions.");
-                        ui.add_space(6.0);
-                        if ui.button("Load Example").clicked() {
-                            do_add = true;
+                    if self.examples.is_empty() {
+                        ui.label("No examples found. Please verify the examples directory exists and contains info.json files.");
+                    } else {
+                        for (idx, ex) in self.examples.iter().enumerate() {
+                            ui.group(|ui| {
+                                ui.label(egui::RichText::new(format!("🚀 {}", ex.title)).strong());
+                                ui.label(&ex.description);
+                                ui.add_space(6.0);
+                                ui.add_enabled_ui(self.workspace_dir.is_some(), |ui| {
+                                    if ui.button("Load Example").clicked() {
+                                        load_example_idx = Some(idx);
+                                    }
+                                });
+                            });
+                            ui.add_space(6.0);
                         }
-                    });
-                    ui.add_space(4.0);
+                    }
+                    ui.add_space(8.0);
                     if ui.button("Close").clicked() {
                         show = false;
                     }
                 });
             
-            if do_add {
+            if let Some(idx) = load_example_idx {
                 if let Some(dir) = &self.workspace_dir {
-                    let _ = std::fs::write(dir.join("bootloader.ik"), include_str!("../assets/examples/atmega32_bootloader/bootloader.ik"));
-                    let _ = std::fs::write(dir.join("blink_pb0.ik"), include_str!("../assets/examples/atmega32_bootloader/blink_pb0.ik"));
-                    let _ = std::fs::write(dir.join("README.md"), include_str!("../assets/examples/atmega32_bootloader/README.md"));
+                    let ex = &self.examples[idx];
+                    if let Ok(entries) = std::fs::read_dir(&ex.path) {
+                        for entry in entries.flatten() {
+                            let path = entry.path();
+                            if let Some(file_name) = path.file_name() {
+                                if file_name == "info.json" {
+                                    continue;
+                                }
+                                let target_path = dir.join(file_name);
+                                if path.is_dir() {
+                                    let _ = copy_dir_all(&path, &target_path);
+                                } else {
+                                    let _ = std::fs::copy(&path, &target_path);
+                                }
+                            }
+                        }
+                    }
                     self.refresh_files();
                 }
                 show = false;
