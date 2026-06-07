@@ -84,6 +84,8 @@ pub struct IkIdeApp {
     pub show_stats: bool,
     pub show_minimap: bool,
     pub show_preferences: bool,
+    pub show_about: bool,
+    pub show_examples: bool,
     pub show_serial: bool,
     pub is_busy: bool,
 
@@ -171,6 +173,8 @@ impl Default for IkIdeApp {
             show_stats: settings.show_stats,
             show_minimap: settings.show_minimap,
             show_preferences: false,
+            show_about: false,
+            show_examples: false,
             show_serial: false,
             is_busy: false,
             serial: None,
@@ -752,6 +756,18 @@ impl eframe::App for IkIdeApp {
                     }
                 });
                 
+                ui.menu_button("Help", |ui| {
+                    if ui.button("📚 Built-in Examples").clicked() {
+                        self.show_examples = true;
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui.button("ℹ About IK IDE").clicked() {
+                        self.show_about = true;
+                        ui.close_menu();
+                    }
+                });
+                
                 if self.is_busy {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label("Working...");
@@ -912,6 +928,99 @@ impl eframe::App for IkIdeApp {
                 show = false;
             }
             self.show_preferences = show;
+        }
+
+        if self.show_about {
+            let mut show = self.show_about;
+            egui::Window::new("About")
+                .title_bar(false)
+                .collapsible(false)
+                .resizable(false)
+                .default_width(450.0)
+                .show(ctx, |ui| {
+                    ui.label(egui::RichText::new("ℹ About IK IDE").strong().size(18.0));
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new("Version 0.1.0").weak());
+                    ui.separator();
+                    
+                    ui.label(egui::RichText::new("Vision").strong());
+                    ui.label("IK was created to push the true capabilities of 8-bit AVR microcontrollers to their limits. By breaking free from traditional, heavy abstractions, it empowers developers to deeply understand and optimize their hardware at the lowest level.");
+                    ui.add_space(4.0);
+
+                    ui.label(egui::RichText::new("Purpose").strong());
+                    ui.label("A core goal of the IK language is true portability. It is designed to target a common subset of AVR instructions, ensuring that code can run seamlessly across a wide variety of chips without requiring massive rewrites when changing hardware.");
+                    ui.add_space(4.0);
+
+                    ui.label(egui::RichText::new("Philosophy").strong());
+                    ui.label("True understanding comes from looking 'under the hood'. Built entirely in Rust for frictionless cross-platform development, the IK ecosystem provides cycle-accurate simulation, real-time resource statistics, and transparent bootloader flashing in a single cohesive environment.");
+                    ui.add_space(8.0);
+                    
+                    ui.label(egui::RichText::new("Project Links").strong());
+                    ui.horizontal(|ui| {
+                        ui.label("•");
+                        ui.hyperlink_to("ikide", "https://github.com/isakruas/ikide");
+                        ui.label("- The IDE workspace");
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("•");
+                        ui.hyperlink_to("ik8b", "https://github.com/isakruas/ik8b");
+                        ui.label("- The core compiler");
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("•");
+                        ui.hyperlink_to("ik8bvm", "https://github.com/isakruas/ik8bvm");
+                        ui.label("- The cycle-accurate simulator");
+                    });
+                    ui.add_space(8.0);
+                    
+                    ui.label("Authors: The IK Authors");
+                    ui.label("License: Apache-2.0");
+                    ui.separator();
+                    if ui.button("Close").clicked() {
+                        show = false;
+                    }
+                });
+            self.show_about = show;
+        }
+
+        if self.show_examples {
+            let mut show = self.show_examples;
+            let mut do_add = false;
+            egui::Window::new("Examples Library")
+                .title_bar(false)
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("📚 Built-in Examples").strong());
+                    });
+                    ui.label(egui::RichText::new("Click an example to load it into your current workspace.").weak().small());
+                    ui.separator();
+                    
+                    ui.group(|ui| {
+                        ui.label(egui::RichText::new("🚀 ATmega32 Bootloader & Blink").strong());
+                        ui.label("A complete, tested serial bootloader (9600 baud) written entirely in IK, alongside a blink application. Includes a detailed README with flashing instructions.");
+                        ui.add_space(6.0);
+                        if ui.button("Load Example").clicked() {
+                            do_add = true;
+                        }
+                    });
+                    ui.add_space(4.0);
+                    if ui.button("Close").clicked() {
+                        show = false;
+                    }
+                });
+            
+            if do_add {
+                if let Some(dir) = &self.workspace_dir {
+                    let _ = std::fs::write(dir.join("bootloader.ik"), include_str!("../assets/examples/atmega32_bootloader/bootloader.ik"));
+                    let _ = std::fs::write(dir.join("blink_pb0.ik"), include_str!("../assets/examples/atmega32_bootloader/blink_pb0.ik"));
+                    let _ = std::fs::write(dir.join("README.md"), include_str!("../assets/examples/atmega32_bootloader/README.md"));
+                    self.refresh_files();
+                }
+                show = false;
+            }
+            self.show_examples = show;
         }
 
         if self.show_terminal {
