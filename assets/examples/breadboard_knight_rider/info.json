@@ -1,0 +1,4 @@
+{
+  "title": "Breadboard: Knight Rider (LED bar)",
+  "description": "A single lit LED runs across all 8 pins of PORTD. On the Breadboard add an LED bar wired to PD0..PD7 and press Run (Clock 16 MHz)."
+}

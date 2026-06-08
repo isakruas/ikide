@@ -1,0 +1,4 @@
+{
+  "title": "Breadboard: Blink",
+  "description": "Blinks an LED on PB5 every 500 ms. On the Breadboard, add an LED wired to PB5 and press Run. Set the Clock to 16 MHz to match @cpu_mhz()."
+}

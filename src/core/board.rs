@@ -172,6 +172,29 @@ pub fn pins(device: &str) -> Vec<Pin> {
     out
 }
 
+/// Data-space addresses of the on-chip serial peripherals' registers, resolved
+/// from the simulator's hardware tables. Each is `None` when the device lacks
+/// that peripheral. Addresses are data-space (I/O address + 0x20), ready to
+/// pass to the VM's `read_data`/`write_data`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PeriphAddrs {
+    /// (data register, status register) for USART0.
+    pub uart: Option<(u32, u32)>,
+    /// (data register, status register) for SPI.
+    pub spi: Option<(u32, u32)>,
+    /// Data register (TWDR) for TWI/I2C.
+    pub twi: Option<u32>,
+}
+
+/// Resolve the active target's serial-peripheral register addresses.
+pub fn periph_addrs(device: &str) -> PeriphAddrs {
+    PeriphAddrs {
+        uart: ik8bvm::hw::uart_hw(device).map(|u| (u.data + 0x20, u.status + 0x20)),
+        spi: ik8bvm::hw::spi_hw(device).map(|s| (s.data + 0x20, s.status + 0x20)),
+        twi: ik8bvm::hw::twi_hw(device).map(|t| t.data + 0x20),
+    }
+}
+
 /// The full set of data-space addresses the breadboard must watch for a device
 /// (every PIN/DDR/PORT register), for the live engine's snapshot list.
 pub fn watch_addrs(device: &str) -> Vec<u32> {

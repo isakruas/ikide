@@ -1,0 +1,4 @@
+{
+  "title": "Breadboard: ADC Threshold",
+  "description": "Reads a potentiometer on ADC0 and lights an LED on PB5 when it crosses mid-scale, printing the value over UART. Add a Potentiometer (channel 0) and an LED on PB5; watch the value in the UART tab."
+}

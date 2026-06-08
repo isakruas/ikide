@@ -1,0 +1,4 @@
+{
+  "title": "Breadboard: 7-Segment Counter",
+  "description": "Counts 0-9 on a common-cathode 7-segment display. Wire segments a..g to PD0..PD6 on the Breadboard (add a 7-segment component) and press Run (Clock 16 MHz)."
+}

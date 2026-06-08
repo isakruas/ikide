@@ -1,0 +1,4 @@
+{
+  "title": "Breadboard: Button + LED",
+  "description": "An LED on PB5 lights while a button on PD2 is held (active-low, internal pull-up). On the Breadboard add an LED on PB5 and a Button on PD2, then Run and hold the button."
+}

@@ -1,0 +1,4 @@
+{
+  "title": "Breadboard: UART Echo",
+  "description": "Echoes back every byte received over the USART. Run it, open the UART tab, type in the Send box and watch your text echoed in the console."
+}

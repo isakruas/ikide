@@ -41,6 +41,15 @@ fn stamp(msg: &str) -> String {
 }
 
 
+/// Keep a peripheral transcript from growing without bound, trimming the oldest
+/// text once it gets large.
+fn cap_log(s: &mut String) {
+    const MAX: usize = 64_000;
+    if s.len() > MAX {
+        *s = s[s.len() - MAX / 2..].to_string();
+    }
+}
+
 /// True when `path` is an ik8b source the IDE should compile, lint and style.
 pub fn is_ik_file(path: &std::path::Path) -> bool {
     path.extension().and_then(|e| e.to_str()) == Some("ik")
@@ -117,6 +126,15 @@ pub struct IkIdeApp {
     pub live_running: bool,
     pub live_status: String,
     pub bb_clock_hz: u32,
+    pub bb_tab: crate::ui::breadboard::BreadboardTab,
+    // Serial-peripheral transcripts, fed from the live engine's captured events.
+    pub uart_log: String,
+    pub uart_send: String,
+    pub spi_log: String,
+    pub twi_log: String,
+    pub bb_spi_miso: u8,
+    /// TWI decode state: the next data byte after a START is the address.
+    twi_expect_addr: bool,
 
     // Serial monitor.
     pub serial: Option<crate::core::serial::SerialConn>,
@@ -237,6 +255,13 @@ impl Default for IkIdeApp {
             live_running: false,
             live_status: String::new(),
             bb_clock_hz: 16_000_000,
+            bb_tab: crate::ui::breadboard::BreadboardTab::Schematic,
+            uart_log: String::new(),
+            uart_send: String::new(),
+            spi_log: String::new(),
+            twi_log: String::new(),
+            bb_spi_miso: 0xFF,
+            twi_expect_addr: false,
             serial: None,
             serial_port: settings.serial_port.clone(),
             serial_baud: settings.serial_baud,
@@ -463,7 +488,18 @@ impl IkIdeApp {
         self.live_regs.clear();
         self.live_cycles = 0;
         self.live_running = true;
-        self.live = Some(crate::core::sim_live::spawn(device, hex_path, self.bb_clock_hz, watch));
+        // Clearing the peripheral logs gives each run a fresh transcript.
+        self.uart_log.clear();
+        self.spi_log.clear();
+        self.twi_log.clear();
+        self.twi_expect_addr = false;
+        self.live = Some(crate::core::sim_live::spawn(
+            device,
+            hex_path,
+            self.bb_clock_hz,
+            watch,
+            self.bb_spi_miso,
+        ));
     }
 
     /// Tear down a running breadboard simulation.
@@ -479,11 +515,13 @@ impl IkIdeApp {
     /// repainting).
     pub fn pump_live(&mut self) -> bool {
         let mut halt: Option<String> = None;
+        let mut events: Vec<crate::core::sim_live::IoEvent> = Vec::new();
         if let Some(live) = &self.live {
             while let Ok(snap) = live.snap_rx.try_recv() {
                 self.live_regs = snap.regs;
                 self.live_cycles = snap.cycles;
                 self.live_running = snap.running;
+                events.extend(snap.events);
                 if let Some(reason) = snap.halt_reason {
                     halt = Some(reason);
                 }
@@ -491,10 +529,58 @@ impl IkIdeApp {
         } else {
             return false;
         }
+        for ev in events {
+            self.route_io_event(ev);
+        }
         if let Some(reason) = halt {
             self.live_status = reason;
         }
         true
+    }
+
+    /// Append a captured serial-peripheral event to the matching transcript.
+    fn route_io_event(&mut self, ev: crate::core::sim_live::IoEvent) {
+        use ik8bvm::core::{IoKind, IoPeripheral};
+        match ev.periph {
+            IoPeripheral::Uart => {
+                // UART carries text: keep printable bytes and newlines verbatim,
+                // show other control bytes as a dot.
+                let b = ev.byte;
+                if b == b'\n' || b == b'\r' || b == b'\t' || (0x20..=0x7e).contains(&b) {
+                    self.uart_log.push(b as char);
+                } else {
+                    self.uart_log.push('.');
+                }
+                cap_log(&mut self.uart_log);
+            }
+            IoPeripheral::Spi => {
+                self.spi_log.push_str(&format!("{:02X} ", ev.byte));
+                cap_log(&mut self.spi_log);
+            }
+            IoPeripheral::Twi => {
+                match ev.kind {
+                    IoKind::TwiStart => {
+                        self.twi_log.push_str("\n[S] ");
+                        self.twi_expect_addr = true;
+                    }
+                    IoKind::TwiStop => {
+                        self.twi_log.push_str("[P]");
+                        self.twi_expect_addr = false;
+                    }
+                    IoKind::Data => {
+                        if self.twi_expect_addr {
+                            // First byte after START is the address + R/W bit.
+                            let rw = if ev.byte & 1 == 1 { "R" } else { "W" };
+                            self.twi_log.push_str(&format!("addr 0x{:02X}{} ", ev.byte >> 1, rw));
+                            self.twi_expect_addr = false;
+                        } else {
+                            self.twi_log.push_str(&format!("{:02X} ", ev.byte));
+                        }
+                    }
+                }
+                cap_log(&mut self.twi_log);
+            }
+        }
     }
 
     /// Whether the active tab is an ik8b source. Only `.ik` files get compiled,

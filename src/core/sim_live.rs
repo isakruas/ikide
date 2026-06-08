@@ -17,20 +17,25 @@
 // Unlike `runner::spawn_simulate` (a one-shot run that reports a final
 // snapshot), this drives the same ik8bvm core *continuously* on a background
 // thread, paced to wall-clock time by an assumed CPU clock. Each frame it:
-//   1. applies any pin inputs the UI injected (writing the PINx data byte),
+//   1. applies any pin inputs the UI injected (writing the PINx data byte) and
+//      services the UART receive queue,
 //   2. steps the core forward by one clock-frame worth of cycles,
-//   3. publishes a snapshot of the watched I/O registers back to the UI.
+//   3. publishes a snapshot of the watched I/O registers + captured serial
+//      traffic back to the UI.
 //
-// The fidelity rests on the VM modelling PIN/DDR/PORT as independent raw I/O
-// bytes (no PORT->PIN copy, no toggle-on-write): outputs are read straight
-// from PORTx (gated by DDRx), and an external input is just the PINx byte we
-// write — exactly how a button wired to the pin would read.
+// GPIO fidelity rests on the VM modelling PIN/DDR/PORT as independent raw I/O
+// bytes. Serial peripherals use the VM's `capture_io` hook: bytes the program
+// writes to UDR/SPDR/TWDR are captured as `IoEvent`s; the SPI master read-back
+// is the host-configured `spi_miso`; UART receive is injected best-effort by
+// presenting a byte and pulsing RXC.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
+
+pub use ik8bvm::core::IoEvent;
 
 /// A command from the UI to the running engine.
 pub enum LiveCmd {
@@ -39,15 +44,23 @@ pub enum LiveCmd {
     SetInput { addr: u32, bit: u8, high: bool },
     /// Stop forcing a pin, letting the program drive it again.
     ClearInput { addr: u32, bit: u8 },
+    /// Queue bytes to deliver to the program's UART receiver.
+    UartSend(Vec<u8>),
+    /// Set the byte the SPI peripheral returns to the master.
+    SetSpiMiso(u8),
+    /// Set the analog value (0..1023) on an ADC channel.
+    SetAdc { channel: u8, value: u16 },
     /// Tear the engine down.
     Stop,
 }
 
-/// A periodic readout of the watched registers, sent to the UI each frame.
+/// A periodic readout sent to the UI each frame.
 #[derive(Clone, Debug, Default)]
 pub struct LiveSnapshot {
     /// Watched data-space address -> current value.
     pub regs: HashMap<u32, u8>,
+    /// Serial-peripheral bytes transmitted since the previous snapshot.
+    pub events: Vec<IoEvent>,
     pub cycles: u64,
     pub running: bool,
     /// Set once when the core halts, so the UI can report why.
@@ -67,6 +80,15 @@ impl LiveHandle {
     pub fn clear_input(&self, addr: u32, bit: u8) {
         let _ = self.cmd_tx.send(LiveCmd::ClearInput { addr, bit });
     }
+    pub fn uart_send(&self, bytes: Vec<u8>) {
+        let _ = self.cmd_tx.send(LiveCmd::UartSend(bytes));
+    }
+    pub fn set_spi_miso(&self, byte: u8) {
+        let _ = self.cmd_tx.send(LiveCmd::SetSpiMiso(byte));
+    }
+    pub fn set_adc(&self, channel: u8, value: u16) {
+        let _ = self.cmd_tx.send(LiveCmd::SetAdc { channel, value });
+    }
     pub fn stop(&self) {
         let _ = self.cmd_tx.send(LiveCmd::Stop);
     }
@@ -80,10 +102,16 @@ const FRAME: Duration = Duration::from_millis(16);
 const MAX_STEPS_PER_FRAME: u64 = 8_000_000;
 
 /// Spawn the live engine. `clock_hz` is the assumed CPU frequency used to pace
-/// the run to real time (so cycle-counted `delay_*` loops play at the rate the
-/// code intends); `0` means run as fast as possible. `watch` is the set of
-/// data-space addresses whose values are reported every frame.
-pub fn spawn(device: String, hex_path: PathBuf, clock_hz: u32, watch: Vec<u32>) -> LiveHandle {
+/// the run to real time (`0` = as fast as possible). `watch` is the set of
+/// data-space addresses reported every frame; `spi_miso` is the initial SPI
+/// read-back byte.
+pub fn spawn(
+    device: String,
+    hex_path: PathBuf,
+    clock_hz: u32,
+    watch: Vec<u32>,
+    spi_miso: u8,
+) -> LiveHandle {
     let (cmd_tx, cmd_rx) = mpsc::channel::<LiveCmd>();
     let (snap_tx, snap_rx) = mpsc::channel::<LiveSnapshot>();
 
@@ -97,6 +125,8 @@ pub fn spawn(device: String, hex_path: PathBuf, clock_hz: u32, watch: Vec<u32>) 
             });
             return;
         }
+        vm.capture_io = true;
+        vm.spi_miso = spi_miso;
 
         // Pins the UI is currently forcing as inputs, re-asserted every frame so
         // a held button stays held.
@@ -123,6 +153,9 @@ pub fn spawn(device: String, hex_path: PathBuf, clock_hz: u32, watch: Vec<u32>) 
                     LiveCmd::ClearInput { addr, bit } => {
                         forced.remove(&(addr, bit));
                     }
+                    LiveCmd::UartSend(bytes) => vm.uart_feed(&bytes),
+                    LiveCmd::SetSpiMiso(b) => vm.spi_miso = b,
+                    LiveCmd::SetAdc { channel, value } => vm.adc_set(channel as usize, value),
                     LiveCmd::Stop => stop = true,
                 }
             }
@@ -133,28 +166,27 @@ pub fn spawn(device: String, hex_path: PathBuf, clock_hz: u32, watch: Vec<u32>) 
             // 2. Apply forced inputs, then step a frame's worth of cycles.
             apply_forced(&mut vm, &forced);
             if vm.running {
-                let target = vm.cycles + cycles_per_frame.max(1);
                 let mut steps = 0u64;
                 if cycles_per_frame == 0 {
-                    // Unlimited: run a fat fixed batch, still bounded.
                     while vm.running && steps < MAX_STEPS_PER_FRAME {
                         vm.step();
                         steps += 1;
                     }
                 } else {
+                    let target = vm.cycles + cycles_per_frame.max(1);
                     while vm.running && vm.cycles < target && steps < MAX_STEPS_PER_FRAME {
                         vm.step();
                         steps += 1;
                     }
                 }
-                // Re-assert inputs after stepping too, so the snapshot the UI
-                // sees reflects the forced levels even if the program briefly
-                // wrote the PINx byte.
+                // Re-assert inputs after stepping too, so the snapshot reflects
+                // the forced levels even if the program wrote the PINx byte.
                 apply_forced(&mut vm, &forced);
             }
 
             // 3. Publish a snapshot (always while running; once on halt).
             let halted = !vm.running;
+            let events = std::mem::take(&mut vm.io_events);
             if !halted || !halted_sent {
                 let mut regs = HashMap::with_capacity(watch.len());
                 for &a in &watch {
@@ -173,19 +205,18 @@ pub fn spawn(device: String, hex_path: PathBuf, clock_hz: u32, watch: Vec<u32>) 
                 if snap_tx
                     .send(LiveSnapshot {
                         regs,
+                        events,
                         cycles: vm.cycles,
                         running: vm.running,
                         halt_reason,
                     })
                     .is_err()
                 {
-                    // UI dropped the receiver; nothing left to drive.
-                    break;
+                    break; // UI dropped the receiver.
                 }
             }
 
-            // Pace to ~real time: sleep out the rest of the frame. When halted,
-            // idle but stay responsive to a Stop command.
+            // Pace to ~real time; when halted, idle but stay responsive to Stop.
             if let Some(rem) = FRAME.checked_sub(frame_start.elapsed()) {
                 thread::sleep(rem);
             }
@@ -211,6 +242,7 @@ fn apply_forced(vm: &mut ik8bvm::core::AvrVm, forced: &HashMap<(u32, u8), bool>)
 #[cfg(test)]
 mod tests {
     use crate::core::{analysis, runner};
+    use ik8bvm::core::IoPeripheral;
 
     /// End-to-end check of the path the breadboard's LED indicator relies on:
     /// a real GPIO program drives PB5 high, and the watched PORTB/DDRB bits in
@@ -243,5 +275,133 @@ mod tests {
         let port = vm.read_data(0x25);
         assert_eq!((ddr >> 5) & 1, 1, "DDRB bit 5 should be configured as output");
         assert_eq!((port >> 5) & 1, 1, "PORTB bit 5 should be driven high");
+    }
+
+    /// UART transmissions are captured as events when `capture_io` is on.
+    #[test]
+    fn uart_transmit_is_captured() {
+        let src = "target atmega328p\n\
+                   import std/uart\n\
+                   @main {\n\
+                       @uart_init(103)\n\
+                       @uart_print_str(\"Hi\")\n\
+                   }\n";
+        analysis::sync_std_imports(src);
+        let art = analysis::compile(src).expect("program compiles");
+
+        let hex = std::env::temp_dir().join("ikide_uart_test.hex");
+        std::fs::write(&hex, &art.hex).unwrap();
+
+        let mut vm = runner::build_vm(&art.device);
+        ik8bvm::hw::load_hex(&mut vm, &hex.to_string_lossy()).expect("HEX loads");
+        vm.capture_io = true;
+
+        let mut steps = 0;
+        while vm.running && steps < 2_000_000 {
+            vm.step();
+            steps += 1;
+        }
+
+        let sent: Vec<u8> = vm
+            .io_events
+            .iter()
+            .filter(|e| e.periph == IoPeripheral::Uart && e.write)
+            .map(|e| e.byte)
+            .collect();
+        assert_eq!(sent, b"Hi", "the UART stream should capture the printed text");
+    }
+
+    /// SPI transmissions are captured, and the configured MISO byte is latched
+    /// into the data register for the master to read back (SPDR io=0x2e ->
+    /// data-space 0x4e on the atmega328p).
+    #[test]
+    fn spi_transfer_captures_and_returns_miso() {
+        let src = "target atmega328p\n\
+                   import std/spi\n\
+                   @main {\n\
+                       @spi_init_master_raw()\n\
+                       @spi_transfer(0x42)\n\
+                   }\n";
+        analysis::sync_std_imports(src);
+        let art = analysis::compile(src).expect("program compiles");
+
+        let hex = std::env::temp_dir().join("ikide_spi_test.hex");
+        std::fs::write(&hex, &art.hex).unwrap();
+
+        let mut vm = runner::build_vm(&art.device);
+        ik8bvm::hw::load_hex(&mut vm, &hex.to_string_lossy()).expect("HEX loads");
+        vm.capture_io = true;
+        vm.spi_miso = 0xA5;
+
+        let mut steps = 0;
+        while vm.running && steps < 1_000_000 {
+            vm.step();
+            steps += 1;
+        }
+
+        let sent: Vec<u8> = vm
+            .io_events
+            .iter()
+            .filter(|e| e.periph == IoPeripheral::Spi && e.write)
+            .map(|e| e.byte)
+            .collect();
+        assert_eq!(sent, vec![0x42], "the SPI master byte should be captured");
+        assert_eq!(vm.read_data(0x4e), 0xA5, "the data register should read back the MISO response");
+    }
+
+    /// Fed UART bytes are received and echoed back: RXC reads as set while the
+    /// queue is non-empty and reading UDR pops one byte.
+    #[test]
+    fn uart_receive_echoes_fed_bytes() {
+        let src = "target atmega328p\n\
+                   import std/uart\n\
+                   @main {\n\
+                       @uart_init(103)\n\
+                       loop * {\n\
+                           ram mut $c: u8 = 0\n\
+                           @uart_receive() -> $c\n\
+                           @uart_send($c)\n\
+                       }\n\
+                   }\n";
+        analysis::sync_std_imports(src);
+        let art = analysis::compile(src).expect("program compiles");
+
+        let hex = std::env::temp_dir().join("ikide_uartrx_test.hex");
+        std::fs::write(&hex, &art.hex).unwrap();
+
+        let mut vm = runner::build_vm(&art.device);
+        ik8bvm::hw::load_hex(&mut vm, &hex.to_string_lossy()).expect("HEX loads");
+        vm.capture_io = true;
+        vm.uart_feed(b"AB");
+
+        let mut steps = 0;
+        while vm.running && steps < 1_000_000 {
+            vm.step();
+            steps += 1;
+        }
+
+        let echoed: Vec<u8> = vm
+            .io_events
+            .iter()
+            .filter(|e| e.periph == IoPeripheral::Uart && e.write)
+            .map(|e| e.byte)
+            .collect();
+        assert_eq!(echoed, b"AB", "the program should echo the bytes fed to its receiver");
+    }
+
+    /// An ADC conversion latches the host-supplied channel value into ADCH:ADCL
+    /// and clears ADSC (atmega328p: ADMUX=0x7C, ADCSRA=0x7A, ADCL=0x78, ADCH=0x79).
+    #[test]
+    fn adc_conversion_latches_injected_value() {
+        let mut vm = runner::build_vm("atmega328p");
+        vm.adc_set(2, 0x2AB); // 683, right-adjusted
+
+        vm.write_data(0x7C, 0x02); // ADMUX: select channel 2
+        vm.write_data(0x7A, 0xC7); // ADCSRA: ADEN | ADSC | prescaler
+
+        assert_eq!(vm.read_data(0x7A) & 0x40, 0, "ADSC should be cleared after conversion");
+        let lo = vm.read_data(0x78) as u16;
+        let hi = vm.read_data(0x79) as u16;
+        assert_eq!(lo | (hi << 8), 0x2AB, "ADCH:ADCL should hold the injected value");
     }
 }
