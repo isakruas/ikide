@@ -1,4 +1,0 @@
-{
-  "title": "Serial Plotter Test",
-  "description": "Generates two opposite sine waves (180 degrees out of phase) and prints them to UART. Perfect to test the Serial Plotter tab."
-}
