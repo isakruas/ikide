@@ -239,12 +239,19 @@ fn render_plotter(app: &mut IkIdeApp, ui: &mut egui::Ui) {
     
     ui.add_space(4.0);
     
-    // Determine canvas height based on stats table visibility
-    let canvas_height = if app.plot_show_stats {
-        ui.available_height() - 100.0
-    } else {
-        ui.available_height() - 10.0
-    };
+    // Determine canvas height based on stats table visibility.
+    // Calculate the height of the stats table dynamically to prevent infinite window growth.
+    let mut stats_height = 10.0;
+    if app.plot_show_stats {
+        let mut visible_channels = 0;
+        for ch in 0..num_channels {
+            if ch < app.plot_visible.len() && app.plot_visible[ch] {
+                visible_channels += 1;
+            }
+        }
+        stats_height = 45.0 + (visible_channels as f32 * 20.0);
+    }
+    let canvas_height = ui.available_height() - stats_height;
     let canvas_height = canvas_height.max(150.0);
     
     let (response, painter) = ui.allocate_painter(egui::vec2(ui.available_width(), canvas_height), egui::Sense::hover());
