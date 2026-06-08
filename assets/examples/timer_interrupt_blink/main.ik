@@ -12,21 +12,30 @@ import std/uart
 import std/conv
 import std/delay
 
-# Global counter incremented by ISR
-ram mut $timer1_ticks: u16 = 0
-ram mut $state: u8 = 0
+# Constants for shared variables in RAM (safe area at the end of ATmega32 SRAM)
+const TIMER1_TICKS_ADDR: u16 = 0x0800
+const STATE_ADDR: u16 = 0x0802
+
+# Hardware Registers for Timer1 Configuration on ATmega32
+const %TIMSK: u16 = 0x0059
+const %TCCR1B: u16 = 0x004E
 
 isr TIMER1_OVF {
-    $timer1_ticks + 1 -> $timer1_ticks
+    ram ptr u16 $timer1_ticks_ptr = TIMER1_TICKS_ADDR
+    ram ptr u8 $state_ptr = STATE_ADDR
+
+    ram imut $ticks: u16 = *$timer1_ticks_ptr + 1
+    $ticks -> *$timer1_ticks_ptr
     
     # Toggle PB0 (LED) status
-    ? $state == 0 {
-        1 -> $state
+    ram imut $st: u8 = *$state_ptr
+    ? $st == 0 {
+        1 -> *$state_ptr
         # Turn PB0 high (using PORTB value)
         ram imut $pb_val: u8 = %PORTB | 1
         $pb_val -> %PORTB
     } : {
-        0 -> $state
+        0 -> *$state_ptr
         # Turn PB0 low
         ram imut $pb_val: u8 = %PORTB & 0xFE
         $pb_val -> %PORTB
@@ -69,6 +78,12 @@ isr TIMER1_OVF {
     # Start Timer1 with Prescaler 64 (CS11 and CS10 bits set in TCCR1B -> 3)
     3 -> %TCCR1B
 
+    # Initialize shared variables in RAM via pointers
+    ram ptr u16 $timer1_ticks_ptr = TIMER1_TICKS_ADDR
+    ram ptr u8 $state_ptr = STATE_ADDR
+    0 -> *$timer1_ticks_ptr
+    0 -> *$state_ptr
+
     # Enable interrupts globally
     @sei()
 
@@ -77,7 +92,7 @@ isr TIMER1_OVF {
 
     loop * {
         # Check if ticks changed
-        ram imut $current_ticks: u16 = $timer1_ticks
+        ram imut $current_ticks: u16 = *$timer1_ticks_ptr
         ? $current_ticks != $last_tick {
             $current_ticks -> $last_tick
             

@@ -48,14 +48,12 @@ import std/conv
     # Read back and print
     @uart_print_str("Reading values back from EEPROM:\n")
     
-    ram mut $addr: u16 = 0x0010
-    loop * {
+    loop 0x0010..0x0015 -> $addr {
         ram imut $val: u8 = @eeprom_read($addr)
         
         @uart_print_str("Addr [0x")
         # Print address
-        ram imut $addr_val: u16 = $addr
-        @utoa($addr_val, &$buf[0])
+        @utoa($addr, &$buf[0])
         @uart_print_str(&$buf[0])
         @uart_print_str("] = ")
         
@@ -64,11 +62,6 @@ import std/conv
         @utoa($val_u16, &$buf[0])
         @uart_print_str(&$buf[0])
         @uart_println()
-
-        $addr + 1 -> $addr
-        ? $addr > 0x0014 {
-            break
-        }
     }
 
     @uart_print_str("EEPROM operations completed.\n")
