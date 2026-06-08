@@ -106,7 +106,17 @@ pub struct IkIdeApp {
     pub show_about: bool,
     pub show_examples: bool,
     pub show_serial: bool,
+    pub show_breadboard: bool,
     pub is_busy: bool,
+
+    // Breadboard: visual schematic driven by a live simulation.
+    pub breadboard: crate::ui::breadboard::Breadboard,
+    pub live: Option<crate::core::sim_live::LiveHandle>,
+    pub live_regs: std::collections::HashMap<u32, u8>,
+    pub live_cycles: u64,
+    pub live_running: bool,
+    pub live_status: String,
+    pub bb_clock_hz: u32,
 
     // Serial monitor.
     pub serial: Option<crate::core::serial::SerialConn>,
@@ -218,7 +228,15 @@ impl Default for IkIdeApp {
             show_about: false,
             show_examples: false,
             show_serial: false,
+            show_breadboard: false,
             is_busy: false,
+            breadboard: crate::ui::breadboard::Breadboard::default(),
+            live: None,
+            live_regs: std::collections::HashMap::new(),
+            live_cycles: 0,
+            live_running: false,
+            live_status: String::new(),
+            bb_clock_hz: 16_000_000,
             serial: None,
             serial_port: settings.serial_port.clone(),
             serial_baud: settings.serial_baud,
@@ -411,6 +429,72 @@ impl IkIdeApp {
             peek_addr,
             peek_len: self.sim_peek_len.max(1),
         }
+    }
+
+    /// Compile the active buffer and start a live breadboard simulation: the
+    /// VM runs continuously and the breadboard panel mirrors its I/O ports.
+    pub fn start_breadboard(&mut self) {
+        let content = match self.active_tab.and_then(|i| self.open_tabs.get(i)) {
+            Some(t) => t.content.clone(),
+            None => return,
+        };
+        self.stop_breadboard();
+        self.live_status.clear();
+
+        analysis::sync_std_imports(&content);
+        let artifact = match analysis::compile(&content) {
+            Ok(a) => a,
+            Err(diag) => {
+                let loc = if diag.line > 0 { format!("line {}: ", diag.line) } else { String::new() };
+                self.live_status = format!("Compilation failed — {}{}", loc, diag.message);
+                return;
+            }
+        };
+        let device = artifact.device.clone();
+        // Write the HEX to a temp file the live engine loads into the core.
+        let hex_path = std::env::temp_dir().join("ikide_breadboard.hex");
+        if let Err(e) = std::fs::write(&hex_path, &artifact.hex) {
+            self.live_status = format!("Failed to stage HEX: {}", e);
+            return;
+        }
+
+        let watch = crate::core::board::watch_addrs(&device);
+        self.breadboard.ensure_pins(&device);
+        self.live_regs.clear();
+        self.live_cycles = 0;
+        self.live_running = true;
+        self.live = Some(crate::core::sim_live::spawn(device, hex_path, self.bb_clock_hz, watch));
+    }
+
+    /// Tear down a running breadboard simulation.
+    pub fn stop_breadboard(&mut self) {
+        if let Some(live) = self.live.take() {
+            live.stop();
+        }
+        self.live_running = false;
+    }
+
+    /// Drain the live engine's latest register snapshots into the UI state.
+    /// Returns true while a live simulation is active (so the caller keeps
+    /// repainting).
+    pub fn pump_live(&mut self) -> bool {
+        let mut halt: Option<String> = None;
+        if let Some(live) = &self.live {
+            while let Ok(snap) = live.snap_rx.try_recv() {
+                self.live_regs = snap.regs;
+                self.live_cycles = snap.cycles;
+                self.live_running = snap.running;
+                if let Some(reason) = snap.halt_reason {
+                    halt = Some(reason);
+                }
+            }
+        } else {
+            return false;
+        }
+        if let Some(reason) = halt {
+            self.live_status = reason;
+        }
+        true
     }
 
     /// Whether the active tab is an ik8b source. Only `.ik` files get compiled,
@@ -788,6 +872,11 @@ impl eframe::App for IkIdeApp {
             ctx.request_repaint_after(Duration::from_millis(50));
         }
 
+        // Drain live breadboard snapshots and keep animating while it runs.
+        if self.pump_live() {
+            ctx.request_repaint_after(Duration::from_millis(16));
+        }
+
         // Live, debounced background type-check of the active buffer.
         if let Some(wait) = self.maybe_run_check() {
             ctx.request_repaint_after(wait);
@@ -898,6 +987,7 @@ impl eframe::App for IkIdeApp {
                     ui.checkbox(&mut self.show_stats, "Resource Stats");
                     ui.checkbox(&mut self.show_minimap, "Minimap");
                     ui.checkbox(&mut self.show_serial, "Serial Monitor");
+                    ui.checkbox(&mut self.show_breadboard, "Breadboard");
                     ui.separator();
                     if ui.add_enabled(!self.is_busy, egui::Button::new("🔄 Refresh Explorer")).clicked() {
                         self.refresh_files();
@@ -1399,6 +1489,7 @@ impl eframe::App for IkIdeApp {
             right_panel::render(self, ctx);
         }
         crate::ui::serial::render(self, ctx);
+        crate::ui::breadboard::render(self, ctx);
         editor::render(self, ctx);
     }
 

@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub mod breadboard;
 pub mod editor;
 pub mod explorer;
 pub mod serial;
