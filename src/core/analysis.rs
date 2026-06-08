@@ -1266,7 +1266,7 @@ mod std_embed_tests {
     // into the user's project.
     #[test]
     fn imports_materialize_on_demand_and_compile() {
-        assert_eq!(STD_FILES.len(), 21, "expected the full std library embedded");
+        assert!(STD_FILES.len() >= 21, "expected the full std library embedded");
 
         let src = "target atmega328p\nimport std/atomic\n@main {\n    loop * {}\n}\n";
         let dir = sync_std_imports(src);

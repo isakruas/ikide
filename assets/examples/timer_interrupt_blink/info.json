@@ -1,0 +1,4 @@
+{
+  "title": "Timer Interrupt Blinker",
+  "description": "Uses Timer1 overflow interrupt to toggle a pin (PB0) at periodic intervals without blocking CPU execution. Logs events via UART."
+}

@@ -50,6 +50,18 @@ pub struct Settings {
     pub bootloader_port: String,
     pub bootloader_baud: u32,
 
+    // Burn Bootloader preferences.
+    pub burn_path: String,
+    #[serde(skip)]
+    pub burn_target: String,
+    pub burn_f_cpu: u32,
+    pub burn_baud: u32,
+    pub burn_programmer: String,
+    pub burn_port: String,
+    pub burn_baudrate: String,
+    #[serde(skip)]
+    pub burn_additional_flags: String,
+
     // Serial monitor preferences.
     pub serial_port: String,
     pub serial_baud: u32,
@@ -81,6 +93,14 @@ impl Default for Settings {
             avrdude_target: "atmega32a".to_string(),
             bootloader_port: String::new(),
             bootloader_baud: 9600,
+            burn_path: "avrdude".to_string(),
+            burn_target: String::new(),
+            burn_f_cpu: 8_000_000,
+            burn_baud: 9600,
+            burn_programmer: "usbasp".to_string(),
+            burn_port: "usb".to_string(),
+            burn_baudrate: "-B 10".to_string(),
+            burn_additional_flags: String::new(),
             serial_port: String::new(),
             serial_baud: 9600,
             left_panel_width: 250.0,

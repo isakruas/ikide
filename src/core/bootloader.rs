@@ -259,6 +259,50 @@ pub fn upload(port_name: &str, baud: u32, hex_path: &Path, log: &dyn Fn(String))
     }
 }
 
+/// Returns true if the device is supported by `std/bootloader`.
+pub fn has_bootloader_support(device: &str) -> bool {
+    let d = device.trim().to_lowercase();
+    matches!(
+        d.as_str(),
+        "at90can32" | "at90can64" |
+        "at90pwm216" | "at90pwm2b" | "at90pwm316" | "at90pwm3b" |
+        "ata6612c" | "ata6613c" | "ata6614q" |
+        "atmega16" | "atmega162" | "atmega163" | "atmega164a" | "atmega164p" | "atmega164pa" |
+        "atmega165" | "atmega165a" | "atmega165p" | "atmega165pa" |
+        "atmega168" | "atmega168a" | "atmega168p" | "atmega168pa" |
+        "atmega169" | "atmega169a" | "atmega169p" | "atmega169pa" |
+        "atmega16a" |
+        "atmega32" | "atmega324a" | "atmega324p" | "atmega324pa" |
+        "atmega325" | "atmega3250" | "atmega3250a" | "atmega3250p" | "atmega3250pa" |
+        "atmega325a" | "atmega325p" | "atmega325pa" |
+        "atmega328" | "atmega328p" |
+        "atmega329" | "atmega3290" | "atmega3290a" | "atmega3290p" | "atmega3290pa" |
+        "atmega329a" | "atmega329p" | "atmega329pa" |
+        "atmega32a" | "atmega32c1" | "atmega32hvb" | "atmega32hvbrevb" | "atmega32m1" |
+        "atmega32u2" | "atmega32u4" | "atmega32u6" |
+        "atmega64" | "atmega640" | "atmega644" | "atmega644a" | "atmega644p" |
+        "atmega644pa" | "atmega645" | "atmega6450" | "atmega6450a" | "atmega6450p" |
+        "atmega645a" | "atmega649" | "atmega6490" | "atmega6490a" | "atmega6490p" |
+        "atmega649a" | "atmega64a" | "atmega64c1" | "atmega64m1" |
+        "atmega8" | "atmega8515" | "atmega8535" | "atmega88" | "atmega88a" |
+        "atmega88p" | "atmega88pa" | "atmega8a" | "atmega8hva" | "atmega8u2"
+    )
+}
+
+/// Suggest fuse flags for burning the bootloader on the given device.
+pub fn suggest_burn_fuse_flags(device: &str) -> String {
+    let d = device.trim().to_lowercase();
+    if d.is_empty() {
+        String::new()
+    } else if d == "atmega328p" || d == "atmega328" {
+        "-U lfuse:w:0xFF:m -U hfuse:w:0xD8:m -U efuse:w:0xFD:m".to_string()
+    } else if d == "atmega32" || d == "atmega32a" || d == "atmega16" || d == "atmega16a" {
+        "-U lfuse:w:0xFF:m -U hfuse:w:0xD8:m".to_string()
+    } else {
+        "-U lfuse:w:0xFF:m -U hfuse:w:0xD8:m".to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

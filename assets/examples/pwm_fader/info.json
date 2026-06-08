@@ -1,0 +1,4 @@
+{
+  "title": "PWM Duty Cycle Fader",
+  "description": "Generates a PWM signal on Timer0 with a duty cycle that sweeps up and down, outputting the current duty cycle and status to the Serial Monitor."
+}

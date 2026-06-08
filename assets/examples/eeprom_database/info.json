@@ -1,0 +1,4 @@
+{
+  "title": "EEPROM Configuration Database",
+  "description": "Demonstrates reading and writing user configuration data from the EEPROM. Shows memory logging and dumps over the Serial Monitor."
+}

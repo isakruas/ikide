@@ -40,6 +40,7 @@ fn stamp(msg: &str) -> String {
     }
 }
 
+
 /// True when `path` is an ik8b source the IDE should compile, lint and style.
 pub fn is_ik_file(path: &std::path::Path) -> bool {
     path.extension().and_then(|e| e.to_str()) == Some("ik")
@@ -64,8 +65,10 @@ pub struct ExampleInfo {
     pub title: String,
     pub description: String,
     #[serde(skip)]
-    pub path: PathBuf,
+    pub embedded_index: usize,
 }
+
+include!(concat!(env!("OUT_DIR"), "/examples_embed.rs"));
 
 pub enum ActionPopup {
     None,
@@ -122,6 +125,8 @@ pub struct IkIdeApp {
     pub plot_window_size: usize,
     pub plot_show_stats: bool,
     pub examples: Vec<ExampleInfo>,
+    pub example_search: String,
+    pub example_page: usize,
     pub last_disk_check: Instant,
     
     // In-process simulation preferences.
@@ -146,6 +151,16 @@ pub struct IkIdeApp {
     // Serial-bootloader upload preferences.
     pub bootloader_port: String,
     pub bootloader_baud: u32,
+
+    // Burn Bootloader preferences.
+    pub burn_path: String,
+    pub burn_target: String,
+    pub burn_f_cpu: u32,
+    pub burn_baud: u32,
+    pub burn_programmer: String,
+    pub burn_port: String,
+    pub burn_baudrate: String,
+    pub burn_additional_flags: String,
 
     // Language intelligence (compiler-backed).
     pub std_index: SymbolIndex,
@@ -220,6 +235,8 @@ impl Default for IkIdeApp {
             plot_window_size: 500,
             plot_show_stats: true,
             examples: Vec::new(),
+            example_search: String::new(),
+            example_page: 0,
             last_disk_check: Instant::now(),
             vm_max_cycles: settings.vm_max_cycles,
             sim_trace: settings.sim_trace,
@@ -236,6 +253,14 @@ impl Default for IkIdeApp {
             avrdude_target: settings.avrdude_target.clone(),
             bootloader_port: settings.bootloader_port.clone(),
             bootloader_baud: settings.bootloader_baud,
+            burn_path: settings.burn_path.clone(),
+            burn_target: settings.burn_target.clone(),
+            burn_f_cpu: settings.burn_f_cpu,
+            burn_baud: settings.burn_baud,
+            burn_programmer: settings.burn_programmer.clone(),
+            burn_port: settings.burn_port.clone(),
+            burn_baudrate: settings.burn_baudrate.clone(),
+            burn_additional_flags: settings.burn_additional_flags.clone(),
             std_index,
             devices,
             diagnostics: Vec::new(),
@@ -279,6 +304,14 @@ impl IkIdeApp {
             avrdude_target: self.avrdude_target.clone(),
             bootloader_port: self.bootloader_port.clone(),
             bootloader_baud: self.bootloader_baud,
+            burn_path: self.burn_path.clone(),
+            burn_target: self.burn_target.clone(),
+            burn_f_cpu: self.burn_f_cpu,
+            burn_baud: self.burn_baud,
+            burn_programmer: self.burn_programmer.clone(),
+            burn_port: self.burn_port.clone(),
+            burn_baudrate: self.burn_baudrate.clone(),
+            burn_additional_flags: self.burn_additional_flags.clone(),
             serial_port: self.serial_port.clone(),
             serial_baud: self.serial_baud,
             left_panel_width: self.left_panel_width,
@@ -530,6 +563,44 @@ impl IkIdeApp {
             }
         }
     }
+
+    pub fn trigger_burn_bootloader(&mut self) {
+        let ubrr = (self.burn_f_cpu / (16 * self.burn_baud)).saturating_sub(1);
+        let src = format!(
+            "target {}\nimport std/bootloader\n@main {{ @bootloader_run({}) }}\n",
+            self.burn_target, ubrr
+        );
+
+        crate::core::analysis::sync_std_imports(&src);
+        match crate::core::analysis::compile(&src) {
+            Ok(artifact) => {
+                self.is_busy = true;
+                self.show_terminal = true;
+                self.terminal_output.clear();
+                self.terminal_output.push_str(&format!("{} --- Burning Bootloader ---\n", now_ts()));
+                
+                crate::core::runner::spawn_burn_bootloader(
+                    self.burn_path.clone(),
+                    self.burn_target.clone(),
+                    self.burn_programmer.clone(),
+                    self.burn_port.clone(),
+                    self.burn_baudrate.clone(),
+                    self.burn_additional_flags.clone(),
+                    artifact.hex,
+                    self.task_tx.clone(),
+                );
+            }
+            Err(diag) => {
+                self.show_terminal = true;
+                self.terminal_output.clear();
+                self.terminal_output.push_str(&format!(
+                    "{} Compilation failed — {}\n",
+                    now_ts(),
+                    diag.message
+                ));
+            }
+        }
+    }
     
     pub fn render_popups(&mut self, ctx: &egui::Context) {
         let mut close_popup = false;
@@ -656,56 +727,13 @@ impl IkIdeApp {
             self.refresh_files();
         }
     }
-}
-
-fn copy_dir_all(src: impl AsRef<std::path::Path>, dst: impl AsRef<std::path::Path>) -> std::io::Result<()> {
-    std::fs::create_dir_all(&dst)?;
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let ty = entry.file_type()?;
-        if ty.is_dir() {
-            copy_dir_all(entry.path(), dst.as_ref().join(entry.file_name()))?;
-        } else {
-            std::fs::copy(entry.path(), dst.as_ref().join(entry.file_name()))?;
-        }
-    }
-    Ok(())
-}
-
-impl IkIdeApp {
     pub fn scan_examples(&mut self) {
         self.examples.clear();
-        let paths_to_try = [
-            std::env::current_dir().unwrap_or_default().join("assets/examples"),
-            std::env::current_exe()
-                .ok()
-                .and_then(|p| p.parent().map(|p| p.join("assets/examples")))
-                .unwrap_or_default(),
-            PathBuf::from("assets/examples"),
-        ];
-        let mut examples_dir = None;
-        for path in &paths_to_try {
-            if path.is_dir() {
-                examples_dir = Some(path.clone());
-                break;
-            }
-        }
-        let Some(dir) = examples_dir else {
-            return;
-        };
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    let info_json = path.join("info.json");
-                    if info_json.is_file() {
-                        if let Ok(content) = std::fs::read_to_string(&info_json) {
-                            if let Ok(mut info) = serde_json::from_str::<ExampleInfo>(&content) {
-                                info.path = path;
-                                self.examples.push(info);
-                            }
-                        }
-                    }
+        for (idx, ex) in EMBEDDED_EXAMPLES.iter().enumerate() {
+            if let Some(info_file) = ex.files.iter().find(|f| f.name == "info.json") {
+                if let Ok(mut info) = serde_json::from_str::<ExampleInfo>(info_file.content) {
+                    info.embedded_index = idx;
+                    self.examples.push(info);
                 }
             }
         }
@@ -961,128 +989,211 @@ impl eframe::App for IkIdeApp {
                     ui.label(egui::RichText::new("Compiler & simulator are built in — only their settings are exposed.").weak().small());
                     ui.separator();
 
-                    egui::CollapsingHeader::new("Simulation").default_open(true).show(ui, |ui| {
-                        ui.label(egui::RichText::new("Runs in-process — no external VM binary.").weak().small());
-                        egui::Grid::new("sim_grid").num_columns(2).spacing([10.0, 10.0]).show(ui, |ui| {
-                            ui.label("Max Instructions:");
-                            ui.add(egui::DragValue::new(&mut self.vm_max_cycles).speed(1000).range(0..=1_000_000_000))
-                                .on_hover_text("Stop after this many executed instructions. 0 = run until the core halts.");
-                            ui.end_row();
+                    egui::ScrollArea::vertical().max_height(450.0).show(ui, |ui| {
+                        egui::CollapsingHeader::new("Simulation").default_open(true).show(ui, |ui| {
+                            ui.label(egui::RichText::new("Runs in-process — no external VM binary.").weak().small());
+                            egui::Grid::new("sim_grid").num_columns(2).spacing([10.0, 10.0]).show(ui, |ui| {
+                                ui.label("Max Instructions:");
+                                ui.add(egui::DragValue::new(&mut self.vm_max_cycles).speed(1000).range(0..=1_000_000_000))
+                                    .on_hover_text("Stop after this many executed instructions. 0 = run until the core halts.");
+                                ui.end_row();
 
-                            ui.label("Instruction Trace:");
-                            ui.checkbox(&mut self.sim_trace, "Log each executed instruction (-t)")
-                                .on_hover_text("Capture a per-instruction trace into the log. Capped to keep the UI responsive.");
-                            ui.end_row();
+                                ui.label("Instruction Trace:");
+                                ui.checkbox(&mut self.sim_trace, "Log each executed instruction (-t)")
+                                    .on_hover_text("Capture a per-instruction trace into the log. Capped to keep the UI responsive.");
+                                ui.end_row();
 
-                            ui.label("Dump Registers:");
-                            ui.checkbox(&mut self.sim_dump_regs, "Append register/flag dump to the log");
-                            ui.end_row();
+                                ui.label("Dump Registers:");
+                                ui.checkbox(&mut self.sim_dump_regs, "Append register/flag dump to the log");
+                                ui.end_row();
 
-                            ui.label("Memory Peek Addr:");
-                            ui.text_edit_singleline(&mut self.sim_peek_addr)
-                                .on_hover_text("Data-space address to read at the end of the run (0x-hex or decimal). Blank = off.");
-                            ui.end_row();
+                                ui.label("Memory Peek Addr:");
+                                ui.text_edit_singleline(&mut self.sim_peek_addr)
+                                    .on_hover_text("Data-space address to read at the end of the run (0x-hex or decimal). Blank = off.");
+                                ui.end_row();
 
-                            ui.label("Peek Length:");
-                            ui.add(egui::DragValue::new(&mut self.sim_peek_len).speed(1).range(1..=256));
-                            ui.end_row();
+                                ui.label("Peek Length:");
+                                ui.add(egui::DragValue::new(&mut self.sim_peek_len).speed(1).range(1..=256));
+                                ui.end_row();
+                            });
                         });
-                    });
 
-                    ui.add_space(5.0);
+                        ui.add_space(5.0);
 
-                    ui.label(egui::RichText::new("Upload method").strong());
-                    ui.horizontal(|ui| {
-                        ui.radio_value(&mut self.use_bootloader, true, "Bootloader")
-                            .on_hover_text("Flash through the ik serial bootloader running on the board.");
-                        ui.radio_value(&mut self.use_bootloader, false, "avrdude")
-                            .on_hover_text("Flash with an external programmer via avrdude.");
-                    });
-                    ui.label(egui::RichText::new("\"Upload to Board\" uses the selected method.").small().weak());
-                    ui.add_space(5.0);
-
-                    egui::CollapsingHeader::new("Avrdude Configuration").default_open(!self.use_bootloader).show(ui, |ui| {
-                        ui.add_enabled_ui(!self.use_bootloader, |ui| {
-                        egui::Grid::new("avrdude_grid").num_columns(2).spacing([10.0, 10.0]).show(ui, |ui| {
-                            ui.label("Executable Path:");
-                            ui.text_edit_singleline(&mut self.avrdude_path);
-                            ui.end_row();
-
-                            ui.label("Target MCU:");
-                            egui::ComboBox::from_id_salt("mcu_target")
-                                .selected_text(&self.avrdude_target)
-                                .show_ui(ui, |ui| {
-                                    for (dev, _) in &self.devices {
-                                        ui.selectable_value(&mut self.avrdude_target, dev.clone(), dev);
-                                    }
-                                });
-                            ui.end_row();
-                            
-                            ui.label("Programmer:");
-                            egui::ComboBox::from_id_salt("programmer_target")
-                                .selected_text(&self.avrdude_programmer)
-                                .show_ui(ui, |ui| {
-                                    for p in ["arduino", "usbasp", "usbtiny", "avrispmkII", "stk500v1", "stk500v2", "micronucleus"] {
-                                        ui.selectable_value(&mut self.avrdude_programmer, p.to_string(), p);
-                                    }
-                                });
-                            ui.end_row();
-                            
-                            ui.label("Port:");
-                            ui.text_edit_singleline(&mut self.avrdude_port);
-                            ui.end_row();
-
-                            ui.label("Baudrate (opt):");
-                            ui.text_edit_singleline(&mut self.avrdude_baudrate);
-                            ui.end_row();
-                            
-                            ui.label("Additional Flags:");
-                            ui.text_edit_singleline(&mut self.avrdude_additional_flags);
-                            ui.end_row();
+                        ui.label(egui::RichText::new("Upload method").strong());
+                        ui.horizontal(|ui| {
+                            ui.radio_value(&mut self.use_bootloader, true, "Bootloader")
+                                .on_hover_text("Flash through the ik serial bootloader running on the board.");
+                            ui.radio_value(&mut self.use_bootloader, false, "avrdude")
+                                .on_hover_text("Flash with an external programmer via avrdude.");
                         });
-                        });
-                    });
+                        ui.label(egui::RichText::new("\"Upload to Board\" uses the selected method.").small().weak());
+                        ui.add_space(5.0);
 
-                    ui.add_space(5.0);
-                    egui::CollapsingHeader::new("Bootloader Upload").default_open(true).show(ui, |ui| {
-                        ui.label(egui::RichText::new(
-                            "Flash through the ik serial bootloader running on the board.",
-                        ).small().weak());
-                        egui::Grid::new("bootloader_grid").num_columns(2).spacing([10.0, 10.0]).show(ui, |ui| {
-                            ui.label("Serial Port:");
-                            ui.horizontal(|ui| {
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut self.bootloader_port)
-                                        .desired_width(160.0)
-                                        .hint_text("/dev/ttyUSB0"),
-                                );
-                                egui::ComboBox::from_id_salt("bootloader_port_pick")
-                                    .selected_text("▾")
-                                    .width(16.0)
+                        egui::CollapsingHeader::new("Avrdude Configuration").default_open(!self.use_bootloader).show(ui, |ui| {
+                            ui.add_enabled_ui(!self.use_bootloader, |ui| {
+                            egui::Grid::new("avrdude_grid").num_columns(2).spacing([10.0, 10.0]).show(ui, |ui| {
+                                ui.label("Executable Path:");
+                                ui.text_edit_singleline(&mut self.avrdude_path);
+                                ui.end_row();
+
+                                ui.label("Target MCU:");
+                                egui::ComboBox::from_id_salt("mcu_target")
+                                    .selected_text(&self.avrdude_target)
                                     .show_ui(ui, |ui| {
-                                        let ports = crate::core::serial::list_ports();
-                                        if ports.is_empty() {
-                                            ui.label(egui::RichText::new("no ports found").weak());
-                                        }
-                                        for p in ports {
-                                            ui.selectable_value(&mut self.bootloader_port, p.clone(), p);
+                                        for (dev, _) in &self.devices {
+                                            ui.selectable_value(&mut self.avrdude_target, dev.clone(), dev);
                                         }
                                     });
-                            });
-                            ui.end_row();
+                                ui.end_row();
+                                
+                                ui.label("Programmer:");
+                                egui::ComboBox::from_id_salt("programmer_target")
+                                    .selected_text(&self.avrdude_programmer)
+                                    .show_ui(ui, |ui| {
+                                        for p in ["arduino", "usbasp", "usbtiny", "avrispmkII", "stk500v1", "stk500v2", "micronucleus"] {
+                                            ui.selectable_value(&mut self.avrdude_programmer, p.to_string(), p);
+                                        }
+                                    });
+                                ui.end_row();
+                                
+                                ui.label("Port:");
+                                ui.text_edit_singleline(&mut self.avrdude_port);
+                                ui.end_row();
 
-                            ui.label("Baud:");
-                            let mut baud_str = self.bootloader_baud.to_string();
-                            if ui.text_edit_singleline(&mut baud_str).changed() {
-                                if let Ok(b) = baud_str.trim().parse::<u32>() {
-                                    self.bootloader_baud = b;
-                                }
-                            }
-                            ui.end_row();
+                                ui.label("Baudrate (opt):");
+                                ui.text_edit_singleline(&mut self.avrdude_baudrate);
+                                ui.end_row();
+                                
+                                ui.label("Additional Flags:");
+                                ui.text_edit_singleline(&mut self.avrdude_additional_flags);
+                                ui.end_row();
+                            });
+                            });
                         });
-                        ui.label(egui::RichText::new(
-                            "Baud must match the bootloader's BL_UBRR (default 9600 @ 8 MHz).",
-                        ).small().weak());
+
+                        ui.add_space(5.0);
+                        egui::CollapsingHeader::new("Bootloader Upload").default_open(true).show(ui, |ui| {
+                            ui.label(egui::RichText::new(
+                                "Flash through the ik serial bootloader running on the board.",
+                            ).small().weak());
+                            egui::Grid::new("bootloader_grid").num_columns(2).spacing([10.0, 10.0]).show(ui, |ui| {
+                                ui.label("Serial Port:");
+                                ui.horizontal(|ui| {
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut self.bootloader_port)
+                                            .desired_width(160.0)
+                                            .hint_text("/dev/ttyUSB0"),
+                                    );
+                                    egui::ComboBox::from_id_salt("bootloader_port_pick")
+                                        .selected_text("▾")
+                                        .width(16.0)
+                                        .show_ui(ui, |ui| {
+                                            let ports = crate::core::serial::list_ports();
+                                            if ports.is_empty() {
+                                                ui.label(egui::RichText::new("no ports found").weak());
+                                            }
+                                            for p in ports {
+                                                ui.selectable_value(&mut self.bootloader_port, p.clone(), p);
+                                            }
+                                        });
+                                });
+                                ui.end_row();
+
+                                ui.label("Baud:");
+                                let mut baud_str = self.bootloader_baud.to_string();
+                                if ui.text_edit_singleline(&mut baud_str).changed() {
+                                    if let Ok(b) = baud_str.trim().parse::<u32>() {
+                                        self.bootloader_baud = b;
+                                    }
+                                }
+                                ui.end_row();
+                            });
+                            ui.label(egui::RichText::new(
+                                "Baud must match the bootloader's BL_UBRR (default 9600 @ 8 MHz).",
+                            ).small().weak());
+                        });
+
+                        ui.add_space(5.0);
+                        egui::CollapsingHeader::new("Burn Bootloader").default_open(false).show(ui, |ui| {
+                            ui.label(egui::RichText::new(
+                                "Compile the standard bootloader for a target chip and write it using avrdude with fuses.",
+                            ).small().weak());
+                            
+                            egui::Grid::new("burn_bootloader_grid").num_columns(2).spacing([10.0, 10.0]).show(ui, |ui| {
+                                ui.label("Executable Path:");
+                                ui.text_edit_singleline(&mut self.burn_path);
+                                ui.end_row();
+
+                                ui.label("Target MCU:");
+                                let old_target = self.burn_target.clone();
+                                let display_text = if self.burn_target.is_empty() {
+                                    "Select MCU..."
+                                } else {
+                                    &self.burn_target
+                                };
+                                egui::ComboBox::from_id_salt("burn_target_pick")
+                                    .selected_text(display_text)
+                                    .show_ui(ui, |ui| {
+                                        for (dev, _) in &self.devices {
+                                            if crate::core::bootloader::has_bootloader_support(dev) {
+                                                ui.selectable_value(&mut self.burn_target, dev.clone(), dev);
+                                            }
+                                        }
+                                    });
+                                if self.burn_target != old_target {
+                                    self.burn_additional_flags = crate::core::bootloader::suggest_burn_fuse_flags(&self.burn_target);
+                                }
+                                ui.end_row();
+
+                                ui.label("Clock F_CPU (Hz):");
+                                ui.add(egui::DragValue::new(&mut self.burn_f_cpu).speed(1000000).range(1_000_000..=32_000_000))
+                                    .on_hover_text("Calculates the bootloader UART divisor based on this crystal/internal clock frequency.");
+                                ui.end_row();
+
+                                ui.label("Baudrate (bps):");
+                                let mut baud_str = self.burn_baud.to_string();
+                                if ui.text_edit_singleline(&mut baud_str).changed() {
+                                    if let Ok(b) = baud_str.trim().parse::<u32>() {
+                                        self.burn_baud = b;
+                                    }
+                                }
+                                ui.end_row();
+
+                                ui.label("Programmer:");
+                                egui::ComboBox::from_id_salt("burn_programmer_pick")
+                                    .selected_text(&self.burn_programmer)
+                                    .show_ui(ui, |ui| {
+                                        for p in ["arduino", "usbasp", "usbtiny", "avrispmkII", "stk500v1", "stk500v2", "micronucleus"] {
+                                            ui.selectable_value(&mut self.burn_programmer, p.to_string(), p);
+                                        }
+                                    });
+                                ui.end_row();
+
+                                ui.label("Port:");
+                                ui.text_edit_singleline(&mut self.burn_port);
+                                ui.end_row();
+
+                                ui.label("Baudrate (opt):");
+                                ui.text_edit_singleline(&mut self.burn_baudrate);
+                                ui.end_row();
+
+                                ui.label("Additional Flags:");
+                                ui.text_edit_singleline(&mut self.burn_additional_flags)
+                                    .on_hover_text("Specify avrdude flags here, including fuses (e.g. -U lfuse:w:0xFF:m -U hfuse:w:0xD8:m).");
+                                ui.end_row();
+                            });
+
+                            ui.add_space(5.0);
+                            ui.horizontal(|ui| {
+                                let can_burn = !self.is_busy && !self.burn_target.is_empty();
+                                ui.add_enabled_ui(can_burn, |ui| {
+                                    if ui.button("🔥 Burn Bootloader").clicked() {
+                                        self.trigger_burn_bootloader();
+                                    }
+                                });
+                            });
+                        });
                     });
 
                     ui.add_space(10.0);
@@ -1161,54 +1272,117 @@ impl eframe::App for IkIdeApp {
                 .title_bar(false)
                 .collapsible(false)
                 .resizable(false)
+                .default_width(600.0)
                 .show(ctx, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("📚 Built-in Examples").strong());
-                    });
+                    ui.label(egui::RichText::new("📚 Examples Library").strong());
                     ui.label(egui::RichText::new("Click an example to load it into your current workspace.").weak().small());
                     ui.separator();
                     
                     if self.examples.is_empty() {
-                        ui.label("No examples found. Please verify the examples directory exists and contains info.json files.");
+                        ui.label("No examples found.");
                     } else {
-                        for (idx, ex) in self.examples.iter().enumerate() {
-                            ui.group(|ui| {
-                                ui.label(egui::RichText::new(format!("🚀 {}", ex.title)).strong());
-                                ui.label(&ex.description);
-                                ui.add_space(6.0);
-                                ui.add_enabled_ui(self.workspace_dir.is_some(), |ui| {
-                                    if ui.button("Load Example").clicked() {
-                                        load_example_idx = Some(idx);
-                                    }
-                                });
+                        // Search Input
+                        ui.horizontal(|ui| {
+                            ui.label("🔍 Search:");
+                            let old_search = self.example_search.clone();
+                            ui.text_edit_singleline(&mut self.example_search);
+                            if self.example_search != old_search {
+                                self.example_page = 0;
+                            }
+                            if !self.example_search.is_empty() {
+                                if ui.button("Clear").clicked() {
+                                    self.example_search.clear();
+                                    self.example_page = 0;
+                                }
+                            }
+                        });
+                        ui.add_space(6.0);
+                        
+                        let query = self.example_search.trim().to_lowercase();
+                        let filtered: Vec<&ExampleInfo> = self.examples.iter()
+                            .filter(|ex| {
+                                query.is_empty() || ex.title.to_lowercase().contains(&query) || ex.description.to_lowercase().contains(&query)
+                            })
+                            .collect();
+                        
+                        let page_size = 4;
+                        let total_items = filtered.len();
+                        let total_pages = (total_items + page_size - 1).max(1) / page_size;
+                        
+                        if self.example_page >= total_pages {
+                            self.example_page = 0;
+                        }
+                        
+                        let start_idx = self.example_page * page_size;
+                        let end_idx = std::cmp::min(start_idx + page_size, total_items);
+                        
+                        if filtered.is_empty() {
+                            ui.label("No examples found matching your search.");
+                        } else {
+                            egui::ScrollArea::vertical().max_height(400.0).show(ui, |ui| {
+                                for ex in &filtered[start_idx..end_idx] {
+                                    let original_idx = ex.embedded_index;
+                                    ui.group(|ui| {
+                                        ui.vertical(|ui| {
+                                            ui.horizontal(|ui| {
+                                                ui.label(egui::RichText::new(format!("🚀 {}", ex.title)).strong());
+                                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                    ui.add_enabled_ui(self.workspace_dir.is_some(), |ui| {
+                                                        if ui.button("Load Example").clicked() {
+                                                            load_example_idx = Some(original_idx);
+                                                        }
+                                                    });
+                                                });
+                                            });
+                                            ui.label(&ex.description);
+                                        });
+                                    });
+                                    ui.add_space(6.0);
+                                }
                             });
-                            ui.add_space(6.0);
+                            
+                            if total_pages > 1 {
+                                ui.separator();
+                                ui.horizontal(|ui| {
+                                    ui.add_enabled_ui(self.example_page > 0, |ui| {
+                                        if ui.button("◀ Previous").clicked() {
+                                            self.example_page -= 1;
+                                        }
+                                    });
+                                    
+                                    ui.label(format!("Page {} of {}", self.example_page + 1, total_pages));
+                                    ui.label(format!("(Showing {}-{} of {})", start_idx + 1, end_idx, total_items));
+                                    
+                                    ui.add_enabled_ui(self.example_page + 1 < total_pages, |ui| {
+                                        if ui.button("Next ▶").clicked() {
+                                            self.example_page += 1;
+                                        }
+                                    });
+                                });
+                            }
                         }
                     }
-                    ui.add_space(8.0);
-                    if ui.button("Close").clicked() {
-                        show = false;
-                    }
+                    
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        if ui.button("Close").clicked() {
+                            show = false;
+                        }
+                        if self.workspace_dir.is_none() {
+                            ui.label(egui::RichText::new("⚠️ Open a folder workspace first to load examples.").weak().small());
+                        }
+                    });
                 });
             
             if let Some(idx) = load_example_idx {
                 if let Some(dir) = &self.workspace_dir {
-                    let ex = &self.examples[idx];
-                    if let Ok(entries) = std::fs::read_dir(&ex.path) {
-                        for entry in entries.flatten() {
-                            let path = entry.path();
-                            if let Some(file_name) = path.file_name() {
-                                if file_name == "info.json" {
-                                    continue;
-                                }
-                                let target_path = dir.join(file_name);
-                                if path.is_dir() {
-                                    let _ = copy_dir_all(&path, &target_path);
-                                } else {
-                                    let _ = std::fs::copy(&path, &target_path);
-                                }
-                            }
+                    let ex_embedded = &EMBEDDED_EXAMPLES[idx];
+                    for file in ex_embedded.files {
+                        if file.name == "info.json" {
+                            continue;
                         }
+                        let target_path = dir.join(file.name);
+                        let _ = std::fs::write(&target_path, file.content);
                     }
                     self.refresh_files();
                 }

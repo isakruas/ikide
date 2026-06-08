@@ -1,0 +1,4 @@
+{
+  "title": "Multiphase Waveform Generator",
+  "description": "Generates four distinct signals (sine, cosine, triangle, and sawtooth waves) and outputs them to the Serial Plotter."
+}

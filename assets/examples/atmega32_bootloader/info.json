@@ -1,4 +1,0 @@
-{
-  "title": "ATmega32 Bootloader & Blink",
-  "description": "A complete, tested serial bootloader (9600 baud) written entirely in IK, alongside a blink application. Includes a detailed README with flashing instructions."
-}

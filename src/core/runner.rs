@@ -463,7 +463,13 @@ pub fn spawn_upload(workspace_dir: Option<PathBuf>, selected_file: Option<PathBu
                 cmd.arg(format!("-P{}", port));
             }
             if !baudrate.is_empty() {
-                cmd.arg(format!("-b{}", baudrate));
+                if baudrate.starts_with('-') {
+                    for flag in baudrate.split_whitespace() {
+                        cmd.arg(flag);
+                    }
+                } else {
+                    cmd.arg(format!("-b{}", baudrate));
+                }
             }
             
             for flag in additional_flags.split_whitespace() {
@@ -485,6 +491,74 @@ pub fn spawn_upload(workspace_dir: Option<PathBuf>, selected_file: Option<PathBu
         } else {
             let _ = tx.send(TaskMsg::Upload("No file selected to upload.\n".to_string()));
         }
+        let _ = tx.send(TaskMsg::Done);
+    });
+}
+
+pub fn spawn_burn_bootloader(
+    avrdude_path: String,
+    target: String,
+    programmer: String,
+    port: String,
+    baudrate: String,
+    additional_flags: String,
+    hex_content: String,
+    tx: Sender<TaskMsg>,
+) {
+    thread::spawn(move || {
+        let part = avrdude_part(&target);
+        let _ = tx.send(TaskMsg::Upload(format!(
+            "Burning bootloader for target {} -> avrdude -p{}...\n",
+            target, part
+        )));
+
+        // Create temporary HEX file.
+        let temp_dir = std::env::temp_dir();
+        let temp_hex_path = temp_dir.join("ik_bootloader.hex");
+        if let Err(e) = std::fs::write(&temp_hex_path, &hex_content) {
+            let _ = tx.send(TaskMsg::Upload(format!("Failed to write temporary HEX: {}\n", e)));
+            let _ = tx.send(TaskMsg::Done);
+            return;
+        }
+
+        // avrdude command using the converted part id and preferences
+        let mut cmd = Command::new(avrdude_path);
+        cmd.arg(format!("-p{}", part))
+           .arg(format!("-c{}", programmer));
+           
+        if !port.is_empty() {
+            cmd.arg(format!("-P{}", port));
+        }
+        if !baudrate.is_empty() {
+            if baudrate.starts_with('-') {
+                for flag in baudrate.split_whitespace() {
+                    cmd.arg(flag);
+                }
+            } else {
+                cmd.arg(format!("-b{}", baudrate));
+            }
+        }
+        
+        for flag in additional_flags.split_whitespace() {
+            cmd.arg(flag);
+        }
+
+        // Hex file flash write
+        cmd.arg(format!("-Uflash:w:{}:i", temp_hex_path.display()));
+
+        match cmd.output() {
+            Ok(output) => {
+                let _ = tx.send(TaskMsg::Upload(String::from_utf8_lossy(&output.stdout).into_owned()));
+                let _ = tx.send(TaskMsg::Upload(String::from_utf8_lossy(&output.stderr).into_owned()));
+                let _ = tx.send(TaskMsg::Upload("\nBootloader burning complete.\n".to_string()));
+            }
+            Err(e) => {
+                let _ = tx.send(TaskMsg::Upload(format!("Failed to run avrdude: {}\n", e)));
+            }
+        }
+
+        // Clean up temporary HEX file
+        let _ = std::fs::remove_file(temp_hex_path);
         let _ = tx.send(TaskMsg::Done);
     });
 }
