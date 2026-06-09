@@ -190,7 +190,7 @@ fn send_line(app: &mut IkIdeApp) {
 }
 
 #[allow(non_snake_case)]
-fn render_plotter(app: &mut IkIdeApp, ui: &mut egui::Ui) {
+pub fn render_plotter(app: &mut IkIdeApp, ui: &mut egui::Ui) {
     let colors = [
         egui::Color32::from_rgb(255, 85, 85),    // Red
         egui::Color32::from_rgb(85, 255, 85),    // Green

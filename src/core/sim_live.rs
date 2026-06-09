@@ -111,6 +111,7 @@ pub fn spawn(
     clock_hz: u32,
     watch: Vec<u32>,
     spi_miso: u8,
+    responder: Option<Box<dyn ik8bvm::core::BusResponder>>,
 ) -> LiveHandle {
     let (cmd_tx, cmd_rx) = mpsc::channel::<LiveCmd>();
     let (snap_tx, snap_rx) = mpsc::channel::<LiveSnapshot>();
@@ -127,6 +128,7 @@ pub fn spawn(
         }
         vm.capture_io = true;
         vm.spi_miso = spi_miso;
+        vm.responder = responder;
 
         // Pins the UI is currently forcing as inputs, re-asserted every frame so
         // a held button stays held.
@@ -163,8 +165,9 @@ pub fn spawn(
                 break;
             }
 
-            // 2. Apply forced inputs, then step a frame's worth of cycles.
+            // 2. Apply forced inputs, advance attached devices, then step.
             apply_forced(&mut vm, &forced);
+            vm.poll_devices(cycles_per_frame.max(1));
             if vm.running {
                 let mut steps = 0u64;
                 if cycles_per_frame == 0 {
@@ -387,6 +390,97 @@ mod tests {
             .map(|e| e.byte)
             .collect();
         assert_eq!(echoed, b"AB", "the program should echo the bytes fed to its receiver");
+    }
+
+    /// A mock device on every bus: SPI returns mosi+1; an I2C register file at
+    /// address 0x50; a UART byte queued to send to the MCU.
+    #[derive(Default)]
+    struct MockDevice {
+        regs: [u8; 4],
+        ptr: usize,
+        addressed: bool,
+        uart_out: std::collections::VecDeque<u8>,
+        uart_in: Vec<u8>,
+    }
+    impl ik8bvm::core::BusResponder for MockDevice {
+        fn spi_transfer(&mut self, mosi: u8) -> u8 {
+            mosi.wrapping_add(1)
+        }
+        fn i2c_address(&mut self, addr: u8, _read: bool) -> bool {
+            self.addressed = addr == 0x50;
+            self.addressed
+        }
+        fn i2c_write(&mut self, byte: u8) -> bool {
+            self.ptr = (byte as usize) % self.regs.len();
+            true
+        }
+        fn i2c_read(&mut self, _last: bool) -> u8 {
+            let b = self.regs[self.ptr];
+            self.ptr = (self.ptr + 1) % self.regs.len();
+            b
+        }
+        fn uart_tx(&mut self, byte: u8) {
+            self.uart_in.push(byte);
+        }
+        fn uart_poll(&mut self) -> Option<u8> {
+            self.uart_out.pop_front()
+        }
+    }
+
+    /// SPI routes each transferred byte through the device's `spi_transfer`.
+    #[test]
+    fn spi_routes_through_responder() {
+        let mut vm = runner::build_vm("atmega328p");
+        vm.capture_io = true;
+        vm.responder = Some(Box::new(MockDevice::default()));
+        vm.write_data(0x4E, 0x10); // SPDR (io 0x2E -> data-space 0x4E)
+        assert_eq!(vm.read_data(0x4E), 0x11, "MISO should be the device's mosi+1");
+    }
+
+    /// A full I2C master sequence (START, addr+W, set pointer, repeated START,
+    /// addr+R, read) reaches the device and reads back its register value.
+    #[test]
+    fn i2c_master_sequence_drives_device() {
+        let mut dev = MockDevice::default();
+        dev.regs = [0xAA, 0xBB, 0xCC, 0xDD];
+        let mut vm = runner::build_vm("atmega328p");
+        vm.capture_io = true;
+        vm.responder = Some(Box::new(dev));
+
+        // atmega328p: TWDR data-space 0xBB, TWCR data-space 0xBC.
+        const TWDR: u32 = 0xBB;
+        const TWCR: u32 = 0xBC;
+        const START: u8 = 0xA4; // TWINT|TWSTA|TWEN
+        const EN: u8 = 0x84; // TWINT|TWEN
+        const STOP: u8 = 0x94; // TWINT|TWSTO|TWEN
+
+        vm.write_data(TWCR, START);
+        vm.write_data(TWDR, 0xA0); // address 0x50 + write
+        vm.write_data(TWCR, EN);
+        vm.write_data(TWDR, 0x01); // set register pointer = 1
+        vm.write_data(TWCR, EN);
+        vm.write_data(TWCR, START); // repeated start
+        vm.write_data(TWDR, 0xA1); // address 0x50 + read
+        vm.write_data(TWCR, EN);
+        vm.write_data(TWCR, EN); // read with NACK (last byte)
+        let got = vm.read_data(TWDR);
+        vm.write_data(TWCR, STOP);
+
+        assert_eq!(got, 0xBB, "the master should read register 1's value");
+    }
+
+    /// A device's queued UART byte is delivered to the MCU via poll_devices:
+    /// RXC reads set and the data register yields the byte.
+    #[test]
+    fn uart_device_byte_reaches_mcu() {
+        let mut dev = MockDevice::default();
+        dev.uart_out.push_back(b'Z');
+        let mut vm = runner::build_vm("atmega328p");
+        vm.responder = Some(Box::new(dev));
+
+        vm.poll_devices(0);
+        assert!(vm.read_data(0xC0) & 0x80 != 0, "RXC should be set"); // UCSR0A
+        assert_eq!(vm.read_data(0xC6), b'Z'); // UDR0
     }
 
     /// An ADC conversion latches the host-supplied channel value into ADCH:ADCL

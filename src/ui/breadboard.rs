@@ -28,6 +28,7 @@ use eframe::egui;
 
 use crate::app::IkIdeApp;
 use crate::core::board::{self, Pin};
+use crate::core::devices::Bus;
 
 /// The breadboard's top-level views.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -161,6 +162,10 @@ struct Actions {
     spi_miso: Option<u8>,
     /// ADC channel values to push (channel, value).
     adc: Vec<(u8, u16)>,
+    /// Catalog id of a device to attach to the buses.
+    attach: Option<String>,
+    /// Index into bb_devices of a device to detach.
+    detach: Option<usize>,
 }
 
 pub fn render(app: &mut IkIdeApp, ctx: &egui::Context) {
@@ -258,8 +263,7 @@ pub fn render(app: &mut IkIdeApp, ctx: &egui::Context) {
                 BreadboardTab::Schematic => schematic_tab(app, ui, &mut act),
                 BreadboardTab::Uart => uart_tab(app, ui, &mut act),
                 BreadboardTab::Spi => spi_tab(app, ui, &mut act),
-                BreadboardTab::I2c => bus_log_tab(ui, "I2C / TWI", &app.twi_log,
-                    "TWI bus activity: [S] start, addr 0xNN R/W, data bytes (hex), [P] stop."),
+                BreadboardTab::I2c => i2c_tab(app, ui, &mut act),
             }
         });
 
@@ -514,12 +518,75 @@ fn draw_seven_seg(p: &egui::Painter, rect: egui::Rect, color: egui::Color32, seg
     p.circle_filled(egui::pos2(x0 + w + 6.0, y0 + h), 2.5, if dp { on } else { off });
 }
 
+/// Attached devices for one bus, with detach buttons and a searchable picker.
+fn device_panel(app: &mut IkIdeApp, ui: &mut egui::Ui, bus: Bus, act: &mut Actions) {
+    ui.label(egui::RichText::new("Devices on this bus").strong());
+    let mut any = false;
+    for (i, id) in app.bb_devices.iter().enumerate() {
+        if let Some(spec) = app.device_catalog.iter().find(|s| &s.id == id) {
+            if spec.bus == bus {
+                any = true;
+                let addr = spec.address.map(|a| format!(" @0x{:02X}", a)).unwrap_or_default();
+                ui.horizontal(|ui| {
+                    ui.label(format!("• {}{}", spec.name, addr));
+                    if ui.small_button("✖").clicked() {
+                        act.detach = Some(i);
+                    }
+                });
+            }
+        }
+    }
+    if !any {
+        ui.label(egui::RichText::new("none attached").weak().small());
+    }
+    ui.add_enabled_ui(app.live.is_none(), |ui| {
+        egui::ComboBox::from_id_salt(("attach_dev", bus.label()))
+            .selected_text("➕ Attach device…")
+            .show_ui(ui, |ui| {
+                ui.add(egui::TextEdit::singleline(&mut app.device_filter).hint_text("filter…").desired_width(170.0));
+                let q = app.device_filter.to_lowercase();
+                let mut shown = 0;
+                for spec in app.device_catalog.iter().filter(|s| s.bus == bus) {
+                    if !q.is_empty() && !spec.name.to_lowercase().contains(&q) && !spec.id.contains(&q) {
+                        continue;
+                    }
+                    let addr = spec.address.map(|a| format!(" @0x{:02X}", a)).unwrap_or_default();
+                    if ui.selectable_label(false, format!("{}{}", spec.name, addr)).clicked() {
+                        act.attach = Some(spec.id.clone());
+                    }
+                    shown += 1;
+                }
+                if shown == 0 {
+                    ui.label(egui::RichText::new("no devices for this bus").weak());
+                }
+            });
+    });
+    if app.live.is_some() {
+        ui.label(egui::RichText::new("Device changes apply on the next Run.").weak().small());
+    }
+    ui.separator();
+}
+
 /// The UART tab: transmitted-text console plus a best-effort send box.
 fn uart_tab(app: &mut IkIdeApp, ui: &mut egui::Ui, act: &mut Actions) {
     if board::periph_addrs(&app.breadboard.cached_device_name()).uart.is_none() {
         unavailable(ui, "USART isn't modeled for this target in the simulator.");
         return;
     }
+    device_panel(app, ui, Bus::Uart, act);
+
+    ui.horizontal(|ui| {
+        ui.selectable_value(&mut app.bb_uart_plot, false, "Console");
+        ui.selectable_value(&mut app.bb_uart_plot, true, "Plotter");
+    });
+    ui.separator();
+
+    if app.bb_uart_plot {
+        // Same plotter the Serial Monitor uses, fed by the UART transcript.
+        crate::ui::serial::render_plotter(app, ui);
+        return;
+    }
+
     ui.label(egui::RichText::new("Text the program transmits (TX).").weak().small());
     log_view(ui, &app.uart_log, "uart_log");
 
@@ -535,7 +602,7 @@ fn uart_tab(app: &mut IkIdeApp, ui: &mut egui::Ui, act: &mut Actions) {
             app.uart_send.clear();
         }
     });
-    ui.label(egui::RichText::new("Send is best-effort: bytes are presented to the receiver with an RXC pulse.").weak().small());
+    ui.label(egui::RichText::new("Bytes typed here are delivered to the program's receiver.").weak().small());
 }
 
 /// The SPI tab: transmitted bytes plus the configurable read-back (MISO) byte.
@@ -544,6 +611,7 @@ fn spi_tab(app: &mut IkIdeApp, ui: &mut egui::Ui, act: &mut Actions) {
         unavailable(ui, "This target has no SPI.");
         return;
     }
+    device_panel(app, ui, Bus::Spi, act);
     ui.label(egui::RichText::new("Bytes the master transmits (MOSI), in hex.").weak().small());
     log_view(ui, &app.spi_log, "spi_log");
 
@@ -562,10 +630,15 @@ fn spi_tab(app: &mut IkIdeApp, ui: &mut egui::Ui, act: &mut Actions) {
     });
 }
 
-/// A read-only bus transcript tab (used for I2C).
-fn bus_log_tab(ui: &mut egui::Ui, _title: &str, log: &str, note: &str) {
-    ui.label(egui::RichText::new(note).weak().small());
-    log_view(ui, log, "bus_log");
+/// The I2C tab: attached devices plus the decoded TWI bus transcript.
+fn i2c_tab(app: &mut IkIdeApp, ui: &mut egui::Ui, act: &mut Actions) {
+    device_panel(app, ui, Bus::I2c, act);
+    ui.label(
+        egui::RichText::new("TWI bus: [S] start, addr 0xNN R/W, data bytes (hex), [P] stop.")
+            .weak()
+            .small(),
+    );
+    log_view(ui, &app.twi_log, "twi_log");
 }
 
 fn unavailable(ui: &mut egui::Ui, msg: &str) {
@@ -594,6 +667,14 @@ fn apply_actions(app: &mut IkIdeApp, act: Actions) {
         if idx < app.breadboard.components.len() {
             app.breadboard.components.remove(idx);
         }
+    }
+    if let Some(idx) = act.detach {
+        if idx < app.bb_devices.len() {
+            app.bb_devices.remove(idx);
+        }
+    }
+    if let Some(id) = act.attach {
+        app.bb_devices.push(id);
     }
     if let Some(kind) = act.add {
         app.breadboard.components.push(Component::new(kind));

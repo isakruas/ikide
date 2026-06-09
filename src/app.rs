@@ -133,6 +133,16 @@ pub struct IkIdeApp {
     pub spi_log: String,
     pub twi_log: String,
     pub bb_spi_miso: u8,
+    /// Virtual devices (catalog ids) attached to the buses for the next run.
+    pub bb_devices: Vec<String>,
+    /// Cached device catalog (compiled once), for the attach picker.
+    pub device_catalog: Vec<crate::core::devices::DeviceSpec>,
+    /// Filter text for the device attach picker.
+    pub device_filter: String,
+    /// UART tab: show the plotter instead of the text console.
+    pub bb_uart_plot: bool,
+    /// Accumulates the current UART line for the plotter parser.
+    bb_uart_line: String,
     /// TWI decode state: the next data byte after a START is the address.
     twi_expect_addr: bool,
 
@@ -261,6 +271,11 @@ impl Default for IkIdeApp {
             spi_log: String::new(),
             twi_log: String::new(),
             bb_spi_miso: 0xFF,
+            bb_devices: Vec::new(),
+            device_catalog: crate::core::devices::catalog(),
+            device_filter: String::new(),
+            bb_uart_plot: false,
+            bb_uart_line: String::new(),
             twi_expect_addr: false,
             serial: None,
             serial_port: settings.serial_port.clone(),
@@ -389,36 +404,8 @@ impl IkIdeApp {
                     }
                     self.serial_line_buf.push_str(&s);
                     while let Some(pos) = self.serial_line_buf.find('\n') {
-                        let line = self.serial_line_buf[..pos].trim();
-                        let mut values: Vec<f32> = Vec::new();
-                        let mut labels: Vec<String> = Vec::new();
-                        for part in line.split(|c: char| c == ',' || c == ';' || c.is_whitespace()).filter(|s| !s.is_empty()) {
-                            if let Some(idx) = part.find(':') {
-                                let label = part[..idx].trim().to_string();
-                                let val_str = part[idx + 1..].trim();
-                                if let Ok(val) = val_str.parse::<f32>() {
-                                    values.push(val);
-                                    labels.push(label);
-                                }
-                            } else if let Ok(val) = part.parse::<f32>() {
-                                values.push(val);
-                                labels.push(format!("Ch {}", values.len()));
-                            }
-                        }
-                        if !values.is_empty() {
-                            for (ch_idx, label) in labels.into_iter().enumerate() {
-                                if ch_idx >= self.plot_labels.len() {
-                                    self.plot_labels.push(label);
-                                    self.plot_visible.push(true);
-                                } else if label != format!("Ch {}", ch_idx + 1) {
-                                    self.plot_labels[ch_idx] = label;
-                                }
-                            }
-                            self.plot_history.push(values);
-                            if self.plot_history.len() > 100_000 {
-                                self.plot_history.remove(0);
-                            }
-                        }
+                        let line = self.serial_line_buf[..pos].trim().to_string();
+                        self.ingest_plot_line(&line);
                         self.serial_line_buf = self.serial_line_buf[pos + 1..].to_string();
                     }
                 }
@@ -431,6 +418,41 @@ impl IkIdeApp {
         }
         if closed {
             self.serial = None;
+        }
+    }
+
+    /// Parse one line of "label:value, value, ..." plot data and append it to
+    /// the shared plot buffers. Used by both the serial monitor and the
+    /// breadboard's UART plotter so they behave identically.
+    pub fn ingest_plot_line(&mut self, line: &str) {
+        let mut values: Vec<f32> = Vec::new();
+        let mut labels: Vec<String> = Vec::new();
+        for part in line.split(|c: char| c == ',' || c == ';' || c.is_whitespace()).filter(|s| !s.is_empty()) {
+            if let Some(idx) = part.find(':') {
+                let label = part[..idx].trim().to_string();
+                if let Ok(val) = part[idx + 1..].trim().parse::<f32>() {
+                    values.push(val);
+                    labels.push(label);
+                }
+            } else if let Ok(val) = part.parse::<f32>() {
+                values.push(val);
+                labels.push(format!("Ch {}", values.len()));
+            }
+        }
+        if values.is_empty() {
+            return;
+        }
+        for (ch_idx, label) in labels.into_iter().enumerate() {
+            if ch_idx >= self.plot_labels.len() {
+                self.plot_labels.push(label);
+                self.plot_visible.push(true);
+            } else if label != format!("Ch {}", ch_idx + 1) {
+                self.plot_labels[ch_idx] = label;
+            }
+        }
+        self.plot_history.push(values);
+        if self.plot_history.len() > 100_000 {
+            self.plot_history.remove(0);
         }
     }
 
@@ -493,12 +515,26 @@ impl IkIdeApp {
         self.spi_log.clear();
         self.twi_log.clear();
         self.twi_expect_addr = false;
+        // Fresh plot for the UART plotter tab.
+        self.bb_uart_line.clear();
+        self.plot_history.clear();
+        self.plot_labels.clear();
+        self.plot_visible.clear();
+        // Assemble the virtual devices the user attached to the buses.
+        let bus = crate::core::devices::build_bus(&self.bb_devices);
+        let responder: Option<Box<dyn ik8bvm::core::BusResponder>> = if bus.is_empty() {
+            None
+        } else {
+            Some(Box::new(bus))
+        };
+
         self.live = Some(crate::core::sim_live::spawn(
             device,
             hex_path,
             self.bb_clock_hz,
             watch,
             self.bb_spi_miso,
+            responder,
         ));
     }
 
@@ -552,6 +588,16 @@ impl IkIdeApp {
                     self.uart_log.push('.');
                 }
                 cap_log(&mut self.uart_log);
+                // Feed the UART plotter line-by-line (parity with the monitor).
+                if b == b'\n' {
+                    let line = std::mem::take(&mut self.bb_uart_line);
+                    self.ingest_plot_line(line.trim());
+                } else if b != b'\r' {
+                    self.bb_uart_line.push(b as char);
+                    if self.bb_uart_line.len() > 4096 {
+                        self.bb_uart_line.clear();
+                    }
+                }
             }
             IoPeripheral::Spi => {
                 self.spi_log.push_str(&format!("{:02X} ", ev.byte));

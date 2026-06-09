@@ -15,6 +15,7 @@
 pub mod analysis;
 pub mod board;
 pub mod bootloader;
+pub mod devices;
 pub mod runner;
 pub mod serial;
 pub mod settings;

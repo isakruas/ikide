@@ -16,6 +16,10 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # the Docker build needs no extra system packages; ports are still openable and
 # enumerated via the sysfs fallback.
 serialport = { version = "4", default-features = false }
+# Scripting engine for user-authored virtual devices (sensors, displays, ...).
+# Pure Rust, no C deps; the `sync` feature makes compiled scripts Send so a
+# device can live on the simulation thread.
+rhai = { version = "1", features = ["sync"] }
 # The ik8b compiler, linked as a library so the IDE shares the exact same
 # lexer/parser/device table (vendored as a submodule under tools/).
 ik8b = { path = "tools/ik8b" }
