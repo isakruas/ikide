@@ -272,19 +272,21 @@ pub fn render(app: &mut IkIdeApp, ctx: &egui::Context) {
 
 /// The Schematic tab: a palette plus the placed GPIO components.
 fn schematic_tab(app: &mut IkIdeApp, ui: &mut egui::Ui, act: &mut Actions) {
-    ui.horizontal_wrapped(|ui| {
-        ui.label("Add:");
-        for kind in [
+    ui.horizontal(|ui| {
+        ui.label("Add component:");
+        let items: Vec<(CompKind, String)> = [
             CompKind::Led,
             CompKind::RgbLed,
             CompKind::Button,
             CompKind::SevenSeg,
             CompKind::LedBar,
             CompKind::Potentiometer,
-        ] {
-            if ui.button(format!("➕ {}", kind.label())).clicked() {
-                act.add = Some(kind);
-            }
+        ]
+        .into_iter()
+        .map(|k| (k, k.label().to_string()))
+        .collect();
+        if let Some(kind) = crate::ui::widgets::filter_combo(ui, "bb_add_component", "➕ Choose…", &items) {
+            act.add = Some(kind);
         }
     });
     ui.add_space(4.0);
@@ -416,20 +418,20 @@ fn terminal_labels(kind: CompKind, count: usize) -> Vec<String> {
     }
 }
 
-/// A compact "label: [pin ▾]" selector bound to one terminal.
+/// A compact "label: [pin ▾]" selector bound to one terminal. The dropdown is
+/// searchable so it stays usable on chips with dozens of pins.
 fn pin_selector(ui: &mut egui::Ui, pins: &[Pin], sel: &mut Option<usize>, i: usize, t: usize, label: &str) {
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new(label).small());
         let cur = sel.and_then(|p| pins.get(p)).map(|p| p.name.clone()).unwrap_or_else(|| "—".to_string());
-        egui::ComboBox::from_id_salt(("bb_pin", i, t))
-            .selected_text(cur)
-            .width(64.0)
-            .show_ui(ui, |ui| {
-                ui.selectable_value(sel, None, "— none —");
-                for (pi, p) in pins.iter().enumerate() {
-                    ui.selectable_value(sel, Some(pi), &p.name);
-                }
-            });
+        let mut items: Vec<(Option<usize>, String)> = Vec::with_capacity(pins.len() + 1);
+        items.push((None, "— none —".to_string()));
+        for (pi, p) in pins.iter().enumerate() {
+            items.push((Some(pi), p.name.clone()));
+        }
+        if let Some(v) = crate::ui::widgets::filter_combo(ui, ("bb_pin", i, t), &cur, &items) {
+            *sel = v;
+        }
     });
 }
 
@@ -539,27 +541,19 @@ fn device_panel(app: &mut IkIdeApp, ui: &mut egui::Ui, bus: Bus, act: &mut Actio
     if !any {
         ui.label(egui::RichText::new("none attached").weak().small());
     }
+    let items: Vec<(String, String)> = app
+        .device_catalog
+        .iter()
+        .filter(|s| s.bus == bus)
+        .map(|s| {
+            let addr = s.address.map(|a| format!(" @0x{:02X}", a)).unwrap_or_default();
+            (s.id.clone(), format!("{}{}", s.name, addr))
+        })
+        .collect();
     ui.add_enabled_ui(app.live.is_none(), |ui| {
-        egui::ComboBox::from_id_salt(("attach_dev", bus.label()))
-            .selected_text("➕ Attach device…")
-            .show_ui(ui, |ui| {
-                ui.add(egui::TextEdit::singleline(&mut app.device_filter).hint_text("filter…").desired_width(170.0));
-                let q = app.device_filter.to_lowercase();
-                let mut shown = 0;
-                for spec in app.device_catalog.iter().filter(|s| s.bus == bus) {
-                    if !q.is_empty() && !spec.name.to_lowercase().contains(&q) && !spec.id.contains(&q) {
-                        continue;
-                    }
-                    let addr = spec.address.map(|a| format!(" @0x{:02X}", a)).unwrap_or_default();
-                    if ui.selectable_label(false, format!("{}{}", spec.name, addr)).clicked() {
-                        act.attach = Some(spec.id.clone());
-                    }
-                    shown += 1;
-                }
-                if shown == 0 {
-                    ui.label(egui::RichText::new("no devices for this bus").weak());
-                }
-            });
+        if let Some(id) = crate::ui::widgets::filter_combo(ui, ("attach_dev", bus.label()), "➕ Attach device…", &items) {
+            act.attach = Some(id);
+        }
     });
     if app.live.is_some() {
         ui.label(egui::RichText::new("Device changes apply on the next Run.").weak().small());

@@ -137,8 +137,6 @@ pub struct IkIdeApp {
     pub bb_devices: Vec<String>,
     /// Cached device catalog (compiled once), for the attach picker.
     pub device_catalog: Vec<crate::core::devices::DeviceSpec>,
-    /// Filter text for the device attach picker.
-    pub device_filter: String,
     /// UART tab: show the plotter instead of the text console.
     pub bb_uart_plot: bool,
     /// Accumulates the current UART line for the plotter parser.
@@ -273,7 +271,6 @@ impl Default for IkIdeApp {
             bb_spi_miso: 0xFF,
             bb_devices: Vec::new(),
             device_catalog: crate::core::devices::catalog(),
-            device_filter: String::new(),
             bb_uart_plot: false,
             bb_uart_line: String::new(),
             twi_expect_addr: false,
@@ -1260,13 +1257,11 @@ impl eframe::App for IkIdeApp {
                                 ui.end_row();
 
                                 ui.label("Target MCU:");
-                                egui::ComboBox::from_id_salt("mcu_target")
-                                    .selected_text(&self.avrdude_target)
-                                    .show_ui(ui, |ui| {
-                                        for (dev, _) in &self.devices {
-                                            ui.selectable_value(&mut self.avrdude_target, dev.clone(), dev);
-                                        }
-                                    });
+                                let items: Vec<(String, String)> = self.devices.iter().map(|(d, _)| (d.clone(), d.clone())).collect();
+                                let sel = if self.avrdude_target.is_empty() { "Select MCU...".to_string() } else { self.avrdude_target.clone() };
+                                if let Some(d) = crate::ui::widgets::filter_combo(ui, "mcu_target", &sel, &items) {
+                                    self.avrdude_target = d;
+                                }
                                 ui.end_row();
                                 
                                 ui.label("Programmer:");
@@ -1348,22 +1343,15 @@ impl eframe::App for IkIdeApp {
                                 ui.end_row();
 
                                 ui.label("Target MCU:");
-                                let old_target = self.burn_target.clone();
-                                let display_text = if self.burn_target.is_empty() {
-                                    "Select MCU..."
-                                } else {
-                                    &self.burn_target
-                                };
-                                egui::ComboBox::from_id_salt("burn_target_pick")
-                                    .selected_text(display_text)
-                                    .show_ui(ui, |ui| {
-                                        for (dev, _) in &self.devices {
-                                            if crate::core::bootloader::has_bootloader_support(dev) {
-                                                ui.selectable_value(&mut self.burn_target, dev.clone(), dev);
-                                            }
-                                        }
-                                    });
-                                if self.burn_target != old_target {
+                                let items: Vec<(String, String)> = self
+                                    .devices
+                                    .iter()
+                                    .filter(|(d, _)| crate::core::bootloader::has_bootloader_support(d))
+                                    .map(|(d, _)| (d.clone(), d.clone()))
+                                    .collect();
+                                let display_text = if self.burn_target.is_empty() { "Select MCU...".to_string() } else { self.burn_target.clone() };
+                                if let Some(d) = crate::ui::widgets::filter_combo(ui, "burn_target_pick", &display_text, &items) {
+                                    self.burn_target = d;
                                     self.burn_additional_flags = crate::core::bootloader::suggest_burn_fuse_flags(&self.burn_target);
                                 }
                                 ui.end_row();

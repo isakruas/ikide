@@ -265,7 +265,11 @@ const BUILTIN: &[(&str, &str)] = &[
 /// A fresh scripting engine. Engines are cheap to share via `Arc`; one is
 /// enough for every device since per-device state lives in the device.
 pub fn engine() -> Arc<Engine> {
-    Arc::new(Engine::new())
+    let mut e = Engine::new();
+    // A device handler runs inside the VM step, so cap its work to keep a buggy
+    // or runaway script from wedging the simulation thread.
+    e.set_max_operations(2_000_000);
+    Arc::new(e)
 }
 
 /// Load `.rhai` files from a user `devices/` directory next to the project, if
