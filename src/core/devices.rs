@@ -22,11 +22,65 @@
 // Authoring is just dropping a `.rhai` file — no recompile — so the catalog of
 // peripherals can grow without bound.
 
-use std::collections::HashSet;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 
 use ik8bvm::core::BusResponder;
 use rhai::{AST, Dynamic, Engine, Map, Scope};
+
+use crate::core::board;
+
+/// A device's pixel output: a simple RGB framebuffer shared (via `Arc<Mutex>`)
+/// between the device (on the sim thread) and the breadboard's display panel.
+pub struct Framebuffer {
+    pub w: usize,
+    pub h: usize,
+    /// 0x00RRGGBB per pixel.
+    pub pixels: Vec<u32>,
+    /// Bumped on every change so the UI only re-uploads the texture when needed.
+    pub generation: u64,
+}
+
+/// A cloneable handle to a [`Framebuffer`], usable both as a Rhai value (a
+/// device script draws through it) and by the UI (which renders it).
+#[derive(Clone)]
+pub struct DisplayHandle(pub Arc<Mutex<Framebuffer>>);
+
+impl DisplayHandle {
+    fn new(w: usize, h: usize) -> Self {
+        DisplayHandle(Arc::new(Mutex::new(Framebuffer {
+            w,
+            h,
+            pixels: vec![0; w * h],
+            generation: 1,
+        })))
+    }
+    fn set_px(&self, x: i64, y: i64, color: i64) {
+        if let Ok(mut fb) = self.0.lock() {
+            if x >= 0 && y >= 0 && (x as usize) < fb.w && (y as usize) < fb.h {
+                let idx = y as usize * fb.w + x as usize;
+                fb.pixels[idx] = (color as u32) & 0x00FF_FFFF;
+                fb.generation = fb.generation.wrapping_add(1);
+            }
+        }
+    }
+    fn fill(&self, color: i64) {
+        if let Ok(mut fb) = self.0.lock() {
+            let c = (color as u32) & 0x00FF_FFFF;
+            for p in fb.pixels.iter_mut() {
+                *p = c;
+            }
+            fb.generation = fb.generation.wrapping_add(1);
+        }
+    }
+}
+
+/// A display surface exposed to the breadboard UI for rendering.
+#[derive(Clone)]
+pub struct DisplayInfo {
+    pub name: String,
+    pub handle: DisplayHandle,
+}
 
 /// Which bus a device attaches to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -61,6 +115,7 @@ pub struct DeviceSpec {
     pub name: String,
     pub bus: Bus,
     pub address: Option<u8>,
+    pub has_display: bool,
     src: String,
 }
 
@@ -72,14 +127,20 @@ pub struct ScriptedDevice {
     scope: Scope<'static>,
     state: Dynamic,
     fns: HashSet<String>,
+    /// Control pins the device watches: (script pin name, PORT data-space addr, bit).
+    pins: Vec<(String, u32, u8)>,
+    pin_levels: HashMap<String, u8>,
+    /// Pixel output, when the device declared a `display` in its meta.
+    pub display: Option<DisplayHandle>,
     pub name: String,
     pub bus: Bus,
     pub address: Option<u8>,
 }
 
 impl ScriptedDevice {
-    /// Compile a device script and read its descriptor + initial state.
-    pub fn from_src(engine: Arc<Engine>, src: &str) -> Result<Self, String> {
+    /// Compile a device script and read its descriptor + initial state. Control
+    /// pins named in `meta().pins` are resolved against `target`'s pin map.
+    pub fn from_src(engine: Arc<Engine>, src: &str, target: &str) -> Result<Self, String> {
         let ast = engine.compile(src).map_err(|e| e.to_string())?;
         let fns: HashSet<String> = ast.iter_functions().map(|f| f.name.to_string()).collect();
         let mut scope = Scope::new();
@@ -98,16 +159,77 @@ impl ScriptedDevice {
             .ok_or_else(|| "meta() must set bus to \"uart\", \"spi\" or \"i2c\"".to_string())?;
         let address = meta.get("address").and_then(|d| d.as_int().ok()).map(|i| i as u8);
 
+        // Resolve named control pins (e.g. dc: "PB1") to PORT addresses.
+        let board_pins = board::pins(target);
+        let mut pins = Vec::new();
+        if let Some(map) = meta.get("pins").and_then(|d| d.clone().try_cast::<Map>()) {
+            for (pin_name, pin_ref) in map.iter() {
+                if let Ok(target_name) = pin_ref.clone().into_string() {
+                    if let Some(p) = board_pins.iter().find(|p| p.name == target_name) {
+                        pins.push((pin_name.to_string(), p.port_addr, p.bit));
+                    }
+                }
+            }
+        }
+
+        // Optional pixel output.
+        let display = meta.get("display").and_then(|d| d.clone().try_cast::<Map>()).map(|m| {
+            let w = m.get("w").and_then(|d| d.as_int().ok()).unwrap_or(128) as usize;
+            let h = m.get("h").and_then(|d| d.as_int().ok()).unwrap_or(128) as usize;
+            DisplayHandle::new(w, h)
+        });
+
         // Initial state: the script's optional init() return, else an empty map.
-        let state = if fns.contains("init") {
+        let mut state = if fns.contains("init") {
             engine
                 .call_fn::<Dynamic>(&mut scope, &ast, "init", ())
                 .map_err(|e| format!("init(): {}", e))?
         } else {
             Dynamic::from(Map::new())
         };
+        // Hand the display surface to the script as `this.fb`.
+        if let Some(h) = &display {
+            if let Some(mut m) = state.write_lock::<Map>() {
+                m.insert("fb".into(), Dynamic::from(h.clone()));
+            }
+        }
 
-        Ok(ScriptedDevice { engine, ast, scope, state, fns, name, bus, address })
+        Ok(ScriptedDevice {
+            engine,
+            ast,
+            scope,
+            state,
+            fns,
+            pins,
+            pin_levels: HashMap::new(),
+            display,
+            name,
+            bus,
+            address,
+        })
+    }
+
+    /// PORT register `addr` was written: update any control pins on it and
+    /// notify the script of changes via `pin_set(name, level)`.
+    fn handle_pin_write(&mut self, addr: u32, value: u8) {
+        let mut changes = Vec::new();
+        for (pin_name, paddr, bit) in &self.pins {
+            if *paddr == addr {
+                let level = (value >> bit) & 1;
+                if self.pin_levels.get(pin_name).copied() != Some(level) {
+                    changes.push((pin_name.clone(), level));
+                }
+            }
+        }
+        for (pin_name, level) in changes {
+            self.pin_levels.insert(pin_name.clone(), level);
+            self.call("pin_set", vec![pin_name.into(), (level as i64).into()]);
+        }
+    }
+
+    /// The PORT data-space addresses this device watches.
+    fn pin_addrs(&self) -> impl Iterator<Item = u32> + '_ {
+        self.pins.iter().map(|(_, a, _)| *a)
     }
 
     /// Invoke a script handler with `this` bound to the device state, returning
@@ -189,6 +311,28 @@ impl DeviceBus {
     pub fn is_empty(&self) -> bool {
         self.uart.is_empty() && self.spi.is_empty() && self.i2c.is_empty()
     }
+    fn all_mut(&mut self) -> impl Iterator<Item = &mut ScriptedDevice> {
+        self.uart.iter_mut().chain(self.spi.iter_mut()).chain(self.i2c.iter_mut())
+    }
+    /// Every PORT data-space address any attached device watches (for the VM's
+    /// `watch_pins`).
+    pub fn pin_addrs(&self) -> Vec<u32> {
+        self.uart
+            .iter()
+            .chain(self.spi.iter())
+            .chain(self.i2c.iter())
+            .flat_map(|d| d.pin_addrs())
+            .collect()
+    }
+    /// The display surfaces of attached devices, for the UI to render.
+    pub fn displays(&self) -> Vec<DisplayInfo> {
+        self.uart
+            .iter()
+            .chain(self.spi.iter())
+            .chain(self.i2c.iter())
+            .filter_map(|d| d.display.as_ref().map(|h| DisplayInfo { name: d.name.clone(), handle: h.clone() }))
+            .collect()
+    }
 }
 
 impl BusResponder for DeviceBus {
@@ -248,8 +392,13 @@ impl BusResponder for DeviceBus {
         None
     }
     fn tick(&mut self, cycles: u64) {
-        for d in self.uart.iter_mut().chain(self.spi.iter_mut()).chain(self.i2c.iter_mut()) {
+        for d in self.all_mut() {
             d.tick(cycles);
+        }
+    }
+    fn pin_write(&mut self, addr: u32, value: u8) {
+        for d in self.all_mut() {
+            d.handle_pin_write(addr, value);
         }
     }
 }
@@ -260,6 +409,9 @@ const BUILTIN: &[(&str, &str)] = &[
     ("uart_loopback", include_str!("../../assets/devices/uart_loopback.rhai")),
     ("i2c_eeprom", include_str!("../../assets/devices/i2c_eeprom.rhai")),
     ("spi_echo", include_str!("../../assets/devices/spi_echo.rhai")),
+    ("pcf8574", include_str!("../../assets/devices/pcf8574.rhai")),
+    ("at24c256", include_str!("../../assets/devices/at24c256.rhai")),
+    ("st7789", include_str!("../../assets/devices/st7789.rhai")),
 ];
 
 /// A fresh scripting engine. Engines are cheap to share via `Arc`; one is
@@ -269,6 +421,12 @@ pub fn engine() -> Arc<Engine> {
     // A device handler runs inside the VM step, so cap its work to keep a buggy
     // or runaway script from wedging the simulation thread.
     e.set_max_operations(2_000_000);
+    // Allow reasonably involved protocol decoders (nested if/else chains).
+    e.set_max_expr_depths(128, 128);
+    // Expose the pixel-output surface to display device scripts as `this.fb`.
+    e.register_type_with_name::<DisplayHandle>("Display")
+        .register_fn("px", |d: &mut DisplayHandle, x: i64, y: i64, color: i64| d.set_px(x, y, color))
+        .register_fn("fill", |d: &mut DisplayHandle, color: i64| d.fill(color));
     Arc::new(e)
 }
 
@@ -297,23 +455,36 @@ pub fn catalog() -> Vec<DeviceSpec> {
     let mut specs = Vec::new();
     let builtins = BUILTIN.iter().map(|(id, src)| (id.to_string(), src.to_string()));
     for (id, src) in builtins.chain(user_scripts()) {
-        if let Ok(dev) = ScriptedDevice::from_src(eng.clone(), &src) {
-            specs.push(DeviceSpec { id, name: dev.name, bus: dev.bus, address: dev.address, src });
+        // The catalog only needs the descriptor, so pin resolution is skipped.
+        match ScriptedDevice::from_src(eng.clone(), &src, "") {
+            Ok(dev) => specs.push(DeviceSpec {
+                id,
+                name: dev.name,
+                bus: dev.bus,
+                address: dev.address,
+                has_display: dev.display.is_some(),
+                src,
+            }),
+            Err(e) => eprintln!("[device {}] catalog build failed: {}", id, e),
         }
     }
     specs
 }
 
-/// Build a [`DeviceBus`] from the catalog ids the user attached.
-pub fn build_bus(ids: &[String]) -> DeviceBus {
+/// Build a [`DeviceBus`] from the catalog ids the user attached, resolving each
+/// device's control pins against the `target` MCU.
+pub fn build_bus(target: &str, ids: &[String]) -> DeviceBus {
     let eng = engine();
     let catalog = catalog();
     let mut bus = DeviceBus::default();
     for id in ids {
         if let Some(spec) = catalog.iter().find(|s| &s.id == id) {
-            if let Ok(dev) = ScriptedDevice::from_src(eng.clone(), &spec.src) {
-                bus.add(dev);
+            match ScriptedDevice::from_src(eng.clone(), &spec.src, target) {
+                Ok(dev) => bus.add(dev),
+                Err(e) => eprintln!("[device {}] build failed: {}", id, e),
             }
+        } else {
+            eprintln!("[device {}] not in catalog", id);
         }
     }
     bus
@@ -328,7 +499,7 @@ mod tests {
     /// register-level master sequence: write pointer + byte, then read it back.
     #[test]
     fn scripted_i2c_eeprom_round_trips() {
-        let bus = build_bus(&["i2c_eeprom".to_string()]);
+        let bus = build_bus("atmega328p", &["i2c_eeprom".to_string()]);
         assert!(!bus.is_empty(), "the eeprom device should load");
 
         let mut vm = runner::build_vm("atmega328p");
@@ -362,10 +533,76 @@ mod tests {
         assert_eq!(vm.read_data(TWDR), 0x5A, "EEPROM should return the stored byte");
     }
 
+    /// The AT24C256 model uses a 16-bit memory address (high byte, low byte):
+    /// write a byte at 0x1234, then read it back.
+    #[test]
+    fn scripted_at24c256_16bit_addressing() {
+        let bus = build_bus("atmega328p", &["at24c256".to_string()]);
+        let mut vm = runner::build_vm("atmega328p");
+        vm.capture_io = true;
+        vm.responder = Some(Box::new(bus));
+
+        const TWDR: u32 = 0xBB;
+        const TWCR: u32 = 0xBC;
+        const START: u8 = 0xA4;
+        const EN: u8 = 0x84;
+
+        // Write 0x7E to address 0x1234.
+        vm.write_data(TWCR, START);
+        vm.write_data(TWDR, 0xA0); // 0x50 + write
+        vm.write_data(TWCR, EN);
+        vm.write_data(TWDR, 0x12); // addr high
+        vm.write_data(TWCR, EN);
+        vm.write_data(TWDR, 0x34); // addr low
+        vm.write_data(TWCR, EN);
+        vm.write_data(TWDR, 0x7E); // data
+        vm.write_data(TWCR, EN);
+
+        // Set the pointer to 0x1234 again, then read.
+        vm.write_data(TWCR, START);
+        vm.write_data(TWDR, 0xA0);
+        vm.write_data(TWCR, EN);
+        vm.write_data(TWDR, 0x12);
+        vm.write_data(TWCR, EN);
+        vm.write_data(TWDR, 0x34);
+        vm.write_data(TWCR, EN);
+        vm.write_data(TWCR, START);
+        vm.write_data(TWDR, 0xA1); // 0x50 + read
+        vm.write_data(TWCR, EN);
+        vm.write_data(TWCR, EN); // read NACK
+        assert_eq!(vm.read_data(TWDR), 0x7E, "should read back the byte at 0x1234");
+    }
+
+    /// A full display device: the VM forwards D/C pin writes and SPI bytes to
+    /// the ST7789 script, which decodes RAMWR pixels into the framebuffer.
+    #[test]
+    fn st7789_renders_a_pixel() {
+        let bus = build_bus("atmega328p", &["st7789".to_string()]);
+        let display = bus.displays().first().expect("st7789 has a display").handle.clone();
+
+        let mut vm = runner::build_vm("atmega328p");
+        vm.capture_io = true;
+        vm.watch_pins = [0x25].into_iter().collect(); // PORTB (atmega328p)
+        vm.responder = Some(Box::new(bus));
+
+        const SPDR: u32 = 0x4E;
+        const PORTB: u32 = 0x25;
+        // DC=PB1 (bit1), CS=PB2 (bit2). Select + command mode: both low.
+        vm.write_data(PORTB, 0x00);
+        vm.write_data(SPDR, 0x2C); // RAMWR
+        // Data mode: DC high, CS still low.
+        vm.write_data(PORTB, 0x02);
+        vm.write_data(SPDR, 0xF8); // RGB565 red, high byte
+        vm.write_data(SPDR, 0x00); // low byte -> 0xF800
+
+        let fb = display.0.lock().unwrap();
+        assert_eq!(fb.pixels[0], 0xF8_0000, "pixel (0,0) should be red");
+    }
+
     /// A scripted SPI device responds on MISO.
     #[test]
     fn scripted_spi_echo_responds() {
-        let bus = build_bus(&["spi_echo".to_string()]);
+        let bus = build_bus("atmega328p", &["spi_echo".to_string()]);
         let mut vm = runner::build_vm("atmega328p");
         vm.responder = Some(Box::new(bus));
         vm.write_data(0x4E, 0x20); // SPDR

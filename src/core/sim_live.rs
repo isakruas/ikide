@@ -112,6 +112,7 @@ pub fn spawn(
     watch: Vec<u32>,
     spi_miso: u8,
     responder: Option<Box<dyn ik8bvm::core::BusResponder>>,
+    watch_pins: Vec<u32>,
 ) -> LiveHandle {
     let (cmd_tx, cmd_rx) = mpsc::channel::<LiveCmd>();
     let (snap_tx, snap_rx) = mpsc::channel::<LiveSnapshot>();
@@ -129,6 +130,7 @@ pub fn spawn(
         vm.capture_io = true;
         vm.spi_miso = spi_miso;
         vm.responder = responder;
+        vm.watch_pins = watch_pins.into_iter().collect();
 
         // Pins the UI is currently forcing as inputs, re-asserted every frame so
         // a held button stays held.

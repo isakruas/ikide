@@ -141,6 +141,10 @@ pub struct IkIdeApp {
     pub bb_uart_plot: bool,
     /// Accumulates the current UART line for the plotter parser.
     bb_uart_line: String,
+    /// Display surfaces of attached devices, rendered in the breadboard.
+    pub bb_displays: Vec<crate::core::devices::DisplayInfo>,
+    /// Cached display textures keyed by device name (generation, handle).
+    pub bb_textures: std::collections::HashMap<String, (u64, egui::TextureHandle)>,
     /// TWI decode state: the next data byte after a START is the address.
     twi_expect_addr: bool,
 
@@ -273,6 +277,8 @@ impl Default for IkIdeApp {
             device_catalog: crate::core::devices::catalog(),
             bb_uart_plot: false,
             bb_uart_line: String::new(),
+            bb_displays: Vec::new(),
+            bb_textures: std::collections::HashMap::new(),
             twi_expect_addr: false,
             serial: None,
             serial_port: settings.serial_port.clone(),
@@ -518,7 +524,9 @@ impl IkIdeApp {
         self.plot_labels.clear();
         self.plot_visible.clear();
         // Assemble the virtual devices the user attached to the buses.
-        let bus = crate::core::devices::build_bus(&self.bb_devices);
+        let bus = crate::core::devices::build_bus(&device, &self.bb_devices);
+        let watch_pins = bus.pin_addrs();
+        self.bb_displays = bus.displays();
         let responder: Option<Box<dyn ik8bvm::core::BusResponder>> = if bus.is_empty() {
             None
         } else {
@@ -532,6 +540,7 @@ impl IkIdeApp {
             watch,
             self.bb_spi_miso,
             responder,
+            watch_pins,
         ));
     }
 

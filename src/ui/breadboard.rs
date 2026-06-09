@@ -291,22 +291,90 @@ fn schematic_tab(app: &mut IkIdeApp, ui: &mut egui::Ui, act: &mut Actions) {
     });
     ui.add_space(4.0);
 
-    if app.breadboard.components.is_empty() {
-        ui.add_space(16.0);
-        ui.vertical_centered(|ui| {
-            ui.label(egui::RichText::new("Add a component, then wire its terminals to pins.").weak());
-        });
-        return;
-    }
-
     let pins: Vec<Pin> = app.breadboard.pins().to_vec();
     let n = app.breadboard.components.len();
     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        // Display devices render here even when there are no GPIO components.
+        display_panel(app, ui);
+
+        if n == 0 {
+            ui.add_space(16.0);
+            ui.vertical_centered(|ui| {
+                ui.label(egui::RichText::new("Add a component, or attach a device on the UART/SPI/I2C tabs.").weak());
+            });
+        }
         for i in 0..n {
             component_card(app, ui, &pins, i, act);
             ui.add_space(6.0);
         }
     });
+}
+
+/// Render the framebuffers of any attached display devices, re-uploading a
+/// texture only when its contents changed.
+fn display_panel(app: &mut IkIdeApp, ui: &mut egui::Ui) {
+    // Display devices attached but not yet rendered (before Run / no framebuffer).
+    let pending: Vec<String> = if app.bb_displays.is_empty() {
+        app.bb_devices
+            .iter()
+            .filter_map(|id| {
+                app.device_catalog
+                    .iter()
+                    .find(|s| &s.id == id && s.has_display)
+                    .map(|s| s.name.clone())
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    if app.bb_displays.is_empty() && pending.is_empty() {
+        return;
+    }
+
+    ui.add_space(8.0);
+    ui.separator();
+    ui.label(egui::RichText::new("Displays").strong());
+
+    for name in &pending {
+        ui.label(egui::RichText::new(format!("📺 {} — press Run to render", name)).weak());
+    }
+
+    for info in app.bb_displays.clone() {
+        let snapshot = info.handle.0.lock().ok().map(|fb| (fb.w, fb.h, fb.generation, fb.pixels.clone()));
+        let (w, h, generation, pixels) = match snapshot {
+            Some(s) if s.0 > 0 => s,
+            _ => continue,
+        };
+
+        let stale = app.bb_textures.get(&info.name).map(|(g, _)| *g != generation).unwrap_or(true);
+        if stale {
+            let mut img = egui::ColorImage::new([w, h], egui::Color32::BLACK);
+            for (i, p) in pixels.iter().enumerate() {
+                img.pixels[i] = egui::Color32::from_rgb((p >> 16) as u8, (p >> 8) as u8, *p as u8);
+            }
+            let handle = ui.ctx().load_texture(
+                format!("bbdisp_{}", info.name),
+                img,
+                egui::TextureOptions::NEAREST,
+            );
+            app.bb_textures.insert(info.name.clone(), (generation, handle));
+        }
+
+        if let Some((_, tex)) = app.bb_textures.get(&info.name) {
+            ui.label(egui::RichText::new(format!("{}  ({}×{})", info.name, w, h)).weak().small());
+            let scale = (240.0 / w as f32).min(2.0);
+            let size = egui::vec2(w as f32 * scale, h as f32 * scale);
+            // Draw the panel, then outline exactly its rect (it's often mostly
+            // black, so a border makes its extent visible).
+            let resp = ui.add(egui::Image::new(egui::load::SizedTexture::new(tex.id(), size)));
+            ui.painter().rect_stroke(
+                resp.rect,
+                egui::Rounding::ZERO,
+                egui::Stroke::new(1.0, egui::Color32::from_gray(90)),
+            );
+        }
+    }
 }
 
 /// One component as a card: live visual on the left, pin wiring on the right.
