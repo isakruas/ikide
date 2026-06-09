@@ -1,4 +1,4 @@
 {
   "title": "Breadboard: SPI Byte Scan",
-  "description": "Sends an incrementing byte over SPI every 100 ms. Run it and open the SPI tab to watch the MOSI stream; set a MISO response to see the read-back."
+  "description": "Sends an incrementing byte over SPI every 100 ms. Run it and open the SPI tab to watch the MOSI stream; add the SPI Echo device (Board tab) or set a MISO response to see the read-back."
 }

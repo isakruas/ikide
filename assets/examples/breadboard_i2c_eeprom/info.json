@@ -1,4 +1,4 @@
 {
   "title": "Breadboard: I2C EEPROM",
-  "description": "Writes a byte to an I2C EEPROM at 0x50 and reads it back over TWI, printing the result via UART. On the Breadboard's I2C tab attach the 'I2C EEPROM 0x50' device, then watch the bus on the I2C tab and the value on the UART tab."
+  "description": "Writes a byte to an I2C EEPROM at 0x50 and reads it back over TWI, printing the result via UART. Add the 'I2C EEPROM 0x50' device on the Board tab, then watch the bus on the I2C tab and the value on the UART tab."
 }

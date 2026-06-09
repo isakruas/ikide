@@ -133,10 +133,12 @@ pub struct IkIdeApp {
     pub spi_log: String,
     pub twi_log: String,
     pub bb_spi_miso: u8,
-    /// Virtual devices (catalog ids) attached to the buses for the next run.
-    pub bb_devices: Vec<String>,
-    /// Cached device catalog (compiled once), for the attach picker.
+    /// Devices placed on the breadboard (wired instances of catalog entries).
+    pub bb_instances: Vec<crate::ui::breadboard::Instance>,
+    /// Cached device catalog (compiled once), for the add picker.
     pub device_catalog: Vec<crate::core::devices::DeviceSpec>,
+    /// Latest device view state from the live engine: (instance, id) -> value.
+    pub live_view: std::collections::HashMap<(usize, String), crate::core::devices::ViewVal>,
     /// UART tab: show the plotter instead of the text console.
     pub bb_uart_plot: bool,
     /// Accumulates the current UART line for the plotter parser.
@@ -273,8 +275,9 @@ impl Default for IkIdeApp {
             spi_log: String::new(),
             twi_log: String::new(),
             bb_spi_miso: 0xFF,
-            bb_devices: Vec::new(),
+            bb_instances: Vec::new(),
             device_catalog: crate::core::devices::catalog(),
+            live_view: std::collections::HashMap::new(),
             bb_uart_plot: false,
             bb_uart_line: String::new(),
             bb_displays: Vec::new(),
@@ -523,14 +526,20 @@ impl IkIdeApp {
         self.plot_history.clear();
         self.plot_labels.clear();
         self.plot_visible.clear();
-        // Assemble the virtual devices the user attached to the buses.
-        let bus = crate::core::devices::build_bus(&device, &self.bb_devices);
-        let watch_pins = bus.pin_addrs();
-        self.bb_displays = bus.displays();
-        let responder: Option<Box<dyn ik8bvm::core::BusResponder>> = if bus.is_empty() {
+        // Instantiate the devices placed on the breadboard, with their wiring.
+        let wirings: Vec<crate::core::devices::InstanceWiring> = self
+            .bb_instances
+            .iter()
+            .map(|inst| inst.wiring(&self.device_catalog, self.breadboard.pins()))
+            .collect();
+        let bus = crate::core::devices::build_bus(&device, &wirings);
+        self.live_view.clear();
+        let bus = if bus.is_empty() {
+            self.bb_displays = Vec::new();
             None
         } else {
-            Some(Box::new(bus))
+            self.bb_displays = bus.displays();
+            Some(std::sync::Arc::new(std::sync::Mutex::new(bus)))
         };
 
         self.live = Some(crate::core::sim_live::spawn(
@@ -539,8 +548,7 @@ impl IkIdeApp {
             self.bb_clock_hz,
             watch,
             self.bb_spi_miso,
-            responder,
-            watch_pins,
+            bus,
         ));
     }
 
@@ -563,6 +571,7 @@ impl IkIdeApp {
                 self.live_regs = snap.regs;
                 self.live_cycles = snap.cycles;
                 self.live_running = snap.running;
+                self.live_view = snap.view;
                 events.extend(snap.events);
                 if let Some(reason) = snap.halt_reason {
                     halt = Some(reason);

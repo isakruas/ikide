@@ -12,15 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// The breadboard: a visual workbench wired to the live simulator.
+// The breadboard: a virtual board built from scripted devices.
 //
-// Two kinds of things live here:
-//   * GPIO components (LED, RGB LED, push button, 7-segment digit, LED bar) you
-//     place on the Schematic tab and wire to individual pins. An output lights
-//     when its pin's PORT bit is high *and* the pin is an output (DDR bit set);
-//     a button drives its pin low while held (active-low, internal pull-up).
-//   * On-chip serial buses (UART/SPI/I2C) shown on their own tabs, fed by the
-//     bytes the program transmits — plus a UART send box and an SPI response.
+// Every part is an instance of a catalog device (a Rhai script). The card UI
+// is generated from the device's declared interface: its `view` elements are
+// rendered live (LEDs from pin state or script state, buttons driving pins,
+// sliders feeding ADC channels, framebuffer displays) and its `pins` become
+// wiring selectors. The Schematic tab is the board; the UART/SPI/I2C tabs are
+// bus monitors.
 
 use std::collections::HashMap;
 
@@ -28,86 +27,74 @@ use eframe::egui;
 
 use crate::app::IkIdeApp;
 use crate::core::board::{self, Pin};
-use crate::core::devices::Bus;
+use crate::core::devices::{Bus, DeviceSpec, InstanceWiring, PinMode, ViewDef, ViewKind, ViewVal};
 
-/// The breadboard's top-level views.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub enum BreadboardTab {
+    #[default]
     Schematic,
     Uart,
     Spi,
     I2c,
 }
 
-impl Default for BreadboardTab {
-    fn default() -> Self {
-        BreadboardTab::Schematic
-    }
-}
-
-/// A GPIO component kind.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum CompKind {
-    Led,
-    RgbLed,
-    Button,
-    SevenSeg,
-    LedBar,
-    Potentiometer,
-}
-
-impl CompKind {
-    fn label(self) -> &'static str {
-        match self {
-            CompKind::Led => "LED",
-            CompKind::RgbLed => "RGB LED",
-            CompKind::Button => "Button",
-            CompKind::SevenSeg => "7-segment",
-            CompKind::LedBar => "LED bar",
-            CompKind::Potentiometer => "Potentiometer",
-        }
-    }
-    /// Pin-terminal count (the LED bar and potentiometer are special-cased).
-    fn fixed_terminals(self) -> usize {
-        match self {
-            CompKind::Led | CompKind::Button => 1,
-            CompKind::RgbLed => 3,
-            CompKind::SevenSeg => 8,
-            CompKind::LedBar | CompKind::Potentiometer => 0,
-        }
-    }
-}
-
-/// One placed component. `pins[t]` is the MCU pin wired to terminal `t`.
-pub struct Component {
-    pub kind: CompKind,
+/// One placed device: which catalog entry, and how its terminals are wired.
+pub struct Instance {
+    pub spec_id: String,
+    /// Per-terminal wiring, parallel to the spec's `pins` (index into the
+    /// board pin list for watch/drive terminals; ADC terminals use `adc_ch`).
     pub pins: Vec<Option<usize>>,
-    pub color_idx: usize,
-    pub pressed: bool,
-    /// Potentiometer: the ADC channel and its 10-bit value.
-    pub adc_channel: u8,
-    pub adc_value: u16,
+    pub adc_ch: Vec<u8>,
+    /// Transient UI state: slider values and held buttons, keyed by element.
+    pub slider_vals: HashMap<usize, f32>,
+    pub pressed: HashMap<usize, bool>,
 }
 
-impl Component {
-    fn new(kind: CompKind) -> Self {
-        let n = if kind == CompKind::LedBar { 8 } else { kind.fixed_terminals() };
-        Component {
-            kind,
-            pins: vec![None; n],
-            color_idx: 0,
-            pressed: false,
-            adc_channel: 0,
-            adc_value: 512,
+impl Instance {
+    pub fn new(spec: &DeviceSpec, board_pins: &[Pin]) -> Self {
+        // Pre-wire terminals that declare a default pin.
+        let pins = spec
+            .pins
+            .iter()
+            .map(|def| {
+                def.default_pin
+                    .as_ref()
+                    .and_then(|n| board_pins.iter().position(|p| &p.name == n))
+            })
+            .collect();
+        Instance {
+            spec_id: spec.id.clone(),
+            pins,
+            adc_ch: vec![0; spec.pins.len()],
+            slider_vals: HashMap::new(),
+            pressed: HashMap::new(),
         }
+    }
+
+    /// Resolve this instance to the wiring the engine builds from.
+    pub fn wiring(&self, catalog: &[DeviceSpec], board_pins: &[Pin]) -> InstanceWiring {
+        let mut w = InstanceWiring { spec_id: self.spec_id.clone(), ..Default::default() };
+        if let Some(spec) = catalog.iter().find(|s| s.id == self.spec_id) {
+            for (t, def) in spec.pins.iter().enumerate() {
+                match def.mode {
+                    PinMode::Adc => {
+                        w.adc.insert(def.name.clone(), self.adc_ch.get(t).copied().unwrap_or(0));
+                    }
+                    _ => {
+                        if let Some(p) = self.pins.get(t).copied().flatten().and_then(|i| board_pins.get(i)) {
+                            w.pins.insert(def.name.clone(), p.name.clone());
+                        }
+                    }
+                }
+            }
+        }
+        w
     }
 }
 
-/// The breadboard model, owned by the app for the session. Pins are cached per
-/// target so we don't re-parse `gpio.ik` per frame.
+/// The board model: placed instances plus the cached pin map of the target.
 #[derive(Default)]
 pub struct Breadboard {
-    pub components: Vec<Component>,
     cached_device: String,
     cached_pins: Vec<Pin>,
 }
@@ -122,16 +109,10 @@ impl Breadboard {
     pub fn pins(&self) -> &[Pin] {
         &self.cached_pins
     }
+    pub fn device_name(&self) -> &str {
+        &self.cached_device
+    }
 }
-
-/// LED colour palette: lit colour for each choice.
-const LED_COLORS: &[(&str, egui::Color32)] = &[
-    ("Red", egui::Color32::from_rgb(255, 70, 70)),
-    ("Green", egui::Color32::from_rgb(80, 255, 110)),
-    ("Blue", egui::Color32::from_rgb(90, 150, 255)),
-    ("Yellow", egui::Color32::from_rgb(255, 220, 70)),
-    ("White", egui::Color32::from_rgb(245, 245, 245)),
-];
 
 fn dim(c: egui::Color32) -> egui::Color32 {
     egui::Color32::from_rgb(
@@ -141,31 +122,35 @@ fn dim(c: egui::Color32) -> egui::Color32 {
     )
 }
 
-/// True when `pin` is configured as an output and currently driven high.
+fn rgb(c: u32) -> egui::Color32 {
+    egui::Color32::from_rgb((c >> 16) as u8, (c >> 8) as u8, c as u8)
+}
+
+/// True when `pin` is configured as an output and driven high.
 fn pin_high(regs: &HashMap<u32, u8>, pin: &Pin) -> bool {
     let port = *regs.get(&pin.port_addr).unwrap_or(&0);
     let ddr = *regs.get(&pin.ddr_addr).unwrap_or(&0);
     (port >> pin.bit) & 1 == 1 && (ddr >> pin.bit) & 1 == 1
 }
 
-/// Actions collected during the UI pass, applied once the model borrow ends.
+/// Actions collected during the UI pass, applied after the borrow ends.
 #[derive(Default)]
 struct Actions {
     close: bool,
     start: bool,
     stop: bool,
-    add: Option<CompKind>,
+    add: Option<String>,
     remove: Option<usize>,
-    /// Pin inputs to drive (PINx addr, bit, level-high).
+    refresh_catalog: bool,
+    new_script: bool,
+    /// (PINx addr, bit, level) inputs from pin-bound buttons.
     inputs: Vec<(u32, u8, bool)>,
+    /// ADC values from pin-bound sliders.
+    adc: Vec<(u8, u16)>,
+    /// Script events from id-bound elements.
+    view_events: Vec<(usize, String, f64)>,
     uart_send: Option<Vec<u8>>,
     spi_miso: Option<u8>,
-    /// ADC channel values to push (channel, value).
-    adc: Vec<(u8, u16)>,
-    /// Catalog id of a device to attach to the buses.
-    attach: Option<String>,
-    /// Index into bb_devices of a device to detach.
-    detach: Option<usize>,
 }
 
 pub fn render(app: &mut IkIdeApp, ctx: &egui::Context) {
@@ -183,10 +168,9 @@ pub fn render(app: &mut IkIdeApp, ctx: &egui::Context) {
     egui::Window::new("breadboard")
         .title_bar(false)
         .resizable(true)
-        .default_width(760.0)
-        .default_height(480.0)
+        .default_width(780.0)
+        .default_height(520.0)
         .show(ctx, |ui| {
-            // --- Header ---
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("🔌 Breadboard").strong());
                 if let Some(dev) = &device {
@@ -200,13 +184,12 @@ pub fn render(app: &mut IkIdeApp, ctx: &egui::Context) {
             });
             ui.separator();
 
-            // --- Run toolbar ---
             let live = app.live.is_some();
             ui.horizontal_wrapped(|ui| {
                 if !live {
                     if ui
                         .add_enabled(device.is_some(), egui::Button::new("▶ Run"))
-                        .on_hover_text("Compile the active file and run it live; components track the simulated I/O.")
+                        .on_hover_text("Compile the active file and run it against the virtual board.")
                         .clicked()
                     {
                         act.start = true;
@@ -228,7 +211,7 @@ pub fn render(app: &mut IkIdeApp, ctx: &egui::Context) {
                     ui.label("Clock:");
                     if ui
                         .add(egui::DragValue::new(&mut mhz).speed(0.5).range(0.0..=32.0).suffix(" MHz"))
-                        .on_hover_text("Assumed CPU clock used to pace the run to real time. Match your code's F_CPU; 0 = full speed.")
+                        .on_hover_text("Assumed CPU clock pacing the run. Match @cpu_mhz(); 0 = full speed.")
                         .changed()
                     {
                         app.bb_clock_hz = (mhz * 1_000_000.0) as u32;
@@ -239,10 +222,9 @@ pub fn render(app: &mut IkIdeApp, ctx: &egui::Context) {
                 ui.label(egui::RichText::new(&app.live_status).weak().small());
             }
 
-            // --- Tab bar ---
             ui.separator();
             ui.horizontal(|ui| {
-                ui.selectable_value(&mut app.bb_tab, BreadboardTab::Schematic, "🧩 Schematic");
+                ui.selectable_value(&mut app.bb_tab, BreadboardTab::Schematic, "🧩 Board");
                 ui.selectable_value(&mut app.bb_tab, BreadboardTab::Uart, "🖧 UART");
                 ui.selectable_value(&mut app.bb_tab, BreadboardTab::Spi, "🔗 SPI");
                 ui.selectable_value(&mut app.bb_tab, BreadboardTab::I2c, "🔗 I2C");
@@ -256,85 +238,311 @@ pub fn render(app: &mut IkIdeApp, ctx: &egui::Context) {
                 });
                 return;
             }
-            let device = device.clone().unwrap();
-            app.breadboard.ensure_pins(&device);
+            app.breadboard.ensure_pins(&device.unwrap());
 
             match app.bb_tab {
-                BreadboardTab::Schematic => schematic_tab(app, ui, &mut act),
+                BreadboardTab::Schematic => board_tab(app, ui, &mut act),
                 BreadboardTab::Uart => uart_tab(app, ui, &mut act),
                 BreadboardTab::Spi => spi_tab(app, ui, &mut act),
-                BreadboardTab::I2c => i2c_tab(app, ui, &mut act),
+                BreadboardTab::I2c => i2c_tab(app, ui),
             }
         });
 
     apply_actions(app, act);
 }
 
-/// The Schematic tab: a palette plus the placed GPIO components.
-fn schematic_tab(app: &mut IkIdeApp, ui: &mut egui::Ui, act: &mut Actions) {
+// ---------------------------------------------------------------------------
+// Board tab
+// ---------------------------------------------------------------------------
+
+fn board_tab(app: &mut IkIdeApp, ui: &mut egui::Ui, act: &mut Actions) {
     ui.horizontal(|ui| {
-        ui.label("Add component:");
-        let items: Vec<(CompKind, String)> = [
-            CompKind::Led,
-            CompKind::RgbLed,
-            CompKind::Button,
-            CompKind::SevenSeg,
-            CompKind::LedBar,
-            CompKind::Potentiometer,
-        ]
-        .into_iter()
-        .map(|k| (k, k.label().to_string()))
-        .collect();
-        if let Some(kind) = crate::ui::widgets::filter_combo(ui, "bb_add_component", "➕ Choose…", &items) {
-            act.add = Some(kind);
+        ui.label("Add device:");
+        let items: Vec<(String, String)> = app
+            .device_catalog
+            .iter()
+            .map(|s| {
+                let tag = match s.bus {
+                    Bus::None => String::new(),
+                    b => format!("  [{}]", b.label()),
+                };
+                (s.id.clone(), format!("{}{}", s.name, tag))
+            })
+            .collect();
+        if let Some(id) = crate::ui::widgets::filter_combo(ui, "bb_add_device", "➕ Choose…", &items) {
+            act.add = Some(id);
+        }
+        ui.add_space(8.0);
+        if ui
+            .button("📝 New device script")
+            .on_hover_text("Create devices/my_device.rhai in the project and open it. It appears in the catalog after a refresh.")
+            .clicked()
+        {
+            act.new_script = true;
+        }
+        if ui.button("⟳").on_hover_text("Reload the device catalog (built-ins + devices/*.rhai).").clicked() {
+            act.refresh_catalog = true;
         }
     });
     ui.add_space(4.0);
 
     let pins: Vec<Pin> = app.breadboard.pins().to_vec();
-    let n = app.breadboard.components.len();
+    let n = app.bb_instances.len();
     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-        // Display devices render here even when there are no GPIO components.
         display_panel(app, ui);
-
         if n == 0 {
             ui.add_space(16.0);
             ui.vertical_centered(|ui| {
-                ui.label(egui::RichText::new("Add a component, or attach a device on the UART/SPI/I2C tabs.").weak());
+                ui.label(egui::RichText::new("Add a device — components and bus peripherals all live here.").weak());
             });
         }
         for i in 0..n {
-            component_card(app, ui, &pins, i, act);
+            instance_card(app, ui, &pins, i, act);
             ui.add_space(6.0);
         }
     });
 }
 
-/// Render the framebuffers of any attached display devices, re-uploading a
-/// texture only when its contents changed.
+/// One placed device: header, generated view elements, wiring selectors.
+fn instance_card(app: &mut IkIdeApp, ui: &mut egui::Ui, pins: &[Pin], i: usize, act: &mut Actions) {
+    let spec = match app.device_catalog.iter().find(|s| s.id == app.bb_instances[i].spec_id) {
+        Some(s) => s.clone(),
+        None => return,
+    };
+
+    egui::Frame::group(ui.style()).show(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(&spec.name).strong());
+            if spec.bus != Bus::None {
+                let addr = spec.address.map(|a| format!(" @0x{:02X}", a)).unwrap_or_default();
+                ui.label(egui::RichText::new(format!("[{}{}]", spec.bus.label(), addr)).weak().small());
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("✖").on_hover_text("Remove").clicked() {
+                    act.remove = Some(i);
+                }
+            });
+        });
+
+        // View elements, side by side.
+        if !spec.view.is_empty() {
+            ui.horizontal_wrapped(|ui| {
+                for (e, view) in spec.view.iter().enumerate() {
+                    render_view_element(app, ui, pins, &spec, i, e, view, act);
+                }
+            });
+        }
+
+        // Wiring selectors for every declared terminal.
+        if !spec.pins.is_empty() {
+            ui.horizontal_wrapped(|ui| {
+                for (t, def) in spec.pins.iter().enumerate() {
+                    match def.mode {
+                        PinMode::Adc => {
+                            ui.label(egui::RichText::new(format!("{}:", def.name)).small());
+                            let ch = app.bb_instances[i].adc_ch.get(t).copied().unwrap_or(0);
+                            egui::ComboBox::from_id_salt(("bb_adc", i, t))
+                                .selected_text(format!("ADC{}", ch))
+                                .width(70.0)
+                                .show_ui(ui, |ui| {
+                                    for c in 0u8..8 {
+                                        ui.selectable_value(&mut app.bb_instances[i].adc_ch[t], c, format!("ADC{}", c));
+                                    }
+                                });
+                        }
+                        _ => {
+                            ui.label(egui::RichText::new(format!("{}:", def.name)).small());
+                            let cur = app.bb_instances[i].pins[t]
+                                .and_then(|p| pins.get(p))
+                                .map(|p| p.name.clone())
+                                .unwrap_or_else(|| "—".into());
+                            let mut items: Vec<(Option<usize>, String)> = Vec::with_capacity(pins.len() + 1);
+                            items.push((None, "— none —".into()));
+                            items.extend(pins.iter().enumerate().map(|(pi, p)| (Some(pi), p.name.clone())));
+                            if let Some(v) = crate::ui::widgets::filter_combo(ui, ("bb_pin", i, t), &cur, &items) {
+                                app.bb_instances[i].pins[t] = v;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
+}
+
+/// Render one declared view element and queue any input it produces.
+#[allow(clippy::too_many_arguments)]
+fn render_view_element(
+    app: &mut IkIdeApp,
+    ui: &mut egui::Ui,
+    pins: &[Pin],
+    spec: &DeviceSpec,
+    i: usize,
+    e: usize,
+    view: &ViewDef,
+    act: &mut Actions,
+) {
+    let live = app.live.is_some();
+    // Resolve the element's terminal bindings up front, so the interactive
+    // arms below are free to mutate the instance.
+    let wired: Vec<Option<Pin>> = view
+        .pins
+        .iter()
+        .map(|name| {
+            spec.pins
+                .iter()
+                .position(|d| &d.name == name)
+                .and_then(|t| app.bb_instances[i].pins.get(t).copied().flatten())
+                .and_then(|p| pins.get(p).cloned())
+        })
+        .collect();
+    let id_num: Option<f64> = view.id.as_ref().and_then(|id| match app.live_view.get(&(i, id.clone())) {
+        Some(ViewVal::Num(n)) => Some(*n),
+        _ => None,
+    });
+    let pin_on = |n: usize| -> bool {
+        live && wired.get(n).and_then(|p| p.as_ref()).map(|p| pin_high(&app.live_regs, p)).unwrap_or(false)
+    };
+    let bit_on = |n: usize| -> bool {
+        match (&view.id, id_num) {
+            (Some(_), Some(v)) => (v as i64 >> n) & 1 == 1,
+            (Some(_), None) => false,
+            (None, _) => pin_on(n),
+        }
+    };
+
+    match view.kind {
+        ViewKind::Led => {
+            let (r, p) = ui.allocate_painter(egui::vec2(36.0, 36.0), egui::Sense::hover());
+            let c = if bit_on(0) { rgb(view.color) } else { dim(rgb(view.color)) };
+            p.circle_filled(r.rect.center(), 13.0, c);
+        }
+        ViewKind::RgbLed => {
+            let (r, p) = ui.allocate_painter(egui::vec2(36.0, 36.0), egui::Sense::hover());
+            let c = egui::Color32::from_rgb(
+                if pin_on(0) { 255 } else { 18 },
+                if pin_on(1) { 255 } else { 18 },
+                if pin_on(2) { 255 } else { 18 },
+            );
+            p.circle_filled(r.rect.center(), 13.0, c);
+        }
+        ViewKind::LedBar => {
+            let count = if view.id.is_some() { view.bits } else { view.pins.len() };
+            let (r, p) = ui.allocate_painter(egui::vec2((count as f32 * 16.0).max(16.0), 28.0), egui::Sense::hover());
+            for n in 0..count {
+                let cx = r.rect.left() + 8.0 + n as f32 * 16.0;
+                let c = if bit_on(n) { rgb(view.color) } else { dim(rgb(view.color)) };
+                p.circle_filled(egui::pos2(cx, r.rect.center().y), 6.0, c);
+            }
+        }
+        ViewKind::SevenSeg => {
+            let (r, p) = ui.allocate_painter(egui::vec2(46.0, 64.0), egui::Sense::hover());
+            let seg: Vec<bool> = (0..7).map(|n| bit_on(n)).collect();
+            draw_seven_seg(&p, r.rect, rgb(view.color), &seg, bit_on(7));
+        }
+        ViewKind::Button => {
+            let label = view.label.as_deref().unwrap_or("hold");
+            let b = ui.add(egui::Button::new(format!("⏺ {}", label)).min_size(egui::vec2(64.0, 28.0)));
+            let down = b.is_pointer_button_down_on();
+            let was = app.bb_instances[i].pressed.get(&e).copied().unwrap_or(false);
+            app.bb_instances[i].pressed.insert(e, down);
+            if live {
+                if let Some(id) = &view.id {
+                    if down != was {
+                        act.view_events.push((i, id.clone(), if down { 1.0 } else { 0.0 }));
+                    }
+                } else if let Some(pin) = wired.first().and_then(|p| p.as_ref()) {
+                    // Pressed -> the `press` level; released -> its inverse.
+                    let level = if down { view.press != 0 } else { view.press == 0 };
+                    act.inputs.push((pin.pin_addr, pin.bit, level));
+                }
+            }
+        }
+        ViewKind::Slider => {
+            let mut v = app.bb_instances[i]
+                .slider_vals
+                .get(&e)
+                .copied()
+                .unwrap_or(((view.min + view.max) / 2.0) as f32);
+            if ui
+                .add(egui::Slider::new(&mut v, view.min as f32..=view.max as f32))
+                .changed()
+            {
+                app.bb_instances[i].slider_vals.insert(e, v);
+                if live {
+                    if let Some(id) = &view.id {
+                        act.view_events.push((i, id.clone(), v as f64));
+                    }
+                }
+            } else {
+                app.bb_instances[i].slider_vals.insert(e, v);
+            }
+            // ADC-bound sliders push their value continuously while live.
+            if live && view.id.is_none() {
+                if let Some(t) = view.pins.first().and_then(|n| spec.pins.iter().position(|d| &d.name == n)) {
+                    if matches!(spec.pins[t].mode, PinMode::Adc) {
+                        let ch = app.bb_instances[i].adc_ch.get(t).copied().unwrap_or(0);
+                        act.adc.push((ch, v as u16));
+                    }
+                }
+            }
+        }
+        ViewKind::Text => {
+            let txt = match view.id.as_deref().map(|id| app.live_view.get(&(i, id.to_string()))) {
+                Some(Some(ViewVal::Str(s))) => s.clone(),
+                Some(Some(ViewVal::Num(n))) => format!("{}", n),
+                _ => "—".into(),
+            };
+            ui.label(egui::RichText::new(txt).monospace());
+        }
+    }
+}
+
+/// 7-segment digit; `seg[0..7]` are a..g, `dp` the dot.
+fn draw_seven_seg(p: &egui::Painter, rect: egui::Rect, color: egui::Color32, seg: &[bool], dp: bool) {
+    let on = color;
+    let off = dim(color);
+    let w = 26.0;
+    let h = 48.0;
+    let x0 = rect.center().x - w / 2.0;
+    let y0 = rect.top() + 6.0;
+    let t = 4.0;
+    let sc = |i: usize| if seg.get(i).copied().unwrap_or(false) { on } else { off };
+    let hbar = |x: f32, y: f32, c: egui::Color32| {
+        p.rect_filled(egui::Rect::from_min_size(egui::pos2(x + t, y - t / 2.0), egui::vec2(w - 2.0 * t, t)), 1.0, c);
+    };
+    let vbar = |x: f32, y: f32, c: egui::Color32| {
+        p.rect_filled(egui::Rect::from_min_size(egui::pos2(x - t / 2.0, y + t), egui::vec2(t, h / 2.0 - 2.0 * t)), 1.0, c);
+    };
+    hbar(x0, y0, sc(0)); // a
+    vbar(x0 + w, y0, sc(1)); // b
+    vbar(x0 + w, y0 + h / 2.0, sc(2)); // c
+    hbar(x0, y0 + h, sc(3)); // d
+    vbar(x0, y0 + h / 2.0, sc(4)); // e
+    vbar(x0, y0, sc(5)); // f
+    hbar(x0, y0 + h / 2.0, sc(6)); // g
+    p.circle_filled(egui::pos2(x0 + w + 6.0, y0 + h), 2.5, if dp { on } else { off });
+}
+
+/// Framebuffers of attached display devices.
 fn display_panel(app: &mut IkIdeApp, ui: &mut egui::Ui) {
-    // Display devices attached but not yet rendered (before Run / no framebuffer).
+    // Names of placed display devices not yet rendered (before Run).
     let pending: Vec<String> = if app.bb_displays.is_empty() {
-        app.bb_devices
+        app.bb_instances
             .iter()
-            .filter_map(|id| {
+            .filter_map(|inst| {
                 app.device_catalog
                     .iter()
-                    .find(|s| &s.id == id && s.has_display)
+                    .find(|s| s.id == inst.spec_id && s.has_display)
                     .map(|s| s.name.clone())
             })
             .collect()
     } else {
         Vec::new()
     };
-
     if app.bb_displays.is_empty() && pending.is_empty() {
         return;
     }
-
-    ui.add_space(8.0);
-    ui.separator();
-    ui.label(egui::RichText::new("Displays").strong());
 
     for name in &pending {
         ui.label(egui::RichText::new(format!("📺 {} — press Run to render", name)).weak());
@@ -353,289 +561,53 @@ fn display_panel(app: &mut IkIdeApp, ui: &mut egui::Ui) {
             for (i, p) in pixels.iter().enumerate() {
                 img.pixels[i] = egui::Color32::from_rgb((p >> 16) as u8, (p >> 8) as u8, *p as u8);
             }
-            let handle = ui.ctx().load_texture(
-                format!("bbdisp_{}", info.name),
-                img,
-                egui::TextureOptions::NEAREST,
-            );
-            app.bb_textures.insert(info.name.clone(), (generation, handle));
+            let tex = ui.ctx().load_texture(format!("bbdisp_{}", info.name), img, egui::TextureOptions::NEAREST);
+            app.bb_textures.insert(info.name.clone(), (generation, tex));
         }
 
         if let Some((_, tex)) = app.bb_textures.get(&info.name) {
             ui.label(egui::RichText::new(format!("{}  ({}×{})", info.name, w, h)).weak().small());
             let scale = (240.0 / w as f32).min(2.0);
             let size = egui::vec2(w as f32 * scale, h as f32 * scale);
-            // Draw the panel, then outline exactly its rect (it's often mostly
-            // black, so a border makes its extent visible).
             let resp = ui.add(egui::Image::new(egui::load::SizedTexture::new(tex.id(), size)));
-            ui.painter().rect_stroke(
-                resp.rect,
-                egui::Rounding::ZERO,
-                egui::Stroke::new(1.0, egui::Color32::from_gray(90)),
-            );
+            ui.painter()
+                .rect_stroke(resp.rect, egui::Rounding::ZERO, egui::Stroke::new(1.0, egui::Color32::from_gray(90)));
         }
     }
+    ui.add_space(6.0);
 }
 
-/// One component as a card: live visual on the left, pin wiring on the right.
-fn component_card(app: &mut IkIdeApp, ui: &mut egui::Ui, pins: &[Pin], i: usize, act: &mut Actions) {
-    let kind = app.breadboard.components[i].kind;
-    egui::Frame::group(ui.style()).show(ui, |ui| {
-        ui.horizontal(|ui| {
-            // --- Live visual ---
-            draw_visual(app, ui, pins, i);
+// ---------------------------------------------------------------------------
+// Bus monitor tabs
+// ---------------------------------------------------------------------------
 
-            ui.add_space(8.0);
-            ui.separator();
-            ui.add_space(8.0);
-
-            // --- Controls ---
-            ui.vertical(|ui| {
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(kind.label()).strong());
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("✖").on_hover_text("Remove").clicked() {
-                            act.remove = Some(i);
-                        }
-                    });
-                });
-
-                // LED-family colour picker.
-                if matches!(kind, CompKind::Led | CompKind::LedBar) {
-                    let cidx = app.breadboard.components[i].color_idx.min(LED_COLORS.len() - 1);
-                    egui::ComboBox::from_id_salt(("bb_col", i))
-                        .selected_text(LED_COLORS[cidx].0)
-                        .width(90.0)
-                        .show_ui(ui, |ui| {
-                            for (ci, (name, _)) in LED_COLORS.iter().enumerate() {
-                                ui.selectable_value(&mut app.breadboard.components[i].color_idx, ci, *name);
-                            }
-                        });
-                }
-
-                // LED bar length.
-                if kind == CompKind::LedBar {
-                    let mut len = app.breadboard.components[i].pins.len();
-                    if ui
-                        .add(egui::DragValue::new(&mut len).range(1..=16).prefix("LEDs: "))
-                        .changed()
-                    {
-                        app.breadboard.components[i].pins.resize(len, None);
-                    }
-                }
-
-                // Button press (momentary).
-                if kind == CompKind::Button {
-                    let b = ui.add(egui::Button::new("⏺ hold").min_size(egui::vec2(64.0, 28.0)));
-                    app.breadboard.components[i].pressed = b.is_pointer_button_down_on();
-                }
-
-                // Potentiometer: ADC channel + analog value.
-                if kind == CompKind::Potentiometer {
-                    ui.horizontal(|ui| {
-                        ui.label("ADC ch:");
-                        egui::ComboBox::from_id_salt(("bb_adc_ch", i))
-                            .selected_text(format!("{}", app.breadboard.components[i].adc_channel))
-                            .width(48.0)
-                            .show_ui(ui, |ui| {
-                                for ch in 0u8..8 {
-                                    ui.selectable_value(&mut app.breadboard.components[i].adc_channel, ch, format!("{}", ch));
-                                }
-                            });
-                    });
-                    let mut v = app.breadboard.components[i].adc_value;
-                    if ui.add(egui::Slider::new(&mut v, 0..=1023).text("value")).changed() {
-                        app.breadboard.components[i].adc_value = v;
-                    }
-                }
-
-                // Terminal → pin selectors.
-                let labels = terminal_labels(kind, app.breadboard.components[i].pins.len());
-                ui.horizontal_wrapped(|ui| {
-                    let count = app.breadboard.components[i].pins.len();
-                    for t in 0..count {
-                        pin_selector(ui, pins, &mut app.breadboard.components[i].pins[t], i, t, &labels[t]);
-                    }
-                });
-            });
-        });
-    });
-
-    // Queue button input (active-low w/ pull-up) when live.
-    if kind == CompKind::Button && app.live.is_some() {
-        let pressed = app.breadboard.components[i].pressed;
-        if let Some(pin) = app.breadboard.components[i].pins[0].and_then(|p| pins.get(p)) {
-            act.inputs.push((pin.pin_addr, pin.bit, !pressed));
-        }
-    }
-    // Push the potentiometer's analog value to its ADC channel when live.
-    if kind == CompKind::Potentiometer && app.live.is_some() {
-        let c = &app.breadboard.components[i];
-        act.adc.push((c.adc_channel, c.adc_value));
-    }
-}
-
-/// Per-terminal labels for a component's pin selectors.
-fn terminal_labels(kind: CompKind, count: usize) -> Vec<String> {
-    match kind {
-        CompKind::Led | CompKind::Button => vec!["pin".to_string()],
-        CompKind::RgbLed => vec!["R".to_string(), "G".to_string(), "B".to_string()],
-        CompKind::SevenSeg => ["a", "b", "c", "d", "e", "f", "g", "dp"].iter().map(|s| s.to_string()).collect(),
-        CompKind::LedBar => (0..count).map(|n| n.to_string()).collect(),
-        CompKind::Potentiometer => Vec::new(),
-    }
-}
-
-/// A compact "label: [pin ▾]" selector bound to one terminal. The dropdown is
-/// searchable so it stays usable on chips with dozens of pins.
-fn pin_selector(ui: &mut egui::Ui, pins: &[Pin], sel: &mut Option<usize>, i: usize, t: usize, label: &str) {
-    ui.horizontal(|ui| {
-        ui.label(egui::RichText::new(label).small());
-        let cur = sel.and_then(|p| pins.get(p)).map(|p| p.name.clone()).unwrap_or_else(|| "—".to_string());
-        let mut items: Vec<(Option<usize>, String)> = Vec::with_capacity(pins.len() + 1);
-        items.push((None, "— none —".to_string()));
-        for (pi, p) in pins.iter().enumerate() {
-            items.push((Some(pi), p.name.clone()));
-        }
-        if let Some(v) = crate::ui::widgets::filter_combo(ui, ("bb_pin", i, t), &cur, &items) {
-            *sel = v;
-        }
-    });
-}
-
-/// Draw a component's live visual via a small painter.
-fn draw_visual(app: &IkIdeApp, ui: &mut egui::Ui, pins: &[Pin], i: usize) {
-    let comp = &app.breadboard.components[i];
-    let regs = &app.live_regs;
-    let live = app.live.is_some();
-    let on = |t: usize| -> bool {
-        live && comp.pins.get(t).copied().flatten().and_then(|p| pins.get(p)).map(|p| pin_high(regs, p)).unwrap_or(false)
-    };
-    let color = LED_COLORS[comp.color_idx.min(LED_COLORS.len() - 1)].1;
-
-    match comp.kind {
-        CompKind::Led => {
-            let (_r, p) = ui.allocate_painter(egui::vec2(40.0, 40.0), egui::Sense::hover());
-            let c = if on(0) { color } else { dim(color) };
-            p.circle_filled(_r.rect.center(), 14.0, c);
-        }
-        CompKind::Button => {
-            let (_r, p) = ui.allocate_painter(egui::vec2(40.0, 40.0), egui::Sense::hover());
-            let c = if comp.pressed { egui::Color32::from_rgb(120, 200, 120) } else { egui::Color32::from_gray(90) };
-            p.rect_filled(egui::Rect::from_center_size(_r.rect.center(), egui::vec2(24.0, 24.0)), egui::Rounding::same(4.0), c);
-        }
-        CompKind::RgbLed => {
-            let (_r, p) = ui.allocate_painter(egui::vec2(40.0, 40.0), egui::Sense::hover());
-            let c = egui::Color32::from_rgb(
-                if on(0) { 255 } else { 18 },
-                if on(1) { 255 } else { 18 },
-                if on(2) { 255 } else { 18 },
-            );
-            p.circle_filled(_r.rect.center(), 14.0, c);
-        }
-        CompKind::SevenSeg => {
-            let (_r, p) = ui.allocate_painter(egui::vec2(46.0, 64.0), egui::Sense::hover());
-            draw_seven_seg(&p, _r.rect, color, &(0..7).map(|t| on(t)).collect::<Vec<_>>(), on(7));
-        }
-        CompKind::LedBar => {
-            let count = comp.pins.len();
-            let (_r, p) = ui.allocate_painter(egui::vec2((count as f32 * 16.0).max(16.0), 24.0), egui::Sense::hover());
-            for t in 0..count {
-                let cx = _r.rect.left() + 8.0 + t as f32 * 16.0;
-                let c = if on(t) { color } else { dim(color) };
-                p.circle_filled(egui::pos2(cx, _r.rect.center().y), 6.0, c);
-            }
-        }
-        CompKind::Potentiometer => {
-            // A fill bar proportional to the 0..1023 value.
-            let (_r, p) = ui.allocate_painter(egui::vec2(40.0, 40.0), egui::Sense::hover());
-            let frac = comp.adc_value as f32 / 1023.0;
-            let r = _r.rect.shrink(6.0);
-            p.rect_stroke(r, egui::Rounding::same(3.0), egui::Stroke::new(1.0, egui::Color32::from_gray(110)));
-            let fill = egui::Rect::from_min_max(
-                egui::pos2(r.left(), r.bottom() - r.height() * frac),
-                r.right_bottom(),
-            );
-            p.rect_filled(fill, egui::Rounding::same(3.0), egui::Color32::from_rgb(110, 170, 255));
-        }
-    }
-}
-
-/// Render a 7-segment digit. `seg[0..7]` are segments a..g; `dp` is the dot.
-fn draw_seven_seg(p: &egui::Painter, rect: egui::Rect, color: egui::Color32, seg: &[bool], dp: bool) {
-    let on = color;
-    let off = dim(color);
-    let w = 26.0;
-    let h = 48.0;
-    let x0 = rect.center().x - w / 2.0;
-    let y0 = rect.top() + 6.0;
-    let t = 4.0; // segment thickness
-    let seg_color = |i: usize| if seg.get(i).copied().unwrap_or(false) { on } else { off };
-    let hbar = |p: &egui::Painter, x: f32, y: f32, col: egui::Color32| {
-        p.rect_filled(egui::Rect::from_min_size(egui::pos2(x + t, y - t / 2.0), egui::vec2(w - 2.0 * t, t)), egui::Rounding::same(1.0), col);
-    };
-    let vbar = |p: &egui::Painter, x: f32, y: f32, col: egui::Color32| {
-        p.rect_filled(egui::Rect::from_min_size(egui::pos2(x - t / 2.0, y + t), egui::vec2(t, h / 2.0 - 2.0 * t)), egui::Rounding::same(1.0), col);
-    };
-    // a top, b top-right, c bottom-right, d bottom, e bottom-left, f top-left, g middle
-    hbar(p, x0, y0, seg_color(0));
-    vbar(p, x0 + w, y0, seg_color(1));
-    vbar(p, x0 + w, y0 + h / 2.0, seg_color(2));
-    hbar(p, x0, y0 + h, seg_color(3));
-    vbar(p, x0, y0 + h / 2.0, seg_color(4));
-    vbar(p, x0, y0, seg_color(5));
-    hbar(p, x0, y0 + h / 2.0, seg_color(6));
-    p.circle_filled(egui::pos2(x0 + w + 6.0, y0 + h), 2.5, if dp { on } else { off });
-}
-
-/// Attached devices for one bus, with detach buttons and a searchable picker.
-fn device_panel(app: &mut IkIdeApp, ui: &mut egui::Ui, bus: Bus, act: &mut Actions) {
-    ui.label(egui::RichText::new("Devices on this bus").strong());
-    let mut any = false;
-    for (i, id) in app.bb_devices.iter().enumerate() {
-        if let Some(spec) = app.device_catalog.iter().find(|s| &s.id == id) {
-            if spec.bus == bus {
-                any = true;
-                let addr = spec.address.map(|a| format!(" @0x{:02X}", a)).unwrap_or_default();
-                ui.horizontal(|ui| {
-                    ui.label(format!("• {}{}", spec.name, addr));
-                    if ui.small_button("✖").clicked() {
-                        act.detach = Some(i);
-                    }
-                });
-            }
-        }
-    }
-    if !any {
-        ui.label(egui::RichText::new("none attached").weak().small());
-    }
-    let items: Vec<(String, String)> = app
-        .device_catalog
+/// Devices placed on `bus`, listed read-only (managed on the Board tab).
+fn bus_device_list(app: &IkIdeApp, ui: &mut egui::Ui, bus: Bus) {
+    let names: Vec<String> = app
+        .bb_instances
         .iter()
-        .filter(|s| s.bus == bus)
-        .map(|s| {
-            let addr = s.address.map(|a| format!(" @0x{:02X}", a)).unwrap_or_default();
-            (s.id.clone(), format!("{}{}", s.name, addr))
+        .filter_map(|inst| {
+            app.device_catalog
+                .iter()
+                .find(|s| s.id == inst.spec_id && s.bus == bus)
+                .map(|s| {
+                    let addr = s.address.map(|a| format!(" @0x{:02X}", a)).unwrap_or_default();
+                    format!("{}{}", s.name, addr)
+                })
         })
         .collect();
-    ui.add_enabled_ui(app.live.is_none(), |ui| {
-        if let Some(id) = crate::ui::widgets::filter_combo(ui, ("attach_dev", bus.label()), "➕ Attach device…", &items) {
-            act.attach = Some(id);
-        }
-    });
-    if app.live.is_some() {
-        ui.label(egui::RichText::new("Device changes apply on the next Run.").weak().small());
+    if !names.is_empty() {
+        ui.label(egui::RichText::new(format!("Devices: {}", names.join(", "))).weak().small());
+        ui.separator();
     }
-    ui.separator();
 }
 
-/// The UART tab: transmitted-text console plus a best-effort send box.
 fn uart_tab(app: &mut IkIdeApp, ui: &mut egui::Ui, act: &mut Actions) {
-    if board::periph_addrs(&app.breadboard.cached_device_name()).uart.is_none() {
+    if board::periph_addrs(app.breadboard.device_name()).uart.is_none() {
         unavailable(ui, "USART isn't modeled for this target in the simulator.");
         return;
     }
-    device_panel(app, ui, Bus::Uart, act);
+    bus_device_list(app, ui, Bus::Uart);
 
     ui.horizontal(|ui| {
         ui.selectable_value(&mut app.bb_uart_plot, false, "Console");
@@ -644,7 +616,6 @@ fn uart_tab(app: &mut IkIdeApp, ui: &mut egui::Ui, act: &mut Actions) {
     ui.separator();
 
     if app.bb_uart_plot {
-        // Same plotter the Serial Monitor uses, fed by the UART transcript.
         crate::ui::serial::render_plotter(app, ui);
         return;
     }
@@ -654,7 +625,11 @@ fn uart_tab(app: &mut IkIdeApp, ui: &mut egui::Ui, act: &mut Actions) {
 
     ui.add_space(4.0);
     ui.horizontal(|ui| {
-        let send = ui.add(egui::TextEdit::singleline(&mut app.uart_send).desired_width(200.0).hint_text("type to send to the program…"));
+        let send = ui.add(
+            egui::TextEdit::singleline(&mut app.uart_send)
+                .desired_width(200.0)
+                .hint_text("type to send to the program…"),
+        );
         let enter = send.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
         let clicked = ui.add_enabled(app.live.is_some(), egui::Button::new("Send")).clicked();
         if (enter || clicked) && !app.uart_send.is_empty() {
@@ -664,16 +639,14 @@ fn uart_tab(app: &mut IkIdeApp, ui: &mut egui::Ui, act: &mut Actions) {
             app.uart_send.clear();
         }
     });
-    ui.label(egui::RichText::new("Bytes typed here are delivered to the program's receiver.").weak().small());
 }
 
-/// The SPI tab: transmitted bytes plus the configurable read-back (MISO) byte.
 fn spi_tab(app: &mut IkIdeApp, ui: &mut egui::Ui, act: &mut Actions) {
-    if board::periph_addrs(&app.breadboard.cached_device_name()).spi.is_none() {
+    if board::periph_addrs(app.breadboard.device_name()).spi.is_none() {
         unavailable(ui, "This target has no SPI.");
         return;
     }
-    device_panel(app, ui, Bus::Spi, act);
+    bus_device_list(app, ui, Bus::Spi);
     ui.label(egui::RichText::new("Bytes the master transmits (MOSI), in hex.").weak().small());
     log_view(ui, &app.spi_log, "spi_log");
 
@@ -683,7 +656,7 @@ fn spi_tab(app: &mut IkIdeApp, ui: &mut egui::Ui, act: &mut Actions) {
         let mut v = app.bb_spi_miso;
         if ui
             .add(egui::DragValue::new(&mut v).hexadecimal(2, false, true).prefix("0x"))
-            .on_hover_text("Byte returned to the master on each transfer (read back from the data register).")
+            .on_hover_text("Fallback byte returned to the master when no SPI device is attached.")
             .changed()
         {
             app.bb_spi_miso = v;
@@ -692,9 +665,8 @@ fn spi_tab(app: &mut IkIdeApp, ui: &mut egui::Ui, act: &mut Actions) {
     });
 }
 
-/// The I2C tab: attached devices plus the decoded TWI bus transcript.
-fn i2c_tab(app: &mut IkIdeApp, ui: &mut egui::Ui, act: &mut Actions) {
-    device_panel(app, ui, Bus::I2c, act);
+fn i2c_tab(app: &mut IkIdeApp, ui: &mut egui::Ui) {
+    bus_device_list(app, ui, Bus::I2c);
     ui.label(
         egui::RichText::new("TWI bus: [S] start, addr 0xNN R/W, data bytes (hex), [P] stop.")
             .weak()
@@ -710,7 +682,7 @@ fn unavailable(ui: &mut egui::Ui, msg: &str) {
     });
 }
 
-/// A scrolling monospace transcript that sticks to the bottom.
+/// Scrolling monospace transcript pinned to the bottom.
 fn log_view(ui: &mut egui::Ui, text: &str, id: &str) {
     egui::ScrollArea::vertical()
         .id_salt(id)
@@ -723,36 +695,79 @@ fn log_view(ui: &mut egui::Ui, text: &str, id: &str) {
         });
 }
 
-/// Apply the actions gathered during the UI pass.
+// ---------------------------------------------------------------------------
+// Action application
+// ---------------------------------------------------------------------------
+
+const SCRIPT_TEMPLATE: &str = r#"// My device — rename, wire and extend. Remove what you don't need.
+//
+// pins:  watch = observe an MCU output | drive = drive an MCU input | adc
+// view:  led | rgbled | ledbar | sevenseg | button | slider | text
+// bus:   none | uart | spi | i2c (+ address)
+// State lives in `this` between calls; `this.fb` is the display, if declared.
+fn meta() {
+    #{
+        name: "My Device",
+        bus: "none",
+        pins: #{ out: #{} },
+        view: [#{ kind: "led", pin: "out", color: 0x52A0FF }],
+    }
+}
+
+// fn init() { #{ count: 0 } }
+// fn pin_set(name, level) { ... }
+// fn on_view(id, value) { ... }
+// fn i2c_address(addr, read) { addr == 0x42 }
+// fn i2c_write(byte) { true }
+// fn i2c_read(last) { 0xFF }
+// fn spi_transfer(mosi) { 0xFF }
+// fn uart_tx(byte) { ... }
+// fn uart_poll() { () }
+"#;
+
 fn apply_actions(app: &mut IkIdeApp, act: Actions) {
     if let Some(idx) = act.remove {
-        if idx < app.breadboard.components.len() {
-            app.breadboard.components.remove(idx);
+        if idx < app.bb_instances.len() {
+            app.bb_instances.remove(idx);
         }
     }
-    if let Some(idx) = act.detach {
-        if idx < app.bb_devices.len() {
-            app.bb_devices.remove(idx);
+    if let Some(id) = act.add {
+        let board_pins = app.breadboard.pins().to_vec();
+        if let Some(spec) = app.device_catalog.iter().find(|s| s.id == id) {
+            app.bb_instances.push(Instance::new(spec, &board_pins));
         }
     }
-    if let Some(id) = act.attach {
-        app.bb_devices.push(id);
+    if act.refresh_catalog {
+        app.device_catalog = crate::core::devices::catalog();
     }
-    if let Some(kind) = act.add {
-        app.breadboard.components.push(Component::new(kind));
+    if act.new_script {
+        let dir = std::path::Path::new("devices");
+        let _ = std::fs::create_dir_all(dir);
+        let path = dir.join("my_device.rhai");
+        if !path.exists() {
+            let _ = std::fs::write(&path, SCRIPT_TEMPLATE);
+        }
+        if let Ok(abs) = path.canonicalize() {
+            app.load_file(abs);
+        }
+        app.device_catalog = crate::core::devices::catalog();
+        app.refresh_files();
     }
     if let Some(live) = &app.live {
         for (addr, bit, high) in act.inputs {
             live.set_input(addr, bit, high);
+        }
+        for (ch, val) in act.adc {
+            live.set_adc(ch, val);
+        }
+        for (dev, id, value) in act.view_events {
+            live.view_event(dev, &id, value);
         }
         if let Some(bytes) = act.uart_send {
             live.uart_send(bytes);
         }
         if let Some(b) = act.spi_miso {
             live.set_spi_miso(b);
-        }
-        for (ch, val) in act.adc {
-            live.set_adc(ch, val);
         }
     }
     if act.start {
@@ -763,12 +778,5 @@ fn apply_actions(app: &mut IkIdeApp, act: Actions) {
     }
     if act.close {
         app.show_breadboard = false;
-    }
-}
-
-impl Breadboard {
-    /// The device whose pins are currently cached (for peripheral lookups).
-    pub fn cached_device_name(&self) -> String {
-        self.cached_device.clone()
     }
 }

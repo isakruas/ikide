@@ -4,7 +4,7 @@ Initializes SPI as master and transmits an incrementing byte every 100 ms.
 
 ## On the breadboard
 
-- Optional: attach the **SPI Echo (+1)** device on the SPI tab.
+- Optional: on the **Board** tab, add the **SPI Echo (+1)** device.
 
 ## Run
 

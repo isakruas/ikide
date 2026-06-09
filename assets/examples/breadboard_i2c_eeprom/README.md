@@ -4,7 +4,7 @@ Writes a byte to an I2C EEPROM at **0x50** and reads it back over TWI, printing 
 
 ## On the breadboard
 
-- On the **I2C** tab, attach the **I2C EEPROM 0x50** device.
+- On the **Board** tab, add the **I2C EEPROM 0x50** device.
 
 ## Run
 

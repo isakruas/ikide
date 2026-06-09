@@ -1,4 +1,4 @@
 {
   "title": "Breadboard: ST7789 Display",
-  "description": "Drives an ST7789 SPI TFT: sets a 64x64 window and fills it, alternating colors. On the Breadboard's SPI tab attach the 'ST7789 TFT 240x240' device (DC=PB1, CS=PB2); the rendered display appears in the Schematic tab."
+  "description": "Drives an ST7789 SPI TFT, filling the 240x240 panel with alternating colors. On the Board tab add the 'ST7789 TFT 240x240' device (DC=PB1, CS=PB2); the rendered panel appears at the top of the Board tab."
 }

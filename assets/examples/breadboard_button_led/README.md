@@ -5,7 +5,7 @@ An LED on **PB5** lights while a button on **PD2** is held (active-low, internal
 ## On the breadboard
 
 - Add an **LED** on **PB5**.
-- Add a **Button** on **PD2**.
+- Add a **Push Button** wired to **PD2**.
 
 ## Run
 

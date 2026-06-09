@@ -14,28 +14,29 @@
 
 // Live, interactive simulation engine for the breadboard.
 //
-// Unlike `runner::spawn_simulate` (a one-shot run that reports a final
-// snapshot), this drives the same ik8bvm core *continuously* on a background
-// thread, paced to wall-clock time by an assumed CPU clock. Each frame it:
-//   1. applies any pin inputs the UI injected (writing the PINx data byte) and
-//      services the UART receive queue,
-//   2. steps the core forward by one clock-frame worth of cycles,
-//   3. publishes a snapshot of the watched I/O registers + captured serial
-//      traffic back to the UI.
+// Unlike `runner::spawn_simulate` (a one-shot run), this drives the ik8bvm
+// core *continuously* on a background thread, paced to wall-clock time by an
+// assumed CPU clock. Each frame it:
+//   1. drains UI commands (pin inputs, UART sends, device view events),
+//   2. applies forced pin levels and device-requested drives,
+//   3. steps the core one clock-frame worth of cycles,
+//   4. publishes watched registers, captured bus traffic and device view
+//      state back to the UI.
 //
-// GPIO fidelity rests on the VM modelling PIN/DDR/PORT as independent raw I/O
-// bytes. Serial peripherals use the VM's `capture_io` hook: bytes the program
-// writes to UDR/SPDR/TWDR are captured as `IoEvent`s; the SPI master read-back
-// is the host-configured `spi_miso`; UART receive is injected best-effort by
-// presenting a byte and pulsing RXC.
+// The attached virtual devices live in a `DeviceBus` shared between this
+// engine (UI events, snapshots) and the VM (synchronous bus responses) via
+// `SharedBus`; both run on this thread, so the lock is never contended.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 pub use ik8bvm::core::IoEvent;
+
+use crate::core::devices::{DeviceBus, SharedBus, ViewVal};
 
 /// A command from the UI to the running engine.
 pub enum LiveCmd {
@@ -50,6 +51,9 @@ pub enum LiveCmd {
     SetSpiMiso(u8),
     /// Set the analog value (0..1023) on an ADC channel.
     SetAdc { channel: u8, value: u16 },
+    /// A device's UI element changed (button, slider, ...): deliver to the
+    /// device instance's script.
+    ViewEvent { dev: usize, id: String, value: f64 },
     /// Tear the engine down.
     Stop,
 }
@@ -61,6 +65,8 @@ pub struct LiveSnapshot {
     pub regs: HashMap<u32, u8>,
     /// Serial-peripheral bytes transmitted since the previous snapshot.
     pub events: Vec<IoEvent>,
+    /// Device view state: (instance, view id) -> value.
+    pub view: HashMap<(usize, String), ViewVal>,
     pub cycles: u64,
     pub running: bool,
     /// Set once when the core halts, so the UI can report why.
@@ -89,6 +95,9 @@ impl LiveHandle {
     pub fn set_adc(&self, channel: u8, value: u16) {
         let _ = self.cmd_tx.send(LiveCmd::SetAdc { channel, value });
     }
+    pub fn view_event(&self, dev: usize, id: &str, value: f64) {
+        let _ = self.cmd_tx.send(LiveCmd::ViewEvent { dev, id: id.to_string(), value });
+    }
     pub fn stop(&self) {
         let _ = self.cmd_tx.send(LiveCmd::Stop);
     }
@@ -103,16 +112,15 @@ const MAX_STEPS_PER_FRAME: u64 = 8_000_000;
 
 /// Spawn the live engine. `clock_hz` is the assumed CPU frequency used to pace
 /// the run to real time (`0` = as fast as possible). `watch` is the set of
-/// data-space addresses reported every frame; `spi_miso` is the initial SPI
-/// read-back byte.
+/// data-space addresses reported every frame; `bus` carries the attached
+/// virtual devices (shared with the VM through [`SharedBus`]).
 pub fn spawn(
     device: String,
     hex_path: PathBuf,
     clock_hz: u32,
     watch: Vec<u32>,
     spi_miso: u8,
-    responder: Option<Box<dyn ik8bvm::core::BusResponder>>,
-    watch_pins: Vec<u32>,
+    bus: Option<Arc<Mutex<DeviceBus>>>,
 ) -> LiveHandle {
     let (cmd_tx, cmd_rx) = mpsc::channel::<LiveCmd>();
     let (snap_tx, snap_rx) = mpsc::channel::<LiveSnapshot>();
@@ -129,13 +137,22 @@ pub fn spawn(
         }
         vm.capture_io = true;
         vm.spi_miso = spi_miso;
-        vm.responder = responder;
-        vm.watch_pins = watch_pins.into_iter().collect();
 
-        // Pins the UI is currently forcing as inputs, re-asserted every frame so
-        // a held button stays held.
+        // Pins the UI or a device script is forcing as inputs, re-asserted every
+        // frame so a held button stays held.
         let mut forced: HashMap<(u32, u8), bool> = HashMap::new();
         let mut halted_sent = false;
+
+        if let Some(bus) = &bus {
+            let b = bus.lock().unwrap();
+            vm.watch_pins = b.pin_addrs().into_iter().collect();
+            // Released levels of device-driven pins (e.g. button pull-ups).
+            for (addr, bit, level) in b.idle_drives() {
+                forced.insert((addr, bit), level);
+            }
+            drop(b);
+            vm.responder = Some(Box::new(SharedBus(bus.clone())));
+        }
 
         // Cycles to advance per frame to track real time at the assumed clock.
         let cycles_per_frame: u64 = if clock_hz == 0 {
@@ -160,6 +177,11 @@ pub fn spawn(
                     LiveCmd::UartSend(bytes) => vm.uart_feed(&bytes),
                     LiveCmd::SetSpiMiso(b) => vm.spi_miso = b,
                     LiveCmd::SetAdc { channel, value } => vm.adc_set(channel as usize, value),
+                    LiveCmd::ViewEvent { dev, id, value } => {
+                        if let Some(bus) = &bus {
+                            bus.lock().unwrap().ui_event(dev, &id, value);
+                        }
+                    }
                     LiveCmd::Stop => stop = true,
                 }
             }
@@ -167,7 +189,13 @@ pub fn spawn(
                 break;
             }
 
-            // 2. Apply forced inputs, advance attached devices, then step.
+            // 2. Apply forced inputs (UI + script-driven pins), advance attached
+            // devices, then step.
+            if let Some(bus) = &bus {
+                for (addr, bit, level) in bus.lock().unwrap().take_drives() {
+                    forced.insert((addr, bit), level);
+                }
+            }
             apply_forced(&mut vm, &forced);
             vm.poll_devices(cycles_per_frame.max(1));
             if vm.running {
@@ -207,10 +235,21 @@ pub fn spawn(
                 } else {
                     None
                 };
+                let view = match &bus {
+                    Some(bus) => bus
+                        .lock()
+                        .unwrap()
+                        .view_values()
+                        .into_iter()
+                        .map(|(i, k, v)| ((i, k), v))
+                        .collect(),
+                    None => HashMap::new(),
+                };
                 if snap_tx
                     .send(LiveSnapshot {
                         regs,
                         events,
+                        view,
                         cycles: vm.cycles,
                         running: vm.running,
                         halt_reason,

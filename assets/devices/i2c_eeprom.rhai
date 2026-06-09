@@ -1,9 +1,5 @@
-// I2C EEPROM (24C-style) at address 0x50, 256 bytes.
-//
-// Protocol: after addressing, the first written byte is the memory pointer;
-// further writes store data and auto-increment; reads return mem[ptr++].
-// This is the classic register-map shape most I2C devices follow — copy it
-// and change `meta`/`init`/handlers to model your own sensor.
+// I2C EEPROM (24C-style) at 0x50, 256 bytes, 8-bit memory pointer.
+// The classic register-map shape — copy this to model most I2C chips.
 fn meta() { #{ name: "I2C EEPROM 0x50", bus: "i2c", address: 0x50 } }
 
 fn init() {
@@ -13,8 +9,8 @@ fn init() {
 }
 
 fn i2c_address(addr, read) {
-    this.first = true;       // next write (if any) is the pointer
-    addr == 0x50             // ACK only our address
+    this.first = true;                 // next write is the pointer
+    addr == 0x50
 }
 
 fn i2c_write(byte) {
@@ -25,7 +21,7 @@ fn i2c_write(byte) {
         this.mem[this.ptr] = byte;
         this.ptr = (this.ptr + 1) % 256;
     }
-    true                     // ACK
+    true
 }
 
 fn i2c_read(last) {
