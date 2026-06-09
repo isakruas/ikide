@@ -46,8 +46,9 @@ pins: #{
 - **drive** — the device drives the pin (a button pulling low). `idle` is the
   released level. To drive from script code, set `this.drive = #{ irq: 0 }`.
 - **adc** — the terminal selects an ADC channel; pair it with a `slider`.
-- `default:` (or the string shorthand) pre-wires the terminal; the user can
-  rewire it on the card.
+- `"default":` (or the string shorthand) pre-wires the terminal; the user can
+  rewire it on the card. Note the quotes: `default` is a reserved keyword in
+  the script language, so the key must be written as a string.
 
 ## Visual interface (`view`)
 

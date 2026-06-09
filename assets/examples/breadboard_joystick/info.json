@@ -1,0 +1,4 @@
+{
+  "title": "Breadboard: Joystick Cursor",
+  "description": "A 5-way joystick (U/L/R/D + SET/RST on PC0..PC5) moves a lit cursor across an LED bar on PD0..PD7: L/R step, RST recenters, SET fills the bar, and every press is logged over UART."
+}

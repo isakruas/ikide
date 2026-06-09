@@ -735,6 +735,7 @@ const BUILTIN: &[(&str, &str)] = &[
     ("max7219", include_str!("../../assets/devices/max7219.rhai")),
     ("lm75", include_str!("../../assets/devices/lm75.rhai")),
     ("mpu6050", include_str!("../../assets/devices/mpu6050.rhai")),
+    ("joystick", include_str!("../../assets/devices/joystick.rhai")),
 ];
 
 /// One scripting engine for all devices; per-device state lives in the device.
@@ -916,6 +917,13 @@ mod tests {
 
         let seg = specs.iter().find(|s| s.id == "seven_segment").unwrap();
         assert_eq!(seg.view[0].pins.len(), 8);
+
+        // Joystick: six active-low drive lines, six buttons, default wiring.
+        let joy = specs.iter().find(|s| s.id == "joystick").unwrap();
+        assert_eq!(joy.pins.len(), 6);
+        assert!(joy.pins.iter().all(|p| matches!(p.mode, PinMode::Drive { idle: 1 })));
+        assert!(joy.pins.iter().all(|p| p.default_pin.is_some()));
+        assert_eq!(joy.view.iter().filter(|v| v.kind == ViewKind::Button).count(), 6);
     }
 
     /// The PCF8574's latched port is exported to the UI via its view id —

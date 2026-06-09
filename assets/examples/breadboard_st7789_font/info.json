@@ -1,0 +1,4 @@
+{
+  "title": "Breadboard: Text on ST7789 (std/font)",
+  "description": "Renders 'IKIDE' on the 240x240 TFT using the 5x8 glyphs from std/font, scaled 4x. On the Board tab add the ST7789 TFT 240x240 device (DC=PB1, CS=PB2)."
+}
