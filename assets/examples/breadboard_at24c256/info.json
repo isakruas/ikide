@@ -1,0 +1,4 @@
+{
+  "title": "Breadboard: AT24C256 EEPROM",
+  "description": "Writes a byte at 16-bit address 0x1234 of an AT24C256 and reads it back, printing the value over UART. Add the AT24C256 device."
+}

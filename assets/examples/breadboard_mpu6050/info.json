@@ -1,0 +1,4 @@
+{
+  "title": "Breadboard: MPU6050 Reader",
+  "description": "Wakes an MPU6050, verifies WHO_AM_I and reads the Z acceleration high byte, printing both over UART. Add the MPU6050 device."
+}

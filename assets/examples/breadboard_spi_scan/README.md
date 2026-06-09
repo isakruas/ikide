@@ -1,6 +1,8 @@
 # SPI Byte Scan
 
-Initializes SPI as master and transmits an incrementing byte every 100 ms.
+SPI is full duplex: every transfer clocks a byte out on MOSI and a byte in on
+MISO simultaneously. This sends an incrementing byte and prints both sides of
+each exchange over UART.
 
 ## On the breadboard
 
@@ -8,4 +10,7 @@ Initializes SPI as master and transmits an incrementing byte every 100 ms.
 
 ## Run
 
-Run, open the **SPI** tab to watch the MOSI stream; set a MISO response (or attach a device) to see the read-back.
+Run and open the UART tab: `sent:N got:M` prints each exchange. With the
+echo device attached, `got` is always `sent + 1`; without it, `got` is the
+configured MISO fallback. The SPI tab shows the same traffic as `MOSI→MISO`
+pairs.

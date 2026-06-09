@@ -130,6 +130,8 @@ pub struct IkIdeApp {
     // Serial-peripheral transcripts, fed from the live engine's captured events.
     pub uart_log: String,
     pub uart_send: String,
+    /// Line ending appended by the UART tab's Send box.
+    pub bb_uart_ending: crate::core::serial::LineEnding,
     pub spi_log: String,
     pub twi_log: String,
     pub bb_spi_miso: u8,
@@ -272,6 +274,7 @@ impl Default for IkIdeApp {
             bb_tab: crate::ui::breadboard::BreadboardTab::Schematic,
             uart_log: String::new(),
             uart_send: String::new(),
+            bb_uart_ending: crate::core::serial::LineEnding::Lf,
             spi_log: String::new(),
             twi_log: String::new(),
             bb_spi_miso: 0xFF,
@@ -615,7 +618,12 @@ impl IkIdeApp {
                 }
             }
             IoPeripheral::Spi => {
-                self.spi_log.push_str(&format!("{:02X} ", ev.byte));
+                // Full-duplex pairs: "MOSI→MISO ".
+                if ev.write {
+                    self.spi_log.push_str(&format!("{:02X}", ev.byte));
+                } else {
+                    self.spi_log.push_str(&format!("→{:02X} ", ev.byte));
+                }
                 cap_log(&mut self.spi_log);
             }
             IoPeripheral::Twi => {
@@ -634,8 +642,11 @@ impl IkIdeApp {
                             let rw = if ev.byte & 1 == 1 { "R" } else { "W" };
                             self.twi_log.push_str(&format!("addr 0x{:02X}{} ", ev.byte >> 1, rw));
                             self.twi_expect_addr = false;
-                        } else {
+                        } else if ev.write {
                             self.twi_log.push_str(&format!("{:02X} ", ev.byte));
+                        } else {
+                            // A byte the device returned to the master.
+                            self.twi_log.push_str(&format!("←{:02X} ", ev.byte));
                         }
                     }
                 }

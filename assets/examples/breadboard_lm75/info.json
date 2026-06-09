@@ -1,0 +1,4 @@
+{
+  "title": "Breadboard: LM75 Thermostat",
+  "description": "Reads an LM75 temperature sensor over I2C and turns an LED on above 30 degrees, printing readings over UART. Add the LM75 device and an LED on PB5; set the temperature with the slider."
+}

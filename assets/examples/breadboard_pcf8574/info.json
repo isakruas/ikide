@@ -1,0 +1,4 @@
+{
+  "title": "Breadboard: PCF8574 Port Expander",
+  "description": "Walks a bit across a PCF8574's eight outputs over I2C. Add the PCF8574 device — its LED bar shows the latched outputs live."
+}

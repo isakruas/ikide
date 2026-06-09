@@ -1,0 +1,4 @@
+{
+  "title": "Breadboard: LCD 16x2 (HD44780)",
+  "description": "Prints two lines of text on a 16x2 character LCD behind an I2C backpack, using the standard 4-bit initialization. Add the LCD 16x2 I2C device."
+}

@@ -1,4 +1,4 @@
 {
-  "title": "Analog ADC Serial Plotter",
+  "title": "Serial: ADC Plotter",
   "description": "Reads analog voltages from two ADC channels (channel 0 and channel 1) and prints them to UART. Perfect to visualize analog sensor readings in the Serial Plotter."
 }

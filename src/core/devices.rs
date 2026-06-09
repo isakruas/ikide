@@ -402,9 +402,15 @@ impl ScriptedDevice {
             .eval_ast(false)
             .rewind_scope(true)
             .bind_this_ptr(&mut self.state);
-        self.engine
-            .call_fn_with_options::<Dynamic>(opts, &mut self.scope, &self.ast, name, args)
-            .ok()
+        match self.engine.call_fn_with_options::<Dynamic>(opts, &mut self.scope, &self.ast, name, args) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                // A script error aborts only this call; log it so device
+                // authors can see what went wrong.
+                eprintln!("[device {}] {}(): {}", self.name, name, e);
+                None
+            }
+        }
     }
 
     /// A watched PORT register changed: notify the script of any edges.
@@ -723,6 +729,12 @@ const BUILTIN: &[(&str, &str)] = &[
     ("pcf8574", include_str!("../../assets/devices/pcf8574.rhai")),
     ("at24c256", include_str!("../../assets/devices/at24c256.rhai")),
     ("st7789", include_str!("../../assets/devices/st7789.rhai")),
+    ("ssd1306", include_str!("../../assets/devices/ssd1306.rhai")),
+    ("hd44780_i2c", include_str!("../../assets/devices/hd44780_i2c.rhai")),
+    ("sn74hc595", include_str!("../../assets/devices/sn74hc595.rhai")),
+    ("max7219", include_str!("../../assets/devices/max7219.rhai")),
+    ("lm75", include_str!("../../assets/devices/lm75.rhai")),
+    ("mpu6050", include_str!("../../assets/devices/mpu6050.rhai")),
 ];
 
 /// One scripting engine for all devices; per-device state lives in the device.
@@ -735,6 +747,10 @@ pub fn engine() -> Arc<Engine> {
     e.register_type_with_name::<DisplayHandle>("Display")
         .register_fn("px", |d: &mut DisplayHandle, x: i64, y: i64, c: i64| d.set_px(x, y, c))
         .register_fn("fill", |d: &mut DisplayHandle, c: i64| d.fill(c));
+    // chr(code): one-character string from an ASCII code, for text views.
+    e.register_fn("chr", |c: i64| {
+        char::from_u32((c as u32).clamp(0x20, 0x10FFFF)).unwrap_or(' ').to_string()
+    });
     Arc::new(e)
 }
 
@@ -823,6 +839,24 @@ mod tests {
     const TWCR: u32 = 0xBC;
     const START: u8 = 0xA4;
     const EN: u8 = 0x84;
+
+    /// Every shipped example program compiles for its declared target.
+    #[test]
+    fn all_examples_compile() {
+        let mut checked = 0;
+        for entry in std::fs::read_dir("assets/examples").expect("examples dir") {
+            let main = entry.expect("entry").path().join("main.ik");
+            if !main.is_file() {
+                continue;
+            }
+            let src = std::fs::read_to_string(&main).expect("read main.ik");
+            crate::core::analysis::sync_std_imports(&src);
+            crate::core::analysis::compile(&src)
+                .unwrap_or_else(|e| panic!("{:?} failed to compile: {}", main, e.message));
+            checked += 1;
+        }
+        assert!(checked >= 24, "expected all examples checked, got {}", checked);
+    }
 
     /// Pure-view component scripts parse with pins and view elements.
     #[test]
@@ -983,5 +1017,146 @@ fn on_view(id, value) {
         let mut vm = vm_with(bus);
         vm.write_data(0x4E, 0x20);
         assert_eq!(vm.read_data(0x4E), 0x21);
+    }
+
+    /// I2C helper: one full master write transaction (addr + payload bytes).
+    fn twi_write(vm: &mut ik8bvm::core::AvrVm, addr7: u8, bytes: &[u8]) {
+        vm.write_data(TWCR, START);
+        vm.write_data(TWDR, addr7 << 1);
+        vm.write_data(TWCR, EN);
+        for &b in bytes {
+            vm.write_data(TWDR, b);
+            vm.write_data(TWCR, EN);
+        }
+        vm.write_data(TWCR, 0x94); // STOP
+    }
+
+    /// SSD1306: init window + one data byte lights pixel (0,0).
+    #[test]
+    fn ssd1306_draws_pixels() {
+        let bus = build_bus("atmega328p", &[wired("ssd1306")]);
+        let display = bus.displays().first().expect("has display").handle.clone();
+        let mut vm = vm_with(bus);
+
+        twi_write(&mut vm, 0x3C, &[0x00, 0x20, 0x00, 0x21, 0, 127, 0x22, 0, 7]);
+        twi_write(&mut vm, 0x3C, &[0x40, 0x01]); // data: bit 0 -> pixel (0,0)
+
+        let fb = display.0.lock().unwrap();
+        assert_ne!(fb.pixels[0], 0, "pixel (0,0) should be lit");
+        assert_eq!(fb.pixels[1], 0, "pixel (1,0) stays dark");
+    }
+
+    /// HD44780 backpack: init to 4-bit mode, print 'H', read the text view.
+    #[test]
+    fn hd44780_renders_text() {
+        let bus = Arc::new(Mutex::new(build_bus("atmega328p", &[wired("hd44780_i2c")])));
+        let mut vm = runner::build_vm("atmega328p");
+        vm.responder = Some(Box::new(SharedBus(bus.clone())));
+
+        // Send one nibble with an EN pulse (RS in bit 0, nibble in bits 4..7).
+        let mut nib = |vm: &mut ik8bvm::core::AvrVm, n: u8, rs: u8| {
+            let base = (n << 4) | rs;
+            twi_write(vm, 0x27, &[base | 0x04, base]); // EN high, EN low
+        };
+        nib(&mut vm, 0x2, 0); // enter 4-bit mode
+        nib(&mut vm, 0x4, 1); // 'H' = 0x48: high nibble
+        nib(&mut vm, 0x8, 1); //             low nibble
+
+        let vals = bus.lock().unwrap().view_values();
+        let screen = vals.iter().find_map(|(_, k, v)| match (k.as_str(), v) {
+            ("screen", ViewVal::Str(s)) => Some(s.clone()),
+            _ => None,
+        });
+        assert!(screen.unwrap_or_default().starts_with('H'), "LCD should show H");
+    }
+
+    /// 74HC595: SPI byte latched to the outputs on the latch rising edge.
+    #[test]
+    fn sn74hc595_latches_on_rising_edge() {
+        let bus = Arc::new(Mutex::new(build_bus("atmega328p", &[wired("sn74hc595")])));
+        let mut vm = runner::build_vm("atmega328p");
+        vm.watch_pins = bus.lock().unwrap().pin_addrs().into_iter().collect();
+        vm.responder = Some(Box::new(SharedBus(bus.clone())));
+
+        const PORTB: u32 = 0x25;
+        vm.write_data(PORTB, 0x00); // latch (PB2) low
+        vm.write_data(0x4E, 0xA5); // shift a byte in
+        vm.write_data(PORTB, 0x04); // latch rising edge
+
+        let vals = bus.lock().unwrap().view_values();
+        assert!(
+            vals.iter().any(|(_, k, v)| k == "q" && matches!(v, ViewVal::Num(n) if *n == 165.0)),
+            "outputs should latch 0xA5, got {:?}",
+            vals
+        );
+    }
+
+    /// MAX7219: powers up in shutdown (blank); after waking via register
+    /// 0x0C, a (row, data) frame latched on LOAD lights the row's pixels.
+    #[test]
+    fn max7219_lights_a_row() {
+        let bus = build_bus("atmega328p", &[wired("max7219")]);
+        let display = bus.displays().first().expect("has display").handle.clone();
+        let mut vm = runner::build_vm("atmega328p");
+        vm.watch_pins = bus.pin_addrs().into_iter().collect();
+        vm.responder = Some(Box::new(bus));
+
+        const PORTB: u32 = 0x25;
+        let mut frame = |vm: &mut ik8bvm::core::AvrVm, reg: u8, data: u8| {
+            vm.write_data(PORTB, 0x00); // LOAD low
+            vm.write_data(0x4E, reg);
+            vm.write_data(0x4E, data);
+            vm.write_data(PORTB, 0x04); // LOAD rising edge latches
+        };
+
+        frame(&mut vm, 0x01, 0x81); // row 0 while still in shutdown
+        assert_eq!(display.0.lock().unwrap().pixels[0], 0, "blank in shutdown");
+
+        frame(&mut vm, 0x0C, 0x01); // leave shutdown
+        let fb = display.0.lock().unwrap();
+        assert_ne!(fb.pixels[0], 0, "col 0 lit");
+        assert_ne!(fb.pixels[7], 0, "col 7 lit");
+        assert_eq!(fb.pixels[1], 0, "col 1 dark");
+    }
+
+    /// LM75: the slider temperature is read back over I2C.
+    #[test]
+    fn lm75_reads_set_temperature() {
+        let bus = Arc::new(Mutex::new(build_bus("atmega328p", &[wired("lm75")])));
+        let mut vm = runner::build_vm("atmega328p");
+        vm.responder = Some(Box::new(SharedBus(bus.clone())));
+
+        bus.lock().unwrap().ui_event(0, "temp_c", 31.0);
+
+        twi_write(&mut vm, 0x48, &[0x00]); // point at the temperature register
+        vm.write_data(TWCR, START);
+        vm.write_data(TWDR, (0x48 << 1) | 1);
+        vm.write_data(TWCR, EN);
+        vm.write_data(TWCR, 0xC4); // read with ACK (TWEA): MSB
+        let msb = vm.read_data(TWDR);
+        vm.write_data(TWCR, EN); // read with NACK: LSB
+        let _lsb = vm.read_data(TWDR);
+        assert_eq!(msb, 31, "MSB should be the set temperature");
+    }
+
+    /// MPU6050: WHO_AM_I answers 0x68 and the accel block reads 1 g on Z.
+    #[test]
+    fn mpu6050_whoami_and_accel() {
+        let bus = build_bus("atmega328p", &[wired("mpu6050")]);
+        let mut vm = vm_with(bus);
+
+        twi_write(&mut vm, 0x68, &[0x75]); // WHO_AM_I
+        vm.write_data(TWCR, START);
+        vm.write_data(TWDR, (0x68 << 1) | 1);
+        vm.write_data(TWCR, EN);
+        vm.write_data(TWCR, EN); // read NACK
+        assert_eq!(vm.read_data(TWDR), 0x68);
+
+        twi_write(&mut vm, 0x68, &[0x3F]); // ACCEL_ZOUT_H
+        vm.write_data(TWCR, START);
+        vm.write_data(TWDR, (0x68 << 1) | 1);
+        vm.write_data(TWCR, EN);
+        vm.write_data(TWCR, EN);
+        assert_eq!(vm.read_data(TWDR), 0x40, "1 g on Z = 0x4000, high byte 0x40");
     }
 }

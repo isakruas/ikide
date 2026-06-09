@@ -1,0 +1,4 @@
+{
+  "title": "Breadboard: RGB LED Cycle",
+  "description": "Cycles an RGB LED through all eight color combinations on PB1/PB2/PB3. On the Board tab add an RGB LED wired r=PB1, g=PB2, b=PB3."
+}

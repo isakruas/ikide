@@ -2,13 +2,16 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Breadboard: SPI Byte Scan.
-# Initializes SPI as master and transmits an incrementing byte every 100 ms.
-# Watch the bytes in the Breadboard's SPI tab; set a MISO response there to
-# observe what the master reads back.
+# SPI is full duplex: every transfer sends a byte on MOSI and receives one on
+# MISO in the same clocks. This sends an incrementing byte and prints what
+# came back over UART. Board tab: add the SPI Echo device to see the
+# response track the sent byte (+1).
 
 target atmega328p
 
 import std/spi
+import std/uart
+import std/conv
 import std/delay
 
 @cpu_mhz() -> u16 {
@@ -16,10 +19,23 @@ import std/delay
 }
 
 @main {
+    @uart_init(103)
     @spi_init_master_raw()
+
+    ram mut $buf: u8[8] = 0
     ram mut $b: u8 = 0
     loop * {
-        ram imut $resp: u8 = @spi_transfer($b)
+        ram mut $resp: u8 = 0
+        @spi_transfer($b) -> $resp
+
+        @uart_print_str("sent:")
+        @utoa($b, &$buf[0])
+        @uart_print_str(&$buf[0])
+        @uart_print_str(" got:")
+        @utoa($resp, &$buf[0])
+        @uart_print_str(&$buf[0])
+        @uart_println()
+
         $b + 1 -> $b
         @delay_ms(100)
     }

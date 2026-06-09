@@ -1,0 +1,4 @@
+{
+  "title": "Breadboard: 74HC595 Shift Register",
+  "description": "Shifts a walking-bit pattern into a 74HC595 over SPI and latches it to the outputs. Add the 74HC595 device (latch on PB2); its LED bar shows the outputs."
+}

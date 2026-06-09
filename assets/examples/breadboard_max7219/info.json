@@ -1,0 +1,4 @@
+{
+  "title": "Breadboard: MAX7219 LED Matrix",
+  "description": "Wakes a MAX7219 from shutdown and draws an X on the 8x8 matrix with (register, data) frames. Add the MAX7219 device (LOAD on PB2)."
+}

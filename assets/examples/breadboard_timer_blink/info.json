@@ -1,0 +1,4 @@
+{
+  "title": "Breadboard: Timer Interrupt Blink",
+  "description": "Uses a Timer1 overflow interrupt to toggle PB0 without blocking the CPU, logging events via UART. On the Board tab add an LED wired to PB0 to watch it blink."
+}

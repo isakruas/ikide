@@ -1,0 +1,4 @@
+{
+  "title": "Breadboard: SSD1306 OLED",
+  "description": "Initializes an SSD1306 OLED in horizontal addressing mode and fills it with a checkerboard. Add the SSD1306 device; the panel renders on the Board tab."
+}

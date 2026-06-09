@@ -1,15 +1,18 @@
-// I2C EEPROM (24C-style) at 0x50, 256 bytes, 8-bit memory pointer.
-// The classic register-map shape — copy this to model most I2C chips.
+// 24C02-style serial EEPROM: 256 x 8, I2C address 0x50, 8-bit word address.
+//
+// A write transaction carries the word address and then data; the address
+// auto-increments. Reads return mem[address++]. This single-pointer register
+// shape is the template for most small I2C memories and sensors.
 fn meta() { #{ name: "I2C EEPROM 0x50", bus: "i2c", address: 0x50 } }
 
 fn init() {
-    let m = [];
-    for i in 0..256 { m.push(0); }
+    let m = blob();
+    m.pad(256, 0xFF);                  // erased cells read 0xFF
     #{ ptr: 0, mem: m, first: true }
 }
 
 fn i2c_address(addr, read) {
-    this.first = true;                 // next write is the pointer
+    this.first = true;                 // a write starts with the word address
     addr == 0x50
 }
 

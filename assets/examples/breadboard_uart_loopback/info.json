@@ -1,0 +1,4 @@
+{
+  "title": "Breadboard: UART Loopback",
+  "description": "Sends a byte over the USART and waits for it to come back, toggling an LED on each verified round trip. Add the UART Loopback device and an LED on PB5."
+}

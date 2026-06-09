@@ -632,10 +632,18 @@ fn uart_tab(app: &mut IkIdeApp, ui: &mut egui::Ui, act: &mut Actions) {
         );
         let enter = send.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
         let clicked = ui.add_enabled(app.live.is_some(), egui::Button::new("Send")).clicked();
+        // Line ending, same options as the Serial Monitor.
+        use crate::core::serial::LineEnding;
+        egui::ComboBox::from_id_salt("bb_uart_ending")
+            .selected_text(app.bb_uart_ending.label())
+            .show_ui(ui, |ui| {
+                for e in [LineEnding::None, LineEnding::Lf, LineEnding::Cr, LineEnding::CrLf] {
+                    ui.selectable_value(&mut app.bb_uart_ending, e, e.label());
+                }
+            });
         if (enter || clicked) && !app.uart_send.is_empty() {
-            let mut bytes = app.uart_send.clone().into_bytes();
-            bytes.push(b'\n');
-            act.uart_send = Some(bytes);
+            let line = format!("{}{}", app.uart_send, app.bb_uart_ending.suffix());
+            act.uart_send = Some(line.into_bytes());
             app.uart_send.clear();
         }
     });
@@ -647,7 +655,11 @@ fn spi_tab(app: &mut IkIdeApp, ui: &mut egui::Ui, act: &mut Actions) {
         return;
     }
     bus_device_list(app, ui, Bus::Spi);
-    ui.label(egui::RichText::new("Bytes the master transmits (MOSI), in hex.").weak().small());
+    ui.label(
+        egui::RichText::new("Full-duplex exchanges, in hex: MOSI→MISO (what the master sent → what it read back).")
+            .weak()
+            .small(),
+    );
     log_view(ui, &app.spi_log, "spi_log");
 
     ui.add_space(4.0);
@@ -668,7 +680,7 @@ fn spi_tab(app: &mut IkIdeApp, ui: &mut egui::Ui, act: &mut Actions) {
 fn i2c_tab(app: &mut IkIdeApp, ui: &mut egui::Ui) {
     bus_device_list(app, ui, Bus::I2c);
     ui.label(
-        egui::RichText::new("TWI bus: [S] start, addr 0xNN R/W, data bytes (hex), [P] stop.")
+        egui::RichText::new("TWI bus: [S] start, addr 0xNN R/W, data (hex; ← = read from the device), [P] stop.")
             .weak()
             .small(),
     );
@@ -705,6 +717,8 @@ const SCRIPT_TEMPLATE: &str = r#"// My device — rename, wire and extend. Remov
 // view:  led | rgbled | ledbar | sevenseg | button | slider | text
 // bus:   none | uart | spi | i2c (+ address)
 // State lives in `this` between calls; `this.fb` is the display, if declared.
+// Full authoring guide with worked examples: assets/devices/README.md in the
+// IKIDE repository (the built-in devices are all written this way).
 fn meta() {
     #{
         name: "My Device",
