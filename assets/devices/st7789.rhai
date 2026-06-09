@@ -57,9 +57,11 @@ fn spi_transfer(mosi) {
         } else {
             let px = (this.hi << 8) | mosi;
             this.hi = -1;
-            let r = ((px >> 11) & 0x1F) << 3;
-            let g = ((px >> 5) & 0x3F) << 2;
-            let b = (px & 0x1F) << 3;
+            // RGB565 -> RGB888, expanding each channel to full range so
+            // 0xFFFF renders as true white.
+            let r = ((px >> 11) & 0x1F) * 255 / 31;
+            let g = ((px >> 5) & 0x3F) * 255 / 63;
+            let b = (px & 0x1F) * 255 / 31;
             this.fb.px(this.cx, this.cy, (r << 16) | (g << 8) | b);
             this.cx += 1;
             if this.cx > this.x1 {

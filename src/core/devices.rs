@@ -858,6 +858,47 @@ mod tests {
         assert!(checked >= 24, "expected all examples checked, got {}", checked);
     }
 
+    /// The font-on-display example really renders: run the shipped program in
+    /// the VM with the ST7789 attached and check the framebuffer — a glyph
+    /// pixel of the "I" turns white and the cleared background stays dark.
+    /// Tens of millions of simulated instructions: ~2 s in release, ~40 s in
+    /// debug, so the debug suite skips it.
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "slow full render; run with --release -- --ignored")]
+    fn st7789_font_example_renders_text() {
+        let src = std::fs::read_to_string("assets/examples/breadboard_st7789_font/main.ik").unwrap();
+        crate::core::analysis::sync_std_imports(&src);
+        let art = crate::core::analysis::compile(&src).expect("example compiles");
+
+        let hex = std::env::temp_dir().join("ikide_font_example.hex");
+        std::fs::write(&hex, &art.hex).unwrap();
+
+        let bus = build_bus("atmega328p", &[wired("st7789")]);
+        let display = bus.displays().first().expect("display").handle.clone();
+
+        let mut vm = runner::build_vm(&art.device);
+        ik8bvm::hw::load_hex(&mut vm, &hex.to_string_lossy()).expect("HEX loads");
+        vm.watch_pins = bus.pin_addrs().into_iter().collect();
+        vm.responder = Some(Box::new(bus));
+
+        // 'I' = glyph column 2 is a full bar: pixel (68, 110) must turn white.
+        let target = 110 * 240 + 68;
+        let mut steps: u64 = 0;
+        while vm.running && steps < 400_000_000 {
+            for _ in 0..1_000_000 {
+                vm.step();
+            }
+            steps += 1_000_000;
+            if display.0.lock().unwrap().pixels[target] == 0xFF_FFFF {
+                break;
+            }
+        }
+
+        let fb = display.0.lock().unwrap();
+        assert_eq!(fb.pixels[target], 0xFF_FFFF, "glyph bar pixel should be white");
+        assert_eq!(fb.pixels[0], 0x10_1010, "background stays dark (0x1082 in RGB565)");
+    }
+
     /// Pure-view component scripts parse with pins and view elements.
     #[test]
     fn component_scripts_parse() {
@@ -1007,7 +1048,7 @@ fn on_view(id, value) {
         vm.write_data(SPDR, 0x00);
 
         let fb = display.0.lock().unwrap();
-        assert_eq!(fb.pixels[0], 0xF8_0000);
+        assert_eq!(fb.pixels[0], 0xFF_0000, "RGB565 0xF800 expands to full red");
     }
 
     /// A scripted SPI device answers on MISO.
