@@ -615,6 +615,15 @@ pub fn keyword_help(word: &str) -> Option<KeywordHelp> {
 // Diagnostics
 // ============================================================================
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Severity {
+    /// The program does not compile.
+    Error,
+    /// The program compiles, but something deserves attention (e.g. an
+    /// implicit narrowing assignment reported by the compiler).
+    Warning,
+}
+
 #[derive(Clone, Debug)]
 pub struct Diagnostic {
     /// 1-based source line, or 0 when the error is file-level (no line).
@@ -626,6 +635,7 @@ pub struct Diagnostic {
     /// The original compiler text, when this came from the compiler (kept for
     /// power users / hover). `None` for IDE-side lints.
     pub raw: Option<String>,
+    pub severity: Severity,
 }
 
 /// Type-check `src` with the compiler's own front end (in-process) and return
@@ -638,13 +648,16 @@ pub fn check(src: &str) -> Vec<Diagnostic> {
     // a half-typed buffer can hit an internal panic, so guard the UI thread.
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compile(src)));
     match result {
-        Ok(Ok(_)) => Vec::new(),
+        // A clean compile still carries the compiler's non-fatal warnings
+        // (e.g. implicit narrowing), each one a Warning-severity diagnostic.
+        Ok(Ok(artifact)) => artifact.warnings,
         Ok(Err(d)) => vec![d],
         Err(_) => vec![Diagnostic {
             line: 0,
             message: "Internal compiler error while analyzing this file.".to_string(),
             term: String::new(),
             raw: None,
+            severity: Severity::Error,
         }],
     }
 }
@@ -655,6 +668,7 @@ fn diag_from_error(raw: &str) -> Diagnostic {
         message: friendly(raw),
         term: extract_term(raw),
         raw: Some(raw.to_string()),
+        severity: Severity::Error,
     }
 }
 
@@ -669,7 +683,40 @@ fn diag_from_src(src: &str, raw: &str) -> Diagnostic {
     d
 }
 
+/// A compiler warning (no line info; quotes the target and names the function).
+fn warning_from_src(src: &str, raw: &str) -> Diagnostic {
+    let mut d = diag_from_src(src, raw);
+    d.severity = Severity::Warning;
+    d
+}
+
 fn resolve_line(src: &str, term: &str, raw: &str) -> usize {
+    // Semantic diagnostics name the enclosing function ("... in function '@f'");
+    // restrict the term search to that function's body so a name that also
+    // appears elsewhere in the file is pinned to the right occurrence.
+    if let Some(fn_name) = named_function(raw) {
+        if let Some((start, end)) = function_span(src, &fn_name) {
+            if !term.is_empty() {
+                // A narrowing warning points at an assignment: prefer the line
+                // that actually assigns the term over its declaration line.
+                if raw.contains("in assignment to") {
+                    for (i, line) in src.lines().enumerate().take(end).skip(start) {
+                        if line.contains(term) && line.contains("->") {
+                            return i + 1;
+                        }
+                    }
+                }
+                for (i, line) in src.lines().enumerate().take(end).skip(start) {
+                    if line.contains(term) {
+                        return i + 1;
+                    }
+                }
+            }
+            // Term not found inside the body (e.g. it lives in an imported
+            // module that was inlined): at least point at the function itself.
+            return start + 1;
+        }
+    }
     // First line that contains the offending token (e.g. the call `@start`).
     if !term.is_empty() {
         for (i, line) in src.lines().enumerate() {
@@ -683,6 +730,53 @@ fn resolve_line(src: &str, term: &str, raw: &str) -> usize {
         return src.lines().count().max(1);
     }
     0
+}
+
+/// The `@name` out of a "... in function '@name'" diagnostic, if present.
+fn named_function(raw: &str) -> Option<String> {
+    let rest = raw.split("in function '").nth(1)?;
+    let name = rest.split('\'').next()?;
+    if name.starts_with('@') {
+        Some(name.to_string())
+    } else {
+        None
+    }
+}
+
+/// 0-based [start, end) line span of a top-level function/ISR body in `src`.
+/// The body runs from the signature line to the next top-level declaration.
+fn function_span(src: &str, fn_name: &str) -> Option<(usize, usize)> {
+    let lines: Vec<&str> = src.lines().collect();
+    // ISR diagnostics use the synthesized name `__isr_<vector>`.
+    let isr_vector = fn_name.strip_prefix("@__isr_");
+    let mut start = None;
+    for (i, line) in lines.iter().enumerate() {
+        let t = line.trim_start();
+        let is_decl = match isr_vector {
+            Some(vec) => t.starts_with("isr ") && t.contains(vec),
+            None => {
+                t.starts_with(fn_name)
+                    && t[fn_name.len()..]
+                        .chars()
+                        .next()
+                        .map_or(true, |c| c == '(' || c == '{' || c.is_whitespace())
+            }
+        };
+        if is_decl {
+            start = Some(i);
+            break;
+        }
+    }
+    let start = start?;
+    let mut end = lines.len();
+    for (i, line) in lines.iter().enumerate().skip(start + 1) {
+        let t = line.trim_start();
+        if (t.starts_with('@') && t.contains('{')) || t.starts_with("isr ") {
+            end = i;
+            break;
+        }
+    }
+    Some((start, end))
 }
 
 /// The product of a successful in-process build: the Intel HEX plus the memory
@@ -703,6 +797,9 @@ pub struct BuildArtifact {
     pub regs_total: u32,
     /// Values the allocator had to spill to memory program-wide.
     pub spills: u32,
+    /// Non-fatal compiler diagnostics (Warning severity), e.g. implicit
+    /// narrowing assignments, already located on their source lines.
+    pub warnings: Vec<Diagnostic>,
 }
 
 /// Compile `src` to Intel HEX entirely in-process, running the compiler's own
@@ -778,6 +875,11 @@ pub fn compile(src: &str) -> Result<BuildArtifact, Diagnostic> {
         regs_used: cg.registers_used(),
         regs_total: 32,
         spills: cg.spills(),
+        warnings: cg
+            .warnings
+            .iter()
+            .map(|w| warning_from_src(src, w))
+            .collect(),
     })
 }
 
@@ -790,6 +892,11 @@ pub fn compile(src: &str) -> Result<BuildArtifact, Diagnostic> {
 pub fn friendly(raw: &str) -> String {
     let m = raw;
     let has = |needle: &str| m.contains(needle);
+
+    // --- Lexical -------------------------------------------------------------
+    if has("Unexpected character ';'") {
+        return "No `;` here — statements end at the newline; ik8b does not use semicolons.".into();
+    }
 
     // --- Sigil rules ---------------------------------------------------------
     if has("Expected constant name") {
@@ -893,6 +1000,70 @@ pub fn friendly(raw: &str) -> String {
     }
 
     // --- Semantic / backend --------------------------------------------------
+    if has("undefined variable") {
+        let n = first_quoted(m).map(|x| format!(" `{}`", x)).unwrap_or_default();
+        return format!(
+            "Unknown variable{} — declare it first, e.g. `ram mut {}: u8 = 0`. Check the spelling.",
+            n,
+            first_quoted(m).unwrap_or_else(|| "$x".into())
+        );
+    }
+    if has("undefined constant") {
+        let n = first_quoted(m).map(|x| format!(" `{}`", x)).unwrap_or_default();
+        return format!(
+            "Unknown constant{} for this target — check the spelling, the `target`, or `import` the module that declares it.",
+            n
+        );
+    }
+    if has("used as a value") {
+        let n = first_quoted(m).unwrap_or_else(|| "@f".into());
+        return format!("`{}` is a function — use `&{}` to take its address.", n, n);
+    }
+    if has("cannot assign to '") {
+        let n = first_quoted(m).map(|x| format!(" `{}`", x)).unwrap_or_default();
+        return format!(
+            "Can't assign to{} — only `$variables`, `%registers`, array elements and `*pointers` are assignable.",
+            n
+        );
+    }
+    if has("cannot take address of '") {
+        let n = first_quoted(m).map(|x| format!(" `{}`", x)).unwrap_or_default();
+        return format!("Can't take the address of{} — constants and hardware registers have no data address.", n);
+    }
+    if has("cannot index '") {
+        let n = first_quoted(m).map(|x| format!(" `{}`", x)).unwrap_or_default();
+        return format!("Can't index{} — only array or pointer `$variables` can be indexed.", n);
+    }
+    if has("does not fit in type") {
+        if has("constant '") {
+            let name = first_quoted(m).unwrap_or_default();
+            let ty = first_quoted_nth(m, 1).unwrap_or_default();
+            return format!("The value of constant `{}` doesn't fit in `{}` — {}.", name, ty, type_range(&ty));
+        }
+        let lit = m
+            .split("literal ")
+            .nth(1)
+            .and_then(|s| s.split_whitespace().next())
+            .unwrap_or("");
+        let ty = first_quoted(m).unwrap_or_default();
+        return format!("The literal {} doesn't fit in `{}` — {}.", lit, ty, type_range(&ty));
+    }
+    if has("outside the 16-bit address space") {
+        let n = first_quoted(m).map(|x| format!(" `{}`", x)).unwrap_or_default();
+        return format!("The address of register{} must be within 0x0000..0xFFFF.", n);
+    }
+    if has("implicit narrowing") {
+        let target = first_quoted(m).unwrap_or_else(|| "$x".into());
+        let from_to = m
+            .split("implicit narrowing ")
+            .nth(1)
+            .and_then(|s| s.split(" in assignment").next())
+            .unwrap_or("to a narrower type");
+        return format!(
+            "Assignment to `{}` truncates ({}) — mask with `& 0xFF` or shift (`>> 8`) to make the truncation explicit.",
+            target, from_to
+        );
+    }
     if has("undefined function") {
         let n = first_quoted(m).map(|x| format!(" `{}`", x)).unwrap_or_default();
         return format!("Unknown function{} — define it, or `import` the module that provides it.", n);
@@ -952,6 +1123,17 @@ pub fn friendly(raw: &str) -> String {
     clean_raw(m)
 }
 
+/// Human-readable value range of a primitive type name, for range diagnostics.
+fn type_range(ty: &str) -> String {
+    match ty {
+        "u8" => "u8 holds 0..255 (bit patterns -128..255 are accepted)".into(),
+        "u16" => "u16 holds 0..65535 (bit patterns -32768..65535 are accepted)".into(),
+        "i8" => "i8 holds -128..127 (bit patterns up to 255 are accepted)".into(),
+        "i16" => "i16 holds -32768..32767 (bit patterns up to 65535 are accepted)".into(),
+        other => format!("the value must fit in `{}`", other),
+    }
+}
+
 /// All single- or double-quoted spans in a message, left to right.
 fn quoted_tokens(s: &str) -> Vec<String> {
     let mut out = Vec::new();
@@ -1009,9 +1191,12 @@ fn clean_raw(m: &str) -> String {
         "Compilation Error: ",
         "Syntax Error: ",
         "Semantic Error: ",
+        "Type Error: ",
+        "Lexical Error: ",
         "Assembly Error: ",
         "Device Error: ",
         "Memory Error: ",
+        "Warning: ",
     ] {
         out = out.replace(prefix, "");
     }
@@ -1039,6 +1224,17 @@ fn extract_line_number(s: &str) -> Option<usize> {
 }
 
 fn extract_term(s: &str) -> String {
+    // A literal-range error quotes the *type*; the token to highlight is the
+    // out-of-range number itself ("literal 300 does not fit in type 'u8'").
+    if s.contains("does not fit in type") && !s.contains("constant '") {
+        if let Some(lit) = s
+            .split("literal ")
+            .nth(1)
+            .and_then(|r| r.split_whitespace().next())
+        {
+            return lit.to_string();
+        }
+    }
     // Prefer the explicit `Identifier("name")` or `Keyword("name")` forms.
     for tag in ["Identifier(\"", "Keyword(\""] {
         if let Some(i) = s.find(tag) {
@@ -1085,6 +1281,7 @@ pub fn lint_buffer(buffer: &str) -> Vec<Diagnostic> {
                     message: "`flash` values can't change — use `flash imut` instead of `flash mut`.".to_string(),
                     term: "mut".to_string(),
                     raw: None,
+                    severity: Severity::Error,
                 });
             }
         }
@@ -1101,6 +1298,7 @@ pub fn lint_buffer(buffer: &str) -> Vec<Diagnostic> {
                     message: "Missing storage location — start the declaration with `ram`, `eeprom`, or `flash` (e.g. `ram mut $x: u8 = 0`).".to_string(),
                     term: first.to_string(),
                     raw: None,
+                    severity: Severity::Error,
                 });
             }
         }
@@ -1108,13 +1306,23 @@ pub fn lint_buffer(buffer: &str) -> Vec<Diagnostic> {
     diags
 }
 
-/// Group diagnostics into a `line -> offending term` map for highlighting,
-/// plus the set of lines that should be flagged in the gutter.
-pub fn highlight_terms(diags: &[Diagnostic]) -> HashMap<usize, String> {
-    let mut map = HashMap::new();
+/// Group diagnostics into a `line -> (offending term, severity)` map for
+/// highlighting. When an error and a warning land on the same line the error
+/// wins, so the squiggle color reflects the most severe problem.
+pub fn highlight_terms(diags: &[Diagnostic]) -> HashMap<usize, (String, Severity)> {
+    let mut map: HashMap<usize, (String, Severity)> = HashMap::new();
     for d in diags {
         if d.line > 0 && !d.term.is_empty() {
-            map.entry(d.line).or_insert_with(|| d.term.clone());
+            match map.get(&d.line) {
+                Some((_, Severity::Error)) => {}
+                _ if d.severity == Severity::Error => {
+                    map.insert(d.line, (d.term.clone(), d.severity));
+                }
+                None => {
+                    map.insert(d.line, (d.term.clone(), d.severity));
+                }
+                _ => {}
+            }
         }
     }
     map
@@ -1307,5 +1515,78 @@ mod std_embed_tests {
         // The cache dir may exist from other runs, but `mem.ik` is only ever
         // written when imported — and this buffer imports nothing.
         let _ = dir; // resolution succeeds; nothing required to be present.
+    }
+}
+
+#[cfg(test)]
+mod diagnostics_tests {
+    use super::*;
+
+    // The compiler's undefined-variable error has no line number, but names the
+    // function; the IDE must pin it to the offending line inside that function.
+    #[test]
+    fn undefined_variable_is_recognized_and_located() {
+        let src = "target atmega328p\nconst %PORTB: u8 = 0x25\n\n@main {\n    ram mut $x: u8 = 0\n    $typo_var -> %PORTB\n}\n";
+        let diags = check(src);
+        assert_eq!(diags.len(), 1, "expected one diagnostic: {:?}", diags);
+        let d = &diags[0];
+        assert_eq!(d.severity, Severity::Error);
+        assert_eq!(d.term, "$typo_var");
+        assert_eq!(d.line, 6, "must point at the line using the unknown variable");
+        assert!(d.message.contains("Unknown variable"), "friendly text: {}", d.message);
+    }
+
+    #[test]
+    fn undefined_constant_is_recognized() {
+        let src = "target atmega328p\nconst %PORTB: u8 = 0x25\n\n@main {\n    NO_SUCH_MASK -> %PORTB\n}\n";
+        let diags = check(src);
+        assert_eq!(diags.len(), 1, "{:?}", diags);
+        assert_eq!(diags[0].term, "NO_SUCH_MASK");
+        assert_eq!(diags[0].line, 5);
+        assert!(diags[0].message.contains("Unknown constant"), "{}", diags[0].message);
+    }
+
+    // Out-of-range literal: the highlighted term is the number itself.
+    #[test]
+    fn out_of_range_literal_is_recognized() {
+        let src = "target atmega328p\n\n@main {\n    ram mut $x: u8 = 300\n    loop * {}\n}\n";
+        let diags = check(src);
+        assert_eq!(diags.len(), 1, "{:?}", diags);
+        assert_eq!(diags[0].term, "300");
+        assert_eq!(diags[0].line, 4);
+        assert!(diags[0].message.contains("doesn't fit"), "{}", diags[0].message);
+    }
+
+    // Narrowing compiles, but surfaces as a Warning pinned to the assignment
+    // line (not the declaration of the target variable).
+    #[test]
+    fn narrowing_warning_is_recognized_and_located() {
+        let src = "target atmega328p\nconst %PORTB: u8 = 0x25\n\n@main {\n    ram mut $a: u16 = 500\n    ram mut $b: u8 = 0\n    $a -> $b\n    $b -> %PORTB\n}\n";
+        let diags = check(src);
+        assert_eq!(diags.len(), 1, "{:?}", diags);
+        let d = &diags[0];
+        assert_eq!(d.severity, Severity::Warning);
+        assert_eq!(d.term, "$b");
+        assert_eq!(d.line, 7, "must point at the assignment, not the declaration");
+        assert!(d.message.contains("truncates"), "{}", d.message);
+    }
+
+    // The semicolon hint from the lexer maps to a friendly explanation.
+    #[test]
+    fn semicolon_hint_is_recognized() {
+        let src = "target atmega328p\n\n@main {\n    ram mut $x: u8 = 5;\n}\n";
+        let diags = check(src);
+        assert_eq!(diags.len(), 1, "{:?}", diags);
+        assert_eq!(diags[0].line, 4);
+        assert!(diags[0].message.contains("semicolons"), "{}", diags[0].message);
+    }
+
+    // Bare `@fn` used as a value (missing `&`).
+    #[test]
+    fn bare_function_reference_is_recognized() {
+        let src = "target atmega328p\nconst %PORTB: u8 = 0x25\n@f() -> u8 { return 1 }\n@main {\n    ram mut $x: u8 = 0\n    @f -> $x\n    $x -> %PORTB\n}\n";
+        let diags = check(src);
+        assert_eq!(diags.len(), 1, "{:?}", diags);
+        assert!(diags[0].message.contains("take its address"), "{}", diags[0].message);
     }
 }

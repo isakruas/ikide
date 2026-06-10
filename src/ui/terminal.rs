@@ -14,6 +14,7 @@
 
 use eframe::egui;
 use crate::app::IkIdeApp;
+use crate::core::analysis::Severity;
 
 pub fn render(app: &mut IkIdeApp, ctx: &egui::Context) {
     let diags = app.all_diagnostics();
@@ -23,13 +24,21 @@ pub fn render(app: &mut IkIdeApp, ctx: &egui::Context) {
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("Output").strong());
-                let problems = diags.len();
-                if problems > 0 {
+                let errors = diags.iter().filter(|d| d.severity == Severity::Error).count();
+                let warns = diags.len() - errors;
+                if errors > 0 {
                     ui.label(
-                        egui::RichText::new(format!("  ⛔ {} problem(s)", problems))
+                        egui::RichText::new(format!("  ⛔ {} error(s)", errors))
                             .color(egui::Color32::from_rgb(255, 120, 120)),
                     );
-                } else {
+                }
+                if warns > 0 {
+                    ui.label(
+                        egui::RichText::new(format!("  ⚠ {} warning(s)", warns))
+                            .color(egui::Color32::from_rgb(230, 180, 80)),
+                    );
+                }
+                if diags.is_empty() {
                     ui.label(egui::RichText::new("  ✔ no problems").color(egui::Color32::from_rgb(120, 200, 120)));
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -62,10 +71,14 @@ pub fn render(app: &mut IkIdeApp, ctx: &egui::Context) {
                             } else {
                                 String::new()
                             };
+                            let (icon, color) = match d.severity {
+                                Severity::Error => ("⛔", egui::Color32::from_rgb(255, 140, 140)),
+                                Severity::Warning => ("⚠", egui::Color32::from_rgb(230, 180, 80)),
+                            };
                             let resp = ui.label(
-                                egui::RichText::new(format!("⛔ {}{}", loc, d.message))
+                                egui::RichText::new(format!("{} {}{}", icon, loc, d.message))
                                     .monospace()
-                                    .color(egui::Color32::from_rgb(255, 140, 140)),
+                                    .color(color),
                             );
                             // Power users can see the exact compiler text on hover.
                             if let Some(raw) = &d.raw {

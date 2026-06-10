@@ -207,6 +207,10 @@ pub fn spawn_compile(workspace_dir: Option<PathBuf>, selected_file: Option<PathB
             match analysis::compile(&content) {
                 Ok(artifact) => match std::fs::write(&out_hex, &artifact.hex) {
                     Ok(_) => {
+                        for w in &artifact.warnings {
+                            let loc = if w.line > 0 { format!("line {}: ", w.line) } else { String::new() };
+                            let _ = tx.send(TaskMsg::Compile(format!("Warning — {}{}\n", loc, w.message)));
+                        }
                         let _ = tx.send(TaskMsg::Compile(format!("Compilation successful. Output at {:?}\n", out_hex)));
                         let _ = tx.send(TaskMsg::Stats(Ok(stats_from(&artifact))));
                     }
@@ -261,6 +265,10 @@ pub fn spawn_simulate(workspace_dir: Option<PathBuf>, selected_file: Option<Path
                     return;
                 }
             };
+            for w in &artifact.warnings {
+                let loc = if w.line > 0 { format!("line {}: ", w.line) } else { String::new() };
+                let _ = tx.send(TaskMsg::Vm(format!("Warning — {}{}\n", loc, w.message)));
+            }
             if let Err(e) = std::fs::write(&out_hex, &artifact.hex) {
                 let _ = tx.send(TaskMsg::Vm(format!("Failed to write HEX: {}\n", e)));
                 let _ = tx.send(TaskMsg::Done);

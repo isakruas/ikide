@@ -12,12 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::core::analysis::Severity;
 use eframe::egui;
 use std::collections::HashMap;
 
 #[derive(Default)]
 pub struct CodeTheme {
     // Extensible for future custom colors
+}
+
+/// Squiggle/background color for a diagnostic severity: red for errors,
+/// amber for warnings.
+fn diag_color(sev: Severity) -> egui::Color32 {
+    match sev {
+        Severity::Error => egui::Color32::RED,
+        Severity::Warning => egui::Color32::from_rgb(220, 150, 0),
+    }
 }
 
 /// A plain, unstyled monospace layout — used for non-`.ik` files, which the
@@ -32,9 +42,10 @@ pub fn plain_job(code: &str, font_size: f32) -> egui::text::LayoutJob {
 }
 
 /// Highlight `code`. `error_terms` maps a 1-based line number to the offending
-/// identifier reported by the compiler on that line; matching tokens are drawn
-/// with an error background so every diagnostic is visible at once.
-pub fn highlight(code: &str, _theme: &CodeTheme, font_size: f32, error_terms: &HashMap<usize, String>, selection: Option<(usize, usize)>) -> egui::text::LayoutJob {
+/// identifier reported by the compiler on that line plus its severity; matching
+/// tokens are drawn with an error (red) or warning (amber) background so every
+/// diagnostic is visible at once.
+pub fn highlight(code: &str, _theme: &CodeTheme, font_size: f32, error_terms: &HashMap<usize, (String, Severity)>, selection: Option<(usize, usize)>) -> egui::text::LayoutJob {
     let mut job = egui::text::LayoutJob::default();
     let mut current_line = 1;
     let mut char_idx = 0;
@@ -93,14 +104,15 @@ pub fn highlight(code: &str, _theme: &CodeTheme, font_size: f32, error_terms: &H
                     egui::TextFormat::simple(font_id.clone(), egui::Color32::LIGHT_GRAY)
                 };
                 
-                if let Some(term) = error_terms.get(&current_line) {
+                if let Some((term, sev)) = error_terms.get(&current_line) {
                     if !term.is_empty() && ident == term {
+                        let color = diag_color(*sev);
                         format.color = egui::Color32::WHITE;
-                        format.background = egui::Color32::RED;
-                        format.underline = egui::Stroke::new(2.0, egui::Color32::RED);
+                        format.background = color;
+                        format.underline = egui::Stroke::new(2.0, color);
                     }
                 }
-                
+
                 job.append(ident, 0.0, format);
                 char_idx += ident.chars().count();
                 rest = new_rest;
@@ -112,9 +124,20 @@ pub fn highlight(code: &str, _theme: &CodeTheme, font_size: f32, error_terms: &H
                     rest.find(|c: char| !c.is_numeric() && c != '.').unwrap_or(rest.len())
                 };
                 let (num, new_rest) = rest.split_at(end);
+                let mut format = egui::TextFormat::simple(font_id.clone(), egui::Color32::from_rgb(150, 200, 150));
+                // An out-of-range literal is reported with the number itself as
+                // the offending term (e.g. `u8 = 300` flags `300`).
+                if let Some((term, sev)) = error_terms.get(&current_line) {
+                    if !term.is_empty() && num == term {
+                        let color = diag_color(*sev);
+                        format.color = egui::Color32::WHITE;
+                        format.background = color;
+                        format.underline = egui::Stroke::new(2.0, color);
+                    }
+                }
                 current_line += num.chars().filter(|&c| c == '\n').count();
                 char_idx += num.chars().count();
-                job.append(num, 0.0, egui::TextFormat::simple(font_id.clone(), egui::Color32::from_rgb(150, 200, 150)));
+                job.append(num, 0.0, format);
                 rest = new_rest;
             } else if first_char == '@' || first_char == '$' || first_char == '%' {
                 // Variable, function or register
@@ -129,11 +152,12 @@ pub fn highlight(code: &str, _theme: &CodeTheme, font_size: f32, error_terms: &H
                 };
                 let mut format = egui::TextFormat::simple(font_id.clone(), base);
                 // Sigiled tokens (@fn, $var, %reg) can be the offending term too.
-                if let Some(term) = error_terms.get(&current_line) {
+                if let Some((term, sev)) = error_terms.get(&current_line) {
                     if !term.is_empty() && var == term {
+                        let color = diag_color(*sev);
                         format.color = egui::Color32::WHITE;
-                        format.background = egui::Color32::RED;
-                        format.underline = egui::Stroke::new(2.0, egui::Color32::RED);
+                        format.background = color;
+                        format.underline = egui::Stroke::new(2.0, color);
                     }
                 }
                 job.append(var, 0.0, format);

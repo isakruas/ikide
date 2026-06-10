@@ -22,8 +22,18 @@ use crate::syntax;
 pub fn render(app: &mut IkIdeApp, ctx: &egui::Context) {
     // Build per-line lookups from the live diagnostics (compiler + lints).
     let diags = app.all_diagnostics();
-    let error_terms: HashMap<usize, String> = analysis::highlight_terms(&diags);
-    let error_lines: HashSet<usize> = diags.iter().filter(|d| d.line > 0).map(|d| d.line).collect();
+    let error_terms: HashMap<usize, (String, analysis::Severity)> = analysis::highlight_terms(&diags);
+    let error_lines: HashSet<usize> = diags
+        .iter()
+        .filter(|d| d.line > 0 && d.severity == analysis::Severity::Error)
+        .map(|d| d.line)
+        .collect();
+    let warn_lines: HashSet<usize> = diags
+        .iter()
+        .filter(|d| d.line > 0 && d.severity == analysis::Severity::Warning)
+        .map(|d| d.line)
+        .filter(|l| !error_lines.contains(l))
+        .collect();
 
     egui::CentralPanel::default().show(ctx, |ui| {
         if app.open_tabs.is_empty() {
@@ -189,6 +199,8 @@ pub fn render(app: &mut IkIdeApp, ctx: &egui::Context) {
                         let format_normal = egui::TextFormat::simple(egui::FontId::monospace(14.0), egui::Color32::from_gray(100));
                         let mut format_error = egui::TextFormat::simple(egui::FontId::monospace(14.0), egui::Color32::RED);
                         format_error.background = egui::Color32::from_rgba_unmultiplied(255, 0, 0, 50);
+                        let mut format_warn = egui::TextFormat::simple(egui::FontId::monospace(14.0), egui::Color32::from_rgb(220, 150, 0));
+                        format_warn.background = egui::Color32::from_rgba_unmultiplied(220, 150, 0, 50);
                         
                         for i in 1..=total_lines {
                             // No trailing newline on the last row, so the gutter
@@ -200,6 +212,8 @@ pub fn render(app: &mut IkIdeApp, ctx: &egui::Context) {
                             };
                             if error_lines.contains(&i) {
                                 line_numbers.append(&text, 0.0, format_error.clone());
+                            } else if warn_lines.contains(&i) {
+                                line_numbers.append(&text, 0.0, format_warn.clone());
                             } else {
                                 line_numbers.append(&text, 0.0, format_normal.clone());
                             }
@@ -408,7 +422,7 @@ pub fn render(app: &mut IkIdeApp, ctx: &egui::Context) {
                                     ui.add_space(6.0);
                                     ui.label(egui::RichText::new("Example").small().weak());
                                     let theme = syntax::CodeTheme::default();
-                                    let empty: HashMap<usize, String> = HashMap::new();
+                                    let empty: HashMap<usize, (String, analysis::Severity)> = HashMap::new();
                                     let job = syntax::highlight(&help.snippet, &theme, 13.0, &empty, None);
                                     egui::Frame::none()
                                         .fill(egui::Color32::from_gray(28))
