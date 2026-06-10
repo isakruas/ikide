@@ -1,0 +1,4 @@
+{
+  "title": "Breadboard: Joystick Mouse on ST7789",
+  "description": "A mouse pointer on the 240x240 TFT driven by the joystick: U/L/R/D move the arrow, SET clicks (painting the target under it), RST opens a color menu. Add the ST7789 (DC=PB1, CS=PB2) and the Joystick (PC0..PC5)."
+}
