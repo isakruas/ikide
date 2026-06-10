@@ -1,0 +1,4 @@
+{
+  "name": "Dodge Car Game",
+  "description": "A 3D dodge-car game using the Joystick (directions on PC0..PC3, SET on PD4, RST on PD5), ST7789 TFT, and optionally an AT24C256 I2C EEPROM (PC4=SDA, PC5=SCL) to store high scores via an on-screen QWERTY virtual keyboard."
+}

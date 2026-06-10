@@ -845,15 +845,19 @@ mod tests {
     #[test]
     fn all_examples_compile() {
         let mut checked = 0;
+        let original_dir = std::env::current_dir().expect("get current dir");
         for entry in std::fs::read_dir("assets/examples").expect("examples dir") {
-            let main = entry.expect("entry").path().join("main.ik");
+            let path = entry.expect("entry").path();
+            let main = path.join("main.ik");
             if !main.is_file() {
                 continue;
             }
-            let src = std::fs::read_to_string(&main).expect("read main.ik");
+            std::env::set_current_dir(&path).expect("set current dir");
+            let src = std::fs::read_to_string("main.ik").expect("read main.ik");
             crate::core::analysis::sync_std_imports(&src);
-            crate::core::analysis::compile(&src)
-                .unwrap_or_else(|e| panic!("{:?} failed to compile: {}", main, e.message));
+            let res = crate::core::analysis::compile(&src);
+            std::env::set_current_dir(&original_dir).expect("restore current dir");
+            res.unwrap_or_else(|e| panic!("{:?} failed to compile: {}", main, e.message));
             checked += 1;
         }
         assert!(checked >= 24, "expected all examples checked, got {}", checked);
