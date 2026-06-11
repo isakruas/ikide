@@ -71,7 +71,9 @@ pub struct OpenTab {
 
 #[derive(Clone, Debug, serde::Deserialize)]
 pub struct ExampleInfo {
+    #[serde(alias = "name")]
     pub title: String,
+    #[serde(default)]
     pub description: String,
     #[serde(skip)]
     pub embedded_index: usize,
@@ -1022,12 +1024,27 @@ impl IkIdeApp {
     pub fn scan_examples(&mut self) {
         self.examples.clear();
         for (idx, ex) in EMBEDDED_EXAMPLES.iter().enumerate() {
-            if let Some(info_file) = ex.files.iter().find(|f| f.name == "info.json") {
-                if let Ok(mut info) = serde_json::from_str::<ExampleInfo>(info_file.content) {
-                    info.embedded_index = idx;
-                    self.examples.push(info);
-                }
-            }
+            // Every embedded example is listed: a missing or malformed
+            // info.json falls back to the directory name so a new example
+            // never silently disappears from the menu.
+            let mut info = ex
+                .files
+                .iter()
+                .find(|f| f.name == "info.json")
+                .and_then(|f| match serde_json::from_str::<ExampleInfo>(f.content) {
+                    Ok(info) => Some(info),
+                    Err(e) => {
+                        eprintln!("ikide: bad info.json in example '{}': {}", ex.name, e);
+                        None
+                    }
+                })
+                .unwrap_or_else(|| ExampleInfo {
+                    title: ex.name.to_string(),
+                    description: String::new(),
+                    embedded_index: 0,
+                });
+            info.embedded_index = idx;
+            self.examples.push(info);
         }
         self.examples.sort_by(|a, b| a.title.cmp(&b.title));
     }

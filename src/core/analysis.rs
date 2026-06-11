@@ -851,12 +851,16 @@ pub fn compile(src: &str) -> Result<BuildArtifact, Diagnostic> {
                 ),
             ));
         }
-        let opcodes = ik8b::codegen::resolve_labels_at(&insts, (byte_base / 2) as i64)
-            .map_err(|e| diag_from_src(src, &format!("Assembly Error: {}", e)))?;
+        let opcodes = ik8b::codegen::resolve_labels_for(
+            &insts,
+            (byte_base / 2) as i64,
+            device.flash_size / 2,
+        )
+        .map_err(|e| diag_from_src(src, &format!("Assembly Error: {}", e)))?;
         let hex = ik8b::codegen::generate_intel_hex_at(&opcodes, byte_base);
         (opcodes, hex)
     } else {
-        let opcodes = ik8b::codegen::resolve_labels(&insts)
+        let opcodes = ik8b::codegen::resolve_labels_for(&insts, 0, device.flash_size / 2)
             .map_err(|e| diag_from_src(src, &format!("Assembly Error: {}", e)))?;
         let hex = ik8b::codegen::generate_intel_hex(&opcodes);
         (opcodes, hex)

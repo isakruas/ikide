@@ -98,4 +98,12 @@ fn main() {
 
     println!("cargo:rerun-if-changed={}", std_dir.display());
     println!("cargo:rerun-if-changed={}", examples_dir.display());
+    // A directory's mtime only changes when entries are added or removed in it
+    // directly, so watch each example subdirectory too — otherwise a file
+    // added inside an existing example would not be re-embedded.
+    if let Ok(read_dirs) = fs::read_dir(&examples_dir) {
+        for d in read_dirs.flatten().filter(|e| e.path().is_dir()) {
+            println!("cargo:rerun-if-changed={}", d.path().display());
+        }
+    }
 }
