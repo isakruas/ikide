@@ -125,6 +125,16 @@ pub struct IkIdeApp {
     pub live_cycles: u64,
     pub live_running: bool,
     pub live_status: String,
+    pub live_sp: u16,
+    pub live_sreg: u8,
+    pub live_pc: u32,
+    pub live_r: [u8; 32],
+    pub live_sram_start: u32,
+    pub live_sram_bytes: u32,
+    pub show_vm_registers: bool,
+    pub ram_history: Vec<u32>,
+    pub live_sram_peak: u32,
+    pub live_sram_static: u32,
     pub bb_clock_hz: u32,
     pub bb_tab: crate::ui::breadboard::BreadboardTab,
     // Serial-peripheral transcripts, fed from the live engine's captured events.
@@ -270,6 +280,16 @@ impl Default for IkIdeApp {
             live_cycles: 0,
             live_running: false,
             live_status: String::new(),
+            live_sp: 0,
+            live_sreg: 0,
+            live_pc: 0,
+            live_r: [0; 32],
+            live_sram_start: 0,
+            live_sram_bytes: 0,
+            show_vm_registers: false,
+            ram_history: Vec::new(),
+            live_sram_peak: 0,
+            live_sram_static: 0,
             bb_clock_hz: 16_000_000,
             bb_tab: crate::ui::breadboard::BreadboardTab::Schematic,
             uart_log: String::new(),
@@ -519,6 +539,15 @@ impl IkIdeApp {
         self.live_regs.clear();
         self.live_cycles = 0;
         self.live_running = true;
+        self.live_sp = 0;
+        self.live_sreg = 0;
+        self.live_pc = 0;
+        self.live_r = [0; 32];
+        self.live_sram_start = 0;
+        self.live_sram_bytes = 0;
+        self.ram_history.clear();
+        self.live_sram_peak = 0;
+        self.live_sram_static = artifact.sram_used;
         // Clearing the peripheral logs gives each run a fresh transcript.
         self.uart_log.clear();
         self.spi_log.clear();
@@ -569,16 +598,24 @@ impl IkIdeApp {
     pub fn pump_live(&mut self) -> bool {
         let mut halt: Option<String> = None;
         let mut events: Vec<crate::core::sim_live::IoEvent> = Vec::new();
+        let mut got_snap = false;
         if let Some(live) = &self.live {
             while let Ok(snap) = live.snap_rx.try_recv() {
                 self.live_regs = snap.regs;
                 self.live_cycles = snap.cycles;
                 self.live_running = snap.running;
                 self.live_view = snap.view;
+                self.live_sp = snap.sp;
+                self.live_sreg = snap.sreg;
+                self.live_pc = snap.pc;
+                self.live_r = snap.r;
+                self.live_sram_start = snap.sram_start;
+                self.live_sram_bytes = snap.sram_bytes;
                 events.extend(snap.events);
                 if let Some(reason) = snap.halt_reason {
                     halt = Some(reason);
                 }
+                got_snap = true;
             }
         } else {
             return false;
@@ -588,6 +625,19 @@ impl IkIdeApp {
         }
         if let Some(reason) = halt {
             self.live_status = reason;
+        }
+        if got_snap && self.live_running {
+            let stack_bytes = (self.live_sram_start + self.live_sram_bytes)
+                .saturating_sub(1)
+                .saturating_sub(self.live_sp as u32);
+            let total_used = self.live_sram_static + stack_bytes;
+            self.ram_history.push(total_used);
+            if total_used > self.live_sram_peak {
+                self.live_sram_peak = total_used;
+            }
+            if self.ram_history.len() > 3600 {
+                self.ram_history.remove(0);
+            }
         }
         true
     }

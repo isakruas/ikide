@@ -71,6 +71,12 @@ pub struct LiveSnapshot {
     pub running: bool,
     /// Set once when the core halts, so the UI can report why.
     pub halt_reason: Option<String>,
+    pub sp: u16,
+    pub sreg: u8,
+    pub pc: u32,
+    pub r: [u8; 32],
+    pub sram_start: u32,
+    pub sram_bytes: u32,
 }
 
 /// Handle the UI keeps while a live simulation is running.
@@ -253,6 +259,12 @@ pub fn spawn(
                         cycles: vm.cycles,
                         running: vm.running,
                         halt_reason,
+                        sp: vm.sp,
+                        sreg: vm.sreg,
+                        pc: vm.pc,
+                        r: vm.r,
+                        sram_start: vm.sram_start,
+                        sram_bytes: vm.sram_bytes,
                     })
                     .is_err()
                 {

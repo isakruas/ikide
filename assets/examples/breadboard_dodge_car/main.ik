@@ -477,7 +477,7 @@ const E_BASE: u16 = 0x0570      # 2 enemies x 4 bytes: t, lane, cnt, active
                 ram str $m0 = "EASY"
                 ram str $m1 = "NORMAL"
                 ram str $m2 = "HARD"
-                
+
                 ? $eeprom_ok != 0 {
                     @gfx_text($m0, 84, 77) -> $sx
                     @gfx_text($m1, 84, 107) -> $sx

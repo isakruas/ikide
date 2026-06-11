@@ -203,7 +203,18 @@ pub fn render(app: &mut IkIdeApp, ctx: &egui::Context) {
                     } else {
                         ("● halted", egui::Color32::GRAY)
                     };
-                    ui.label(egui::RichText::new(format!("{}  ·  {} cyc", txt, app.live_cycles)).color(col));
+                    let stack_bytes = (app.live_sram_start + app.live_sram_bytes)
+                        .saturating_sub(1)
+                        .saturating_sub(app.live_sp as u32);
+                    let status_text = format!(
+                        "{}  ·  {} cyc  ·  SP: 0x{:04X} (Stack: {} B)",
+                        txt,
+                        app.live_cycles,
+                        app.live_sp,
+                        stack_bytes
+                    );
+                    ui.label(egui::RichText::new(status_text).color(col));
+                    ui.checkbox(&mut app.show_vm_registers, "Registers");
                 }
                 ui.separator();
                 ui.add_enabled_ui(!live, |ui| {
@@ -218,6 +229,170 @@ pub fn render(app: &mut IkIdeApp, ctx: &egui::Context) {
                     }
                 });
             });
+            if live && app.show_vm_registers {
+                ui.add_space(4.0);
+                egui::Frame::none()
+                    .fill(ui.style().visuals.widgets.noninteractive.bg_fill)
+                    .stroke(ui.style().visuals.widgets.noninteractive.bg_stroke)
+                    .rounding(4.0)
+                    .inner_margin(8.0)
+                    .show(ui, |ui| {
+                        ui.columns(2, |columns| {
+                            // Left column: Registers
+                            columns[0].vertical(|ui| {
+                                ui.horizontal(|ui| {
+                                    ui.monospace(format!("SREG: 0x{:02X}", app.live_sreg));
+                                    ui.separator();
+                                    ui.monospace(format!("PC: 0x{:06X}", app.live_pc));
+                                    ui.separator();
+                                    ui.monospace(format!("SRAM: 0x{:04X}-0x{:04X}", 
+                                        app.live_sram_start, 
+                                        app.live_sram_start + app.live_sram_bytes - 1
+                                    ));
+                                });
+                                ui.add_space(4.0);
+                                egui::Grid::new("reg_grid").striped(true).show(ui, |ui| {
+                                    for row in 0..8 {
+                                        for col in 0..4 {
+                                            let reg_idx = row * 4 + col;
+                                            ui.monospace(format!("r{:02}: 0x{:02X}  ", reg_idx, app.live_r[reg_idx]));
+                                        }
+                                        ui.end_row();
+                                    }
+                                });
+                            });
+
+                            // Right column: RAM usage history chart
+                            columns[1].vertical(|ui| {
+                                ui.horizontal(|ui| {
+                                    ui.strong("📈 SRAM Usage (Static + Stack - 60s)");
+                                });
+                                ui.add_space(4.0);
+
+                                let history = &app.ram_history;
+                                let max_val = history.iter().copied().max().unwrap_or(0);
+                                let last_val = history.last().copied().unwrap_or(0);
+
+                                // Graph y-axis limit: 10% headroom, at least 32 bytes
+                                let max_y = (max_val as f32 * 1.1).max(32.0);
+
+                                // Allocate space for the chart
+                                let (rect, _response) = ui.allocate_at_least(
+                                    egui::vec2(ui.available_width().max(150.0), 100.0),
+                                    egui::Sense::hover(),
+                                );
+
+                                // Draw background and border
+                                let painter = ui.painter_at(rect);
+                                painter.rect(
+                                    rect,
+                                    4.0,
+                                    egui::Color32::from_black_alpha(30),
+                                    egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color.linear_multiply(0.5)),
+                                );
+
+                                // Draw gridlines (middle line)
+                                let stroke_grid = egui::Stroke::new(
+                                    1.0,
+                                    ui.visuals().widgets.noninteractive.bg_stroke.color.linear_multiply(0.2),
+                                );
+                                let mid_y = rect.center().y;
+                                painter.line_segment(
+                                    [egui::pos2(rect.left(), mid_y), egui::pos2(rect.right(), mid_y)],
+                                    stroke_grid,
+                                );
+
+                                // Draw Y-axis labels
+                                let font_id = egui::FontId::monospace(9.0);
+                                let text_color = ui.visuals().text_color().linear_multiply(0.5);
+                                painter.text(
+                                    egui::pos2(rect.left() + 6.0, rect.top() + 6.0),
+                                    egui::Align2::LEFT_TOP,
+                                    format!("{:.0} B", max_y),
+                                    font_id.clone(),
+                                    text_color,
+                                );
+                                painter.text(
+                                    egui::pos2(rect.left() + 6.0, mid_y),
+                                    egui::Align2::LEFT_CENTER,
+                                    format!("{:.0} B", max_y / 2.0),
+                                    font_id.clone(),
+                                    text_color,
+                                );
+                                painter.text(
+                                    egui::pos2(rect.left() + 6.0, rect.bottom() - 6.0),
+                                    egui::Align2::LEFT_BOTTOM,
+                                    "0 B",
+                                    font_id.clone(),
+                                    text_color,
+                                );
+
+                                // Draw plot lines if history has at least 2 points
+                                if history.len() >= 2 {
+                                    let max_samples = 3600.0;
+                                    let visible_ratio = history.len() as f32 / max_samples;
+                                    let visible_width = visible_ratio * rect.width();
+                                    let num_bins = (visible_width.round() as usize).max(2);
+
+                                    let mut points = Vec::with_capacity(num_bins);
+                                    for col in 0..num_bins {
+                                        let history_idx = (col * (history.len() - 1)) / (num_bins - 1);
+                                        let val = history[history_idx];
+
+                                        let offset_ratio = (history.len() - 1 - history_idx) as f32 / (max_samples - 1.0);
+                                        let x = rect.right() - offset_ratio * rect.width();
+                                        let y = rect.bottom()
+                                            - ((val as f32 / max_y) * rect.height()).min(rect.height());
+                                        points.push(egui::pos2(x, y));
+                                    }
+
+                                    // Draw the area fill using vertical line segments for each binned column
+                                    // This avoids any triangulation flickering bugs with concave polygons!
+                                    let fill_color = egui::Color32::from_rgba_unmultiplied(0, 180, 255, 15);
+                                    for p in &points {
+                                        painter.line_segment(
+                                            [egui::pos2(p.x, rect.bottom()), *p],
+                                            egui::Stroke::new(1.0, fill_color),
+                                        );
+                                    }
+
+                                    // Plot line
+                                    painter.add(egui::Shape::line(
+                                        points,
+                                        egui::Stroke::new(1.5, egui::Color32::from_rgb(0, 180, 255)),
+                                    ));
+                                } else if let Some(&val) = history.first() {
+                                    // Single point: draw a dot on the right edge
+                                    let y = rect.bottom() - ((val as f32 / max_y) * rect.height()).min(rect.height());
+                                    painter.circle_filled(
+                                        egui::pos2(rect.right(), y),
+                                        2.0,
+                                        egui::Color32::from_rgb(0, 180, 255),
+                                    );
+                                }
+
+                                ui.add_space(4.0);
+
+                                // Stats row
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new(format!("Cur: {}B", last_val)).small().monospace());
+                                    ui.separator();
+                                    ui.label(egui::RichText::new(format!("Static: {}B", app.live_sram_static)).small().monospace());
+                                    ui.separator();
+                                    ui.label(egui::RichText::new(format!("Stack: {}B", last_val.saturating_sub(app.live_sram_static))).small().monospace());
+                                    ui.separator();
+                                    ui.label(
+                                        egui::RichText::new(format!("Peak: {}B", app.live_sram_peak))
+                                            .small()
+                                            .monospace()
+                                            .strong()
+                                            .color(egui::Color32::from_rgb(255, 165, 0)),
+                                    );
+                                });
+                            });
+                        });
+                    });
+            }
             if !app.live_status.is_empty() {
                 ui.label(egui::RichText::new(&app.live_status).weak().small());
             }
