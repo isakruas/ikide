@@ -12,12 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod app;
-pub mod core;
-pub mod syntax;
-pub mod ui;
-
-use app::IkIdeApp;
+// Modules live in the library crate (src/lib.rs) so the IDE and external tools
+// (e.g. the ik-os test harness) share one copy of the code. main.rs is just the
+// binary entry point.
+use ikide::app::IkIdeApp;
 
 fn main() -> Result<(), eframe::Error> {
     let icon_data = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png"))

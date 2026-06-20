@@ -142,7 +142,7 @@ fn core_name(core: AvrCoreClass) -> &'static str {
 
 /// Build a fresh VM for `device`, preloaded with that chip's memory/core
 /// config from the compiler's device table, or a generic map as a fallback.
-pub(crate) fn build_vm(device: &str) -> AvrVm {
+pub fn build_vm(device: &str) -> AvrVm {
     if let Some(dev) = AVR_DEVICE_TABLE.iter().find(|d| d.name == device) {
         let mut vm = AvrVm::new(
             device.to_string(),
