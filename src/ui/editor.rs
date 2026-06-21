@@ -20,8 +20,16 @@ use crate::core::analysis;
 use crate::syntax;
 
 pub fn render(app: &mut IkIdeApp, ctx: &egui::Context) {
-    // Build per-line lookups from the live diagnostics (compiler + lints).
-    let diags = app.all_diagnostics();
+    // Build per-line lookups from the live diagnostics (compiler + lints). Only
+    // diagnostics for the active file drive the gutter/squiggles — a diagnostic
+    // resolved into an imported file carries its own `file` and would otherwise
+    // mark the wrong line here.
+    let active_path = app.active_tab.and_then(|i| app.open_tabs.get(i)).map(|t| t.path.clone());
+    let all = app.all_diagnostics();
+    let diags: Vec<analysis::Diagnostic> = all
+        .into_iter()
+        .filter(|d| d.file.is_none() || d.file == active_path)
+        .collect();
     let error_terms: HashMap<usize, (String, analysis::Severity)> = analysis::highlight_terms(&diags);
     let error_lines: HashSet<usize> = diags
         .iter()
@@ -175,13 +183,23 @@ pub fn render(app: &mut IkIdeApp, ctx: &egui::Context) {
                         });
                 }
 
-                let force_scroll: Option<f32> = ui.data_mut(|d| {
-                    let val = d.get_temp(egui::Id::new("editor_force_scroll"));
-                    if val.is_some() {
-                        d.remove_temp::<f32>(egui::Id::new("editor_force_scroll"));
-                    }
-                    val
-                });
+                // A pending "go to line" (e.g. from clicking a problem) wins over
+                // the minimap's pixel offset. Convert the 1-based line to a pixel
+                // offset via the monospace row height so it works the same frame a
+                // different file was opened (content height may still be stale).
+                let force_scroll: Option<f32> = if let Some(line) = app.pending_scroll_line.take() {
+                    let row_h = ui.fonts(|f| f.row_height(&egui::FontId::monospace(14.0)));
+                    let target = (line.saturating_sub(1) as f32) * row_h - view_h / 2.0;
+                    Some(target.max(0.0))
+                } else {
+                    ui.data_mut(|d| {
+                        let val = d.get_temp(egui::Id::new("editor_force_scroll"));
+                        if val.is_some() {
+                            d.remove_temp::<f32>(egui::Id::new("editor_force_scroll"));
+                        }
+                        val
+                    })
+                };
 
                 let mut editor_scroll = egui::ScrollArea::both().id_salt("editor_scroll");
                 if let Some(target) = force_scroll {

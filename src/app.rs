@@ -236,6 +236,9 @@ pub struct IkIdeApp {
     pub std_index: SymbolIndex,
     pub devices: Vec<(String, String)>,
     pub diagnostics: Vec<Diagnostic>,
+    /// A line the editor should scroll to on the next frame (1-based), set when
+    /// the user clicks a problem so the cursor jumps to the offending code.
+    pub pending_scroll_line: Option<usize>,
     pub last_edit: Option<Instant>,
     pub last_checked_content: String,
 
@@ -369,6 +372,7 @@ impl Default for IkIdeApp {
             std_index,
             devices,
             diagnostics: Vec::new(),
+            pending_scroll_line: None,
             last_edit: None,
             last_checked_content: String::new(),
             action_popup: ActionPopup::None,
@@ -781,11 +785,44 @@ impl IkIdeApp {
                 analysis::sync_std_imports(&content);
                 // Fast and synchronous: it's the real lexer + parser, in-process.
                 self.diagnostics = analysis::check(&content);
+                // Diagnostics whose code lives in an imported module don't resolve
+                // against this buffer (line 0). Locate them across the workspace so
+                // the problem still carries a file + line to jump to.
+                if let Some(ws) = self.workspace_dir.clone() {
+                    for d in &mut self.diagnostics {
+                        if d.line == 0 {
+                            if let Some(raw) = d.raw.clone() {
+                                if let Some((file, line)) = analysis::locate_in_workspace(&ws, &raw) {
+                                    d.file = Some(file);
+                                    d.line = line;
+                                }
+                            }
+                        }
+                    }
+                }
                 self.last_checked_content = content;
                 None
             }
             Some(t) => Some(CHECK_DEBOUNCE.saturating_sub(t.elapsed())),
             None => Some(CHECK_DEBOUNCE),
+        }
+    }
+
+    /// Jump to a diagnostic's location: open/focus its file (when it lives in a
+    /// different one) and queue the editor to scroll to the line.
+    pub fn goto_diagnostic(&mut self, file: &Option<PathBuf>, line: usize) {
+        if let Some(f) = file {
+            let already = self
+                .active_tab
+                .and_then(|i| self.open_tabs.get(i))
+                .map(|t| &t.path)
+                == Some(f);
+            if !already {
+                self.load_file(f.clone());
+            }
+        }
+        if line > 0 {
+            self.pending_scroll_line = Some(line);
         }
     }
 

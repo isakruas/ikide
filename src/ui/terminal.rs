@@ -60,32 +60,68 @@ pub fn render(app: &mut IkIdeApp, ctx: &egui::Context) {
             ui.separator();
 
             // Problems list: each live diagnostic from the compiler and lints.
+            // Rows are clickable — clicking jumps the editor to the offending
+            // file and line (resolved across the workspace for imported modules).
             if !diags.is_empty() {
+                let ws = app.workspace_dir.clone();
+                let mut goto: Option<(Option<std::path::PathBuf>, usize)> = None;
                 egui::ScrollArea::vertical()
                     .id_salt("problems_scroll")
                     .max_height(120.0)
                     .show(ui, |ui| {
                         for d in &diags {
-                            let loc = if d.line > 0 {
-                                format!("line {}: ", d.line)
-                            } else {
-                                String::new()
+                            // Locate label: "file.ik:line" for another file, else
+                            // "line N" for the active buffer.
+                            let loc = match (&d.file, d.line) {
+                                (Some(f), l) if l > 0 => {
+                                    let shown = ws
+                                        .as_ref()
+                                        .and_then(|w| f.strip_prefix(w).ok())
+                                        .unwrap_or(f.as_path())
+                                        .to_string_lossy()
+                                        .into_owned();
+                                    format!("{}:{}: ", shown, l)
+                                }
+                                (None, l) if l > 0 => format!("line {}: ", l),
+                                _ => String::new(),
                             };
                             let (icon, color) = match d.severity {
                                 Severity::Error => ("⛔", egui::Color32::from_rgb(255, 140, 140)),
                                 Severity::Warning => ("⚠", egui::Color32::from_rgb(230, 180, 80)),
                             };
-                            let resp = ui.label(
-                                egui::RichText::new(format!("{} {}{}", icon, loc, d.message))
-                                    .monospace()
-                                    .color(color),
+                            let navigable = d.line > 0;
+                            let resp = ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(format!("{} {}{}", icon, loc, d.message))
+                                        .monospace()
+                                        .color(color),
+                                )
+                                .sense(egui::Sense::click()),
                             );
-                            // Power users can see the exact compiler text on hover.
-                            if let Some(raw) = &d.raw {
-                                resp.on_hover_text(egui::RichText::new(raw).monospace());
+                            let resp = if navigable {
+                                resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+                                    .on_hover_text(
+                                        egui::RichText::new(match &d.raw {
+                                            Some(raw) => format!("Click to go to the code\n\n{}", raw),
+                                            None => "Click to go to the code".to_string(),
+                                        })
+                                        .monospace(),
+                                    )
+                            } else if let Some(raw) = &d.raw {
+                                resp.on_hover_text(egui::RichText::new(raw).monospace())
+                            } else {
+                                resp
+                            };
+                            if navigable && resp.clicked() {
+                                goto = Some((d.file.clone(), d.line));
                             }
                         }
                     });
+                if let Some((file, line)) = goto {
+                    app.goto_diagnostic(&file, line);
+                    app.show_terminal = true;
+                    ui.ctx().request_repaint(); // apply the scroll next frame
+                }
                 ui.separator();
             }
 

@@ -636,6 +636,10 @@ pub struct Diagnostic {
     /// power users / hover). `None` for IDE-side lints.
     pub raw: Option<String>,
     pub severity: Severity,
+    /// The file the diagnostic belongs to, when it could be located outside the
+    /// active buffer (e.g. an imported module). `None` means the active file —
+    /// `line` is then relative to it.
+    pub file: Option<PathBuf>,
 }
 
 /// Type-check `src` with the compiler's own front end (in-process) and return
@@ -658,6 +662,7 @@ pub fn check(src: &str) -> Vec<Diagnostic> {
             term: String::new(),
             raw: None,
             severity: Severity::Error,
+            file: None,
         }],
     }
 }
@@ -669,6 +674,7 @@ fn diag_from_error(raw: &str) -> Diagnostic {
         term: extract_term(raw),
         raw: Some(raw.to_string()),
         severity: Severity::Error,
+        file: None,
     }
 }
 
@@ -732,6 +738,64 @@ fn resolve_line(src: &str, term: &str, raw: &str) -> usize {
     0
 }
 
+/// Locate a compiler diagnostic that doesn't resolve against the active buffer
+/// (its code lives in an imported module) by searching every `.ik` file in the
+/// workspace for the named function and the offending assignment. Returns the
+/// file and 1-based line, so a multi-file project's warnings stay navigable.
+pub fn locate_in_workspace(workspace: &Path, raw: &str) -> Option<(PathBuf, usize)> {
+    let fn_name = named_function(raw)?;
+    let term = extract_term(raw);
+    let is_assignment = raw.contains("in assignment to") || raw.contains("truncat");
+    for path in ik_files(workspace) {
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let Some((start, end)) = function_span(&content, &fn_name) else { continue };
+        if !term.is_empty() {
+            // A narrowing warning points at an assignment to `term`: prefer the
+            // line that actually assigns it.
+            if is_assignment {
+                for (i, line) in content.lines().enumerate().take(end).skip(start) {
+                    if line.contains(&term) && line.contains("->") {
+                        return Some((path, i + 1));
+                    }
+                }
+            }
+            for (i, line) in content.lines().enumerate().take(end).skip(start) {
+                if line.contains(&term) {
+                    return Some((path, i + 1));
+                }
+            }
+        }
+        // The function is here even if the exact line wasn't pinned.
+        return Some((path, start + 1));
+    }
+    None
+}
+
+/// Every `.ik` source under `dir` (recursive), skipping build/output dirs.
+fn ik_files(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&d) else { continue };
+        for entry in rd.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                if !matches!(name, "build" | "target" | ".git") {
+                    stack.push(p);
+                }
+            } else if p.extension().and_then(|s| s.to_str()) == Some("ik") {
+                out.push(p);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
 /// The `@name` out of a "... in function '@name'" diagnostic, if present.
 fn named_function(raw: &str) -> Option<String> {
     let rest = raw.split("in function '").nth(1)?;
@@ -752,16 +816,20 @@ fn function_span(src: &str, fn_name: &str) -> Option<(usize, usize)> {
     let mut start = None;
     for (i, line) in lines.iter().enumerate() {
         let t = line.trim_start();
-        let is_decl = match isr_vector {
-            Some(vec) => t.starts_with("isr ") && t.contains(vec),
-            None => {
-                t.starts_with(fn_name)
-                    && t[fn_name.len()..]
-                        .chars()
-                        .next()
-                        .map_or(true, |c| c == '(' || c == '{' || c.is_whitespace())
-            }
-        };
+        // A definition always opens its body brace on the signature line, so
+        // require `{` here — that's what tells a real `@foo { ... }` definition
+        // apart from a `@foo()` call site with the same name.
+        let is_decl = line.contains('{')
+            && match isr_vector {
+                Some(vec) => t.starts_with("isr ") && t.contains(vec),
+                None => {
+                    t.starts_with(fn_name)
+                        && t[fn_name.len()..]
+                            .chars()
+                            .next()
+                            .map_or(true, |c| c == '(' || c == '{' || c.is_whitespace())
+                }
+            };
         if is_decl {
             start = Some(i);
             break;
@@ -1286,6 +1354,7 @@ pub fn lint_buffer(buffer: &str) -> Vec<Diagnostic> {
                     term: "mut".to_string(),
                     raw: None,
                     severity: Severity::Error,
+                    file: None,
                 });
             }
         }
@@ -1303,6 +1372,7 @@ pub fn lint_buffer(buffer: &str) -> Vec<Diagnostic> {
                     term: first.to_string(),
                     raw: None,
                     severity: Severity::Error,
+                    file: None,
                 });
             }
         }
@@ -1525,6 +1595,26 @@ mod std_embed_tests {
 #[cfg(test)]
 mod diagnostics_tests {
     use super::*;
+
+    // A diagnostic whose code lives in an imported module doesn't resolve against
+    // the active buffer; the locator must find the right file and assignment line
+    // across the workspace so the problem stays clickable.
+    #[test]
+    fn locates_diagnostic_in_imported_file() {
+        let dir = std::env::temp_dir().join("ikide_locate_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("drivers")).unwrap();
+        std::fs::write(dir.join("boot.ik"), "target atmega328p\nimport drivers/adc\n@main {\n    @adc_setup()\n}\n").unwrap();
+        std::fs::write(
+            dir.join("drivers/adc.ik"),
+            "const %ADC_CTRLREG: u16 = 0x7A\n@adc_setup {\n    ram imut $cfg: u16 = 0x01CF\n    $cfg -> %ADC_CTRLREG\n}\n",
+        )
+        .unwrap();
+        let raw = "implicit narrowing from u16 to u8 in assignment to '%ADC_CTRLREG' in function '@adc_setup'; the value is truncated";
+        let (file, line) = locate_in_workspace(&dir, raw).expect("should locate the assignment");
+        assert!(file.ends_with("drivers/adc.ik"), "wrong file: {:?}", file);
+        assert_eq!(line, 4, "should point at the assignment line");
+    }
 
     // The compiler's undefined-variable error has no line number, but names the
     // function; the IDE must pin it to the offending line inside that function.
