@@ -58,6 +58,18 @@ same machinery the breadboard uses, minus the GUI. Put `.rhai` files in a
 each file runs against a fresh, isolated bench and the IDE reports PASS/FAIL per
 check.
 
+The same suite runs headless from the command line — useful for CI:
+
+```bash
+ikide test                 # run ./tests/*.rhai
+ikide test path/to/project # run a specific workspace's tests/*.rhai
+ikide test --mcu atmega32  # target device for load_hex tests (default: atmega328p)
+```
+
+`ikide test` prints the same PASS/FAIL report and exits non-zero on any failure.
+Running `ikide` with no command launches the graphical IDE; `ikide help` lists
+every command.
+
 A test file has full control of the core through these functions. Every
 peripheral is controllable from **both** sides — what the program reads and what
 it writes:

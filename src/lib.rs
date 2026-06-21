@@ -13,9 +13,8 @@
 // limitations under the License.
 
 // Library face of the IDE: the same modules the `ikide` binary is built from,
-// exposed so other crates (e.g. the ik-os test harness) can reuse the
-// simulation/device layer instead of re-implementing it. The binary entry
-// point lives in main.rs and is a thin shim over `app`.
+// exposed so external crates can reuse the simulation/device/test layer instead
+// of re-implementing it. The binary entry point lives in main.rs.
 pub mod app;
 pub mod core;
 pub mod syntax;
