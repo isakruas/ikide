@@ -45,6 +45,85 @@ pub fn plain_job(code: &str, font_size: f32) -> egui::text::LayoutJob {
 /// identifier reported by the compiler on that line plus its severity; matching
 /// tokens are drawn with an error (red) or warning (amber) background so every
 /// diagnostic is visible at once.
+/// Syntax highlighting for Rhai scripts (`.rhai`) — used both for test scripts
+/// and for device models. Handles `//` and `/* */` comments, string literals,
+/// numbers, Rhai keywords, and function calls/definitions (any identifier
+/// followed by `(`). Generic: no coupling to a specific API.
+pub fn highlight_rhai(code: &str, font_size: f32) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+    let font_id = egui::FontId::monospace(font_size);
+
+    let keywords = [
+        "let", "const", "fn", "if", "else", "while", "loop", "for", "in",
+        "return", "break", "continue", "switch", "throw", "try", "catch",
+        "do", "until", "import", "export", "as", "global", "private", "this",
+    ];
+    let booleans = ["true", "false"];
+
+    let green = egui::Color32::from_rgb(100, 150, 100);
+    let orange = egui::Color32::from_rgb(200, 150, 100);
+    let purple = egui::Color32::from_rgb(200, 100, 200);
+    let cyan = egui::Color32::from_rgb(100, 200, 255);
+    let numcol = egui::Color32::from_rgb(150, 200, 150);
+    let plain = egui::Color32::LIGHT_GRAY;
+
+    let mut rest = code;
+    while !rest.is_empty() {
+        if rest.starts_with("//") {
+            let end = rest.find('\n').unwrap_or(rest.len());
+            let (c, nr) = rest.split_at(end);
+            job.append(c, 0.0, egui::TextFormat::simple(font_id.clone(), green));
+            rest = nr;
+        } else if rest.starts_with("/*") {
+            let end = rest.find("*/").map(|i| i + 2).unwrap_or(rest.len());
+            let (c, nr) = rest.split_at(end);
+            job.append(c, 0.0, egui::TextFormat::simple(font_id.clone(), green));
+            rest = nr;
+        } else if rest.starts_with('"') {
+            let mut end = rest.len();
+            let mut escape = false;
+            for (i, ch) in rest[1..].char_indices() {
+                if escape { escape = false; }
+                else if ch == '\\' { escape = true; }
+                else if ch == '"' { end = i + 2; break; }
+            }
+            let (s, nr) = rest.split_at(end);
+            job.append(s, 0.0, egui::TextFormat::simple(font_id.clone(), orange));
+            rest = nr;
+        } else if let Some(fc) = rest.chars().next() {
+            if fc.is_alphabetic() || fc == '_' {
+                let end = rest.find(|c: char| !c.is_alphanumeric() && c != '_').unwrap_or(rest.len());
+                let (ident, nr) = rest.split_at(end);
+                let color = if keywords.contains(&ident) { purple }
+                    else if booleans.contains(&ident) { orange }
+                    else if nr.trim_start().starts_with('(') { cyan }  // function call/def
+                    else { plain };
+                job.append(ident, 0.0, egui::TextFormat::simple(font_id.clone(), color));
+                rest = nr;
+            } else if fc.is_numeric() {
+                let end = if rest.starts_with("0x") || rest.starts_with("0X") {
+                    rest[2..].find(|c: char| !c.is_ascii_hexdigit()).map(|i| i + 2).unwrap_or(rest.len())
+                } else {
+                    rest.find(|c: char| !c.is_numeric() && c != '.' && c != '_').unwrap_or(rest.len())
+                };
+                let (num, nr) = rest.split_at(end);
+                job.append(num, 0.0, egui::TextFormat::simple(font_id.clone(), numcol));
+                rest = nr;
+            } else {
+                let mut it = rest.char_indices();
+                it.next();
+                let end = it.next().map(|(i, _)| i).unwrap_or(rest.len());
+                let (sym, nr) = rest.split_at(end);
+                job.append(sym, 0.0, egui::TextFormat::simple(font_id.clone(), plain));
+                rest = nr;
+            }
+        } else {
+            break;
+        }
+    }
+    job
+}
+
 pub fn highlight(code: &str, _theme: &CodeTheme, font_size: f32, error_terms: &HashMap<usize, (String, Severity)>, selection: Option<(usize, usize)>) -> egui::text::LayoutJob {
     let mut job = egui::text::LayoutJob::default();
     let mut current_line = 1;

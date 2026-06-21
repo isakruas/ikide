@@ -113,6 +113,7 @@ pub fn render(app: &mut IkIdeApp, ctx: &egui::Context) {
                 // Only ik8b sources get syntax styling and language features;
                 // any other file is shown as plain text.
                 let is_ik = crate::app::is_ik_file(&tab.path);
+                let is_rhai = crate::app::is_rhai_file(&tab.path);
 
                 let theme = syntax::CodeTheme::default();
 
@@ -132,6 +133,8 @@ pub fn render(app: &mut IkIdeApp, ctx: &egui::Context) {
                                 .show(ui, |ui| {
                                     let layout_job = if is_ik {
                                         syntax::highlight(&tab.content, &theme, 3.5, &error_terms, None)
+                                    } else if is_rhai {
+                                        syntax::highlight_rhai(&tab.content, 3.5)
                                     } else {
                                         syntax::plain_job(&tab.content, 3.5)
                                     };
@@ -237,6 +240,8 @@ pub fn render(app: &mut IkIdeApp, ctx: &egui::Context) {
                             }
                             let mut layout_job = if is_ik {
                                 syntax::highlight(string, &theme, 14.0, &error_terms, selection)
+                            } else if is_rhai {
+                                syntax::highlight_rhai(string, 14.0)
                             } else {
                                 syntax::plain_job(string, 14.0)
                             };

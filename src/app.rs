@@ -55,6 +55,11 @@ pub fn is_ik_file(path: &std::path::Path) -> bool {
     path.extension().and_then(|e| e.to_str()) == Some("ik")
 }
 
+/// Rhai scripts (test scripts and device models) get Rhai syntax highlighting.
+pub fn is_rhai_file(path: &std::path::Path) -> bool {
+    path.extension().and_then(|e| e.to_str()) == Some("rhai")
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SerialTab {
     Console,
@@ -848,6 +853,10 @@ impl IkIdeApp {
                     self.terminal_output.push_str(&stamp(&out));
                     self.show_terminal = true;
                 }
+                TaskMsg::Test(out) => {
+                    self.terminal_output.push_str(&stamp(&out));
+                    self.show_terminal = true;
+                }
                 TaskMsg::Stats(res) => {
                     self.stats_data = match res {
                         Ok(data) => Ok(Some(data)),
@@ -1243,6 +1252,20 @@ impl eframe::App for IkIdeApp {
                             (Some(self.open_tabs[idx].path.clone()), self.open_tabs[idx].content.clone())
                         } else { (None, String::new()) };
                         runner::spawn_simulate(self.workspace_dir.clone(), path, text, self.task_tx.clone(), self.sim_config());
+                        ui.close_menu();
+                    }
+                    if ui.add_enabled(!self.is_busy, egui::Button::new("🧪 Run Tests")).clicked() {
+                        self.save_active_file();
+                        self.is_busy = true;
+                        self.show_terminal = true;
+                        self.terminal_output.clear();
+                        self.terminal_output.push_str(&format!("{} --- Running Tests ---\n", now_ts()));
+                        let target = if self.avrdude_target.is_empty() {
+                            "atmega328p".to_string()
+                        } else {
+                            self.avrdude_target.clone()
+                        };
+                        crate::core::testbed::spawn_run_tests(self.workspace_dir.clone(), target, self.task_tx.clone());
                         ui.close_menu();
                     }
                     if ui.add_enabled(!self.is_busy && self.active_is_ik(), egui::Button::new("🔌 Upload to Board")).clicked() {
@@ -1688,6 +1711,9 @@ impl eframe::App for IkIdeApp {
                             continue;
                         }
                         let target_path = dir.join(file.name);
+                        if let Some(parent) = target_path.parent() {
+                            let _ = std::fs::create_dir_all(parent);
+                        }
                         let _ = std::fs::write(&target_path, file.content);
                     }
                     self.refresh_files();

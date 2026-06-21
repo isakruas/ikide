@@ -738,6 +738,12 @@ const BUILTIN: &[(&str, &str)] = &[
     ("joystick", include_str!("../../assets/devices/joystick.rhai")),
 ];
 
+/// Source of a built-in (shipped) device by name, e.g. `"at24c256"` — the same
+/// catalog the breadboard offers. Returns `None` for an unknown name.
+pub fn builtin_device_src(name: &str) -> Option<&'static str> {
+    BUILTIN.iter().find(|(n, _)| *n == name).map(|(_, s)| *s)
+}
+
 /// One scripting engine for all devices; per-device state lives in the device.
 pub fn engine() -> Arc<Engine> {
     let mut e = Engine::new();

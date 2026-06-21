@@ -124,6 +124,7 @@ pub enum TaskMsg {
     Vm(String),
     VmResult(VmResult),
     Upload(String),
+    Test(String),
     Stats(Result<StatsData, String>),
     Done,
 }

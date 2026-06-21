@@ -23,6 +23,33 @@ use std::env;
 use std::fs;
 use std::path::Path;
 
+/// Emit `EmbeddedExampleFile` entries for every file under `dir`, recursively,
+/// naming each by its path relative to the example root (forward slashes) so the
+/// example's `tests/` (and any other subfolder) travels with it when copied into
+/// a user's workspace. Build artifacts are skipped.
+fn collect_example_files(dir: &Path, prefix: &str, out: &mut String) {
+    let Ok(read) = fs::read_dir(dir) else { return };
+    let mut entries: Vec<_> = read.flatten().collect();
+    entries.sort_by_key(|e| e.file_name());
+    for e in entries {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let rel = if prefix.is_empty() { name.clone() } else { format!("{}/{}", prefix, name) };
+        let p = e.path();
+        if p.is_dir() {
+            if name == "build" || name == "target" {
+                continue;
+            }
+            collect_example_files(&p, &rel, out);
+        } else if p.is_file() {
+            let abs = p.to_string_lossy().into_owned();
+            out.push_str("            EmbeddedExampleFile {\n");
+            out.push_str(&format!("                name: {:?},\n", rel));
+            out.push_str(&format!("                content: include_str!({:?}),\n", abs));
+            out.push_str("            },\n");
+        }
+    }
+}
+
 fn main() {
     let manifest = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
     let std_dir = Path::new(&manifest).join("tools/ik8b/std");
@@ -76,19 +103,7 @@ fn main() {
             examples_code.push_str(&format!("        name: {:?},\n", example_name));
             examples_code.push_str("        files: &[\n");
 
-            if let Ok(read_files) = fs::read_dir(d.path()) {
-                let mut files: Vec<_> = read_files.flatten().filter(|e| e.path().is_file()).collect();
-                files.sort_by_key(|f| f.file_name());
-
-                for f in files {
-                    let file_name = f.file_name().to_string_lossy().into_owned();
-                    let abs_path = f.path().to_string_lossy().into_owned();
-                    examples_code.push_str("            EmbeddedExampleFile {\n");
-                    examples_code.push_str(&format!("                name: {:?},\n", file_name));
-                    examples_code.push_str(&format!("                content: include_str!({:?}),\n", abs_path));
-                    examples_code.push_str("            },\n");
-                }
-            }
+            collect_example_files(&d.path(), "", &mut examples_code);
             examples_code.push_str("        ],\n");
             examples_code.push_str("    },\n");
         }
