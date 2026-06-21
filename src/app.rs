@@ -13,7 +13,9 @@
 // limitations under the License.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use eframe::egui;
 
@@ -124,6 +126,13 @@ pub struct IkIdeApp {
     pub show_serial: bool,
     pub show_breadboard: bool,
     pub is_busy: bool,
+    /// Cancellation flag for the in-flight task; the "Stop" button sets it so the
+    /// worker's loops bail out. A fresh token is created per task so a cancelled
+    /// run can never affect the next one.
+    pub cancel: Arc<AtomicBool>,
+    /// Where the active task streams its output, so a cancel notice lands in the
+    /// right panel (true = VM/trace panel, false = terminal).
+    pub busy_writes_vm: bool,
 
     // Breadboard: visual schematic driven by a live simulation.
     pub breadboard: crate::ui::breadboard::Breadboard,
@@ -281,6 +290,8 @@ impl Default for IkIdeApp {
             show_serial: false,
             show_breadboard: false,
             is_busy: false,
+            cancel: Arc::new(AtomicBool::new(false)),
+            busy_writes_vm: false,
             breadboard: crate::ui::breadboard::Breadboard::default(),
             live: None,
             live_regs: std::collections::HashMap::new(),
@@ -833,6 +844,39 @@ impl IkIdeApp {
         }
     }
 
+    /// Start a cancellable task: mark the IDE busy, hand out a fresh cancel
+    /// token, and swap in a fresh task channel so any straggler messages from a
+    /// previously cancelled (but still-winding-down) worker are dropped instead
+    /// of leaking into this run. `to_vm` selects which panel a later cancel
+    /// notice is written to. Returns the token to pass to the worker.
+    pub fn begin_task(&mut self, to_vm: bool) -> Arc<AtomicBool> {
+        let (tx, rx) = mpsc::channel();
+        self.task_tx = tx;
+        self.task_rx = rx;
+        self.is_busy = true;
+        self.busy_writes_vm = to_vm;
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.cancel = cancel.clone();
+        cancel
+    }
+
+    /// Cancel the in-flight task: signal its loops to stop, abandon its channel
+    /// (so its final messages can't flip `is_busy` on the next run), and free the
+    /// UI immediately. The detached worker exits on its own once it sees the flag.
+    pub fn abandon_task(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+        let (tx, rx) = mpsc::channel();
+        self.task_tx = tx;
+        self.task_rx = rx;
+        self.is_busy = false;
+        let note = format!("{} ⏹ Cancelled.\n", now_ts());
+        if self.busy_writes_vm {
+            self.vm_output.push_str(&note);
+        } else {
+            self.terminal_output.push_str(&note);
+        }
+    }
+
     pub fn handle_background_tasks(&mut self) {
         while let Ok(msg) = self.task_rx.try_recv() {
             match msg {
@@ -877,7 +921,7 @@ impl IkIdeApp {
         crate::core::analysis::sync_std_imports(&src);
         match crate::core::analysis::compile(&src) {
             Ok(artifact) => {
-                self.is_busy = true;
+                let _ = self.begin_task(false);
                 self.show_terminal = true;
                 self.terminal_output.clear();
                 self.terminal_output.push_str(&format!("{} --- Burning Bootloader ---\n", now_ts()));
@@ -1120,7 +1164,7 @@ impl eframe::App for IkIdeApp {
         if ctx.input(|i| i.modifiers.shift && i.key_pressed(egui::Key::R)) {
             if !self.is_busy && self.active_is_ik() {
                 self.save_active_file();
-                self.is_busy = true;
+                let _ = self.begin_task(false);
                 self.show_terminal = true;
                 self.terminal_output.clear();
                 self.terminal_output.push_str(&format!("{} --- Compiling ---\n", now_ts()));
@@ -1130,10 +1174,10 @@ impl eframe::App for IkIdeApp {
                 runner::spawn_compile(self.workspace_dir.clone(), path, content, self.task_tx.clone());
             }
         }
-        
+
         if ctx.input(|i| i.modifiers.shift && i.key_pressed(egui::Key::S)) {
             if !self.is_busy && self.active_is_ik() {
-                self.is_busy = true;
+                let cancel = self.begin_task(true);
                 self.show_vm_trace = true;
                 self.vm_output.clear();
                 self.vm_result = None;
@@ -1143,7 +1187,7 @@ impl eframe::App for IkIdeApp {
                 } else {
                     (None, String::new())
                 };
-                runner::spawn_simulate(self.workspace_dir.clone(), path, text, self.task_tx.clone(), self.sim_config());
+                runner::spawn_simulate(self.workspace_dir.clone(), path, text, self.task_tx.clone(), self.sim_config(), cancel);
             }
         }
 
@@ -1232,7 +1276,7 @@ impl eframe::App for IkIdeApp {
                 ui.menu_button("Run", |ui| {
                     if ui.add_enabled(!self.is_busy && self.active_is_ik(), egui::Button::new("🔨 Compile (Shift+R)")).clicked() {
                         self.save_active_file();
-                        self.is_busy = true;
+                        let _ = self.begin_task(false);
                         self.show_terminal = true;
                         self.terminal_output.clear();
                         self.terminal_output.push_str(&format!("{} --- Compiling ---\n", now_ts()));
@@ -1243,7 +1287,7 @@ impl eframe::App for IkIdeApp {
                         ui.close_menu();
                     }
                     if ui.add_enabled(!self.is_busy && self.active_is_ik(), egui::Button::new("🚀 Simulate (Shift+S)")).clicked() {
-                        self.is_busy = true;
+                        let cancel = self.begin_task(true);
                         self.show_vm_trace = true;
                         self.vm_output.clear();
                         self.vm_result = None;
@@ -1251,12 +1295,12 @@ impl eframe::App for IkIdeApp {
                         let (path, text) = if let Some(idx) = self.active_tab {
                             (Some(self.open_tabs[idx].path.clone()), self.open_tabs[idx].content.clone())
                         } else { (None, String::new()) };
-                        runner::spawn_simulate(self.workspace_dir.clone(), path, text, self.task_tx.clone(), self.sim_config());
+                        runner::spawn_simulate(self.workspace_dir.clone(), path, text, self.task_tx.clone(), self.sim_config(), cancel);
                         ui.close_menu();
                     }
                     if ui.add_enabled(!self.is_busy, egui::Button::new("🧪 Run Tests")).clicked() {
                         self.save_active_file();
-                        self.is_busy = true;
+                        let cancel = self.begin_task(false);
                         self.show_terminal = true;
                         self.terminal_output.clear();
                         self.terminal_output.push_str(&format!("{} --- Running Tests ---\n", now_ts()));
@@ -1265,12 +1309,12 @@ impl eframe::App for IkIdeApp {
                         } else {
                             self.avrdude_target.clone()
                         };
-                        crate::core::testbed::spawn_run_tests(self.workspace_dir.clone(), target, self.task_tx.clone());
+                        crate::core::testbed::spawn_run_tests(self.workspace_dir.clone(), target, self.task_tx.clone(), cancel);
                         ui.close_menu();
                     }
                     if ui.add_enabled(!self.is_busy && self.active_is_ik(), egui::Button::new("🔌 Upload to Board")).clicked() {
                         self.save_active_file();
-                        self.is_busy = true;
+                        let _ = self.begin_task(false);
                         self.show_terminal = true;
                         self.terminal_output.clear();
                         let path = self.active_tab.map(|idx| self.open_tabs[idx].path.clone());
@@ -1307,6 +1351,9 @@ impl eframe::App for IkIdeApp {
                 
                 if self.is_busy {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("⏹ Stop").on_hover_text("Cancel the running task").clicked() {
+                            self.abandon_task();
+                        }
                         ui.label("Working...");
                         ui.spinner();
                     });

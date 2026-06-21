@@ -92,7 +92,8 @@ fn run_tests(rest: &[String], program: &str) -> ! {
     let ws = workspace.or_else(|| std::env::current_dir().ok());
 
     let (tx, rx) = std::sync::mpsc::channel();
-    spawn_run_tests(ws, mcu, tx);
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    spawn_run_tests(ws, mcu, tx, cancel);
 
     // Stream the report as it arrives and keep a copy for the exit verdict.
     let mut report = String::new();

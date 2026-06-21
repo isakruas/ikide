@@ -14,7 +14,9 @@
 
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
+use std::sync::Arc;
 use std::thread;
 use serde::Deserialize;
 
@@ -250,7 +252,7 @@ pub fn spawn_stats(content: String, tx: Sender<TaskMsg>) {
 /// Compile in-process, then simulate the HEX in-process with the ik8bvm
 /// library — no external VM binary. Streams a readable log plus a structured
 /// end-of-run snapshot (`VmResult`) for the state panel.
-pub fn spawn_simulate(workspace_dir: Option<PathBuf>, selected_file: Option<PathBuf>, content: String, tx: Sender<TaskMsg>, cfg: SimConfig) {
+pub fn spawn_simulate(workspace_dir: Option<PathBuf>, selected_file: Option<PathBuf>, content: String, tx: Sender<TaskMsg>, cfg: SimConfig, cancel: Arc<AtomicBool>) {
     thread::spawn(move || {
         if let Some(path) = selected_file {
             let out_hex = out_hex_path(&workspace_dir, &path);
@@ -296,15 +298,30 @@ pub fn spawn_simulate(workspace_dir: Option<PathBuf>, selected_file: Option<Path
 
             let _ = tx.send(TaskMsg::Vm("--- Running simulation ---\n".to_string()));
 
-            // Step until the core halts or hits the instruction budget.
+            // Step until the core halts or hits the instruction budget. Poll the
+            // cancel flag every so often so "Stop" interrupts a long run promptly
+            // without paying an atomic load on every single instruction.
             let max = cfg.max_instr as u64;
             let mut executed: u64 = 0;
+            let mut cancelled = false;
             while vm.running {
                 vm.step();
                 executed += 1;
                 if max > 0 && executed >= max {
                     break;
                 }
+                if executed & 0xFFFF == 0 && cancel.load(Ordering::Relaxed) {
+                    cancelled = true;
+                    break;
+                }
+            }
+            if cancelled {
+                let _ = tx.send(TaskMsg::Vm(format!(
+                    "\n⏹ Cancelled after {} instructions.\n",
+                    executed
+                )));
+                let _ = tx.send(TaskMsg::Done);
+                return;
             }
 
             // Stream the captured instruction trace (the `-t` equivalent).

@@ -47,6 +47,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -94,6 +95,9 @@ pub struct Bench {
     executed: u64,
     results: Vec<CheckResult>,
     logs: Vec<String>,
+    /// Set from the IDE's "Stop" button; the stepping loops bail out when raised
+    /// so a long-running suite can be interrupted.
+    cancel: Arc<AtomicBool>,
 }
 
 impl Bench {
@@ -116,7 +120,13 @@ impl Bench {
             executed: 0,
             results: Vec::new(),
             logs: Vec::new(),
+            cancel: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Whether the test run has been asked to stop.
+    fn cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
     }
 
     /// Resolve a test-supplied path against the workspace when it is relative.
@@ -292,6 +302,9 @@ impl Bench {
     fn step(&mut self, n: u64) {
         let mut left = n;
         while left > 0 && self.vm.running {
+            if self.cancelled() {
+                return;
+            }
             let chunk = left.min(PUMP_CHUNK);
             self.pump(chunk);
             left -= chunk;
@@ -306,6 +319,9 @@ impl Bench {
         }
         let mut spent = 0u64;
         while spent < max && self.vm.running {
+            if self.cancelled() {
+                return false;
+            }
             let chunk = (max - spent).min(PUMP_CHUNK);
             self.pump(chunk);
             spent += chunk;
@@ -537,7 +553,7 @@ fn build_engine(bench: Arc<Mutex<Bench>>) -> Engine {
 
 /// Discover and run every `<workspace>/tests/*.rhai` file, streaming a PASS/FAIL
 /// report back to the IDE. Each file runs against a fresh [`Bench`].
-pub fn spawn_run_tests(workspace: Option<PathBuf>, target: String, tx: Sender<TaskMsg>) {
+pub fn spawn_run_tests(workspace: Option<PathBuf>, target: String, tx: Sender<TaskMsg>, cancel: Arc<AtomicBool>) {
     thread::spawn(move || {
         let tests_dir = match &workspace {
             Some(w) => w.join("tests"),
@@ -572,6 +588,11 @@ pub fn spawn_run_tests(workspace: Option<PathBuf>, target: String, tx: Sender<Ta
         let mut files_with_errors = 0usize;
 
         for file in &files {
+            if cancel.load(Ordering::Relaxed) {
+                let _ = tx.send(TaskMsg::Test("\n⏹ Cancelled — remaining files skipped.\n".to_string()));
+                break;
+            }
+
             let name = file.file_name().and_then(|s| s.to_str()).unwrap_or("?").to_string();
             let _ = tx.send(TaskMsg::Test(format!("\n=== {} ===\n", name)));
 
@@ -585,9 +606,26 @@ pub fn spawn_run_tests(workspace: Option<PathBuf>, target: String, tx: Sender<Ta
             };
 
             let bench = Arc::new(Mutex::new(Bench::new(workspace.clone(), target.clone())));
-            let engine = build_engine(bench.clone());
+            bench.lock().unwrap().cancel = cancel.clone();
+            let mut engine = build_engine(bench.clone());
+            // Abort the script at the next Rhai operation once cancel is raised
+            // (the native stepping loops already bail out via Bench::cancelled).
+            let prog_cancel = cancel.clone();
+            engine.on_progress(move |_| {
+                if prog_cancel.load(Ordering::Relaxed) {
+                    Some(Dynamic::UNIT)
+                } else {
+                    None
+                }
+            });
 
             let run_err = engine.run(&src).err();
+
+            // A cancel aborts mid-script: report it as cancelled, not an error.
+            if cancel.load(Ordering::Relaxed) {
+                let _ = tx.send(TaskMsg::Test("  ⏹ cancelled\n".to_string()));
+                break;
+            }
 
             let g = bench.lock().unwrap();
             for log in &g.logs {
@@ -678,7 +716,7 @@ mod tests {
         .unwrap();
 
         let (tx, rx) = std::sync::mpsc::channel();
-        spawn_run_tests(Some(ws), "atmega328p".to_string(), tx);
+        spawn_run_tests(Some(ws), "atmega328p".to_string(), tx, Arc::new(AtomicBool::new(false)));
 
         let mut report = String::new();
         while let Ok(msg) = rx.recv() {
@@ -790,7 +828,7 @@ mod tests {
         for dir in dirs {
             let name = dir.file_name().and_then(|s| s.to_str()).unwrap_or("?").to_string();
             let (tx, rx) = std::sync::mpsc::channel();
-            spawn_run_tests(Some(dir), "atmega328p".to_string(), tx);
+            spawn_run_tests(Some(dir), "atmega328p".to_string(), tx, Arc::new(AtomicBool::new(false)));
             let mut report = String::new();
             while let Ok(msg) = rx.recv() { match msg { TaskMsg::Test(s) => report.push_str(&s), TaskMsg::Done => break, _ => {} } }
             println!("########## {}\n{}", name, report);
@@ -799,5 +837,29 @@ mod tests {
             }
         }
         assert!(failed.is_empty(), "suites failed: {:?}", failed);
+    }
+
+    /// The "Stop" path: once the cancel flag is raised, the stepping loop bails
+    /// out immediately instead of running the requested instruction budget.
+    #[test]
+    fn cancel_flag_stops_stepping() {
+        let dir = std::env::temp_dir().join("ikide_cancel");
+        std::fs::create_dir_all(&dir).unwrap();
+        // A non-halting loop so the core stays `running` and would otherwise
+        // execute the full budget below.
+        std::fs::write(dir.join("p.ik"),
+            "target atmega328p\n@main {\n    ram mut $x: u8 = 0\n    loop * {\n        $x + 1 -> $x\n    }\n}\n").unwrap();
+        let mut b = Bench::new(Some(dir), "atmega328p".to_string());
+        b.build("p.ik").expect("compile");
+
+        // Without cancelling, a small step actually advances the core.
+        b.step(10_000);
+        assert!(b.executed >= 10_000, "expected real progress, got {}", b.executed);
+
+        // After raising the flag, even a huge budget runs zero instructions.
+        let mark = b.executed;
+        b.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        b.step(100_000_000);
+        assert_eq!(b.executed, mark, "stepping must stop when cancelled");
     }
 }
