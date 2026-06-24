@@ -4,3 +4,6 @@
 [submodule "ik8bvm"]
 	path = tools/ik8bvm
 	url = https://github.com/isakruas/ik8bvm
+[submodule "ikmcp"]
+	path = tools/ikmcp
+	url = https://github.com/isakruas/ikmcp
