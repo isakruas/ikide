@@ -35,6 +35,11 @@ fn print_help(program: &str) {
     println!();
     println!("Commands:");
     println!("  test [workspace]       Run the workspace's tests/*.rhai suite headless");
+    println!("  build <file.ik>        Compile a source file to Intel HEX");
+    println!("  run   <file.ik>        Compile, then simulate the result");
+    println!("  sim   <file.hex>       Simulate an already-assembled HEX image (--mcu <dev>)");
+    println!("  devices                List supported target devices");
+    println!("  mcp                    Serve the bundled ikmcp tools over stdio (MCP server)");
     println!("  version                Print version");
     println!("  license                Print license information");
     println!("  help                   Show this help text");
@@ -117,6 +122,26 @@ fn run_tests(rest: &[String], program: &str) -> ! {
     process::exit(if failed { 1 } else { 0 });
 }
 
+/// Serve the bundled ikmcp tools over stdio (Model Context Protocol).
+///
+/// This is what the IDE's AI agents (the `claude`, `codex` and `gemini` CLIs)
+/// spawn as their MCP server — re-executing this same binary as `ikide mcp` —
+/// so they can drive the ik compiler, simulator and IDE tools using the user's
+/// own CLI subscription, with no API key. It speaks JSON-RPC over stdin/stdout
+/// and never opens a window.
+fn run_mcp_server() -> ! {
+    let paths = ikmcp::paths::resolve_paths();
+    let mut server = ikmcp::protocol::Server::new("ikmcp", VERSION);
+    ikmcp::lang::tools::register(&mut server);
+    ikmcp::ide::tools::register(&mut server);
+    ikmcp::prompts::register(&mut server);
+    // Extra tools that drive the running IDE (compile/simulate in its panels),
+    // available when launched from the IDE's AI chat.
+    ikide::bridge::register(&mut server);
+    server.serve_forever(&paths);
+    process::exit(0);
+}
+
 /// Launch the graphical IDE.
 fn run_gui() -> Result<(), eframe::Error> {
     let icon_data = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png"))
@@ -148,6 +173,13 @@ fn main() {
             }
         }
         Some("test") => run_tests(&args[2..], program),
+        Some("mcp") => run_mcp_server(),
+        // Embedded ik8b/ik8bvm toolchain, exposed so the bundled MCP server and
+        // its agents can compile and simulate through the ikide binary alone.
+        Some("build") => ikide::cli::run_build(&args),
+        Some("run") => ikide::cli::run_run(&args),
+        Some("sim") | Some("sim-hex") => ikide::cli::run_sim(&args),
+        Some("devices") | Some("list-devices") => ikide::cli::print_devices(),
         Some("-h") | Some("--help") | Some("help") => print_help(program),
         Some("-V") | Some("--version") | Some("version") => print_version(),
         Some("--license") | Some("license") => print_license(),

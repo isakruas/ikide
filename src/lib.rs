@@ -16,6 +16,8 @@
 // exposed so external crates can reuse the simulation/device/test layer instead
 // of re-implementing it. The binary entry point lives in main.rs.
 pub mod app;
+pub mod bridge;
+pub mod cli;
 pub mod core;
 pub mod syntax;
 pub mod ui;

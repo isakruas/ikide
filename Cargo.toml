@@ -25,3 +25,7 @@ rhai = { version = "1", features = ["sync"] }
 ik8b = { path = "tools/ik8b" }
 # The ik8bvm AVR simulator, linked as a library so the IDE runs simulations
 ik8bvm = { path = "tools/ik8b/tools/ik8bvm" }
+# The MCP server linked as a library to run in-process
+ikmcp = { path = "tools/ikmcp" }
+# HTTP client for communication with LLM providers
+ureq = { version = "2.9", features = ["json"] }

@@ -73,6 +73,23 @@ pub struct Settings {
     pub show_vm_trace: bool,
     pub show_stats: bool,
     pub show_minimap: bool,
+
+    // LLM / AI configuration
+    pub llm_provider: String,
+    pub llm_api_key: String,
+    pub llm_model: String,
+    pub llm_endpoint: String,
+    pub show_ai_chat: bool,
+    pub ai_chat_active_tab: String,
+    pub agent_cli_command: String,
+    /// Agent autonomy over workspace files: "edits" (auto-accept edits),
+    /// "yolo" (auto-accept everything) or "readonly".
+    pub agent_autonomy: String,
+    /// Hide the agent's tool/system activity messages in the chat (cleaner view).
+    pub agent_hide_system: bool,
+    /// Opt-in: use the agent as the IDE's code assistant (inline suggestions,
+    /// helpers). Reserved for the upcoming assistant integration.
+    pub agent_as_code_assistant: bool,
 }
 
 impl Default for Settings {
@@ -109,6 +126,21 @@ impl Default for Settings {
             show_vm_trace: false,
             show_stats: true,
             show_minimap: true,
+ 
+            // AI agent defaults. `llm_provider` now selects the CLI agent
+            // (claude/codex/gemini), driven via the user's own subscription —
+            // no API key. The llm_* fields below are retained only for
+            // backward-compatible settings round-tripping.
+            llm_provider: "claude".to_string(),
+            llm_api_key: String::new(),
+            llm_model: String::new(),
+            llm_endpoint: String::new(),
+            show_ai_chat: false,
+            ai_chat_active_tab: "simulation".to_string(),
+            agent_cli_command: "claude".to_string(),
+            agent_autonomy: "edits".to_string(),
+            agent_hide_system: true,
+            agent_as_code_assistant: false,
         }
     }
 }

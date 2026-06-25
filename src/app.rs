@@ -52,6 +52,50 @@ fn cap_log(s: &mut String) {
     }
 }
 
+/// Append `{id, text}` to the agent result pipe, so the bridge tool awaiting
+/// `id` can return the IDE's outcome to the agent.
+fn write_agent_result(result_pipe: &str, id: &str, text: &str) {
+    if result_pipe.is_empty() {
+        return;
+    }
+    use std::io::Write;
+    let line = serde_json::json!({ "id": id, "text": text });
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(result_pipe) {
+        let _ = writeln!(f, "{}", line);
+    }
+}
+
+/// Char-safe last `n` characters of `s`.
+fn tail_str(s: &str, n: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= n {
+        s.to_string()
+    } else {
+        chars[chars.len() - n..].iter().collect()
+    }
+}
+
+/// Condense an agent action's captured task output into a concise reply.
+fn summarize_agent_result(action: &str, buf: &str) -> String {
+    let trimmed = buf.trim();
+    if trimmed.is_empty() {
+        return format!("The IDE finished the {} action.", action);
+    }
+    if action == "test" {
+        let lines: Vec<&str> = trimmed
+            .lines()
+            .filter(|l| {
+                let t = l.to_lowercase();
+                l.contains("PASS") || l.contains("FAIL") || t.contains("passed") || t.contains("failed") || t.contains("error")
+            })
+            .collect();
+        if !lines.is_empty() {
+            return lines.join("\n");
+        }
+    }
+    tail_str(trimmed, 1500)
+}
+
 /// True when `path` is an ik8b source the IDE should compile, lint and style.
 pub fn is_ik_file(path: &std::path::Path) -> bool {
     path.extension().and_then(|e| e.to_str()) == Some("ik")
@@ -94,6 +138,16 @@ pub enum ActionPopup {
     CreateFile { parent_dir: PathBuf, new_name: String },
     CreateDir { parent_dir: PathBuf, new_name: String },
     Delete { path: PathBuf },
+}
+
+/// An IDE action the agent requested and is awaiting the result of. The relevant
+/// task output is accumulated in `buf` and written back to `result_pipe` (keyed
+/// by `id`) when the task completes.
+pub struct PendingAgent {
+    pub id: String,
+    pub result_pipe: String,
+    pub action: String,
+    pub buf: String,
 }
 
 pub struct IkIdeApp {
@@ -243,6 +297,31 @@ pub struct IkIdeApp {
     pub last_checked_content: String,
 
     pub action_popup: ActionPopup,
+
+    // LLM / AI Chat config & state
+    pub llm_provider: String,
+    pub llm_api_key: String,
+    pub llm_model: String,
+    pub llm_endpoint: String,
+    pub show_ai_chat: bool,
+    pub ai_chat_active_tab: String,
+    pub agent_cli_command: String,
+    /// Agent autonomy over workspace files: "edits", "yolo" or "readonly".
+    pub agent_autonomy: String,
+    /// Hide the agent's tool/system activity messages in the chat.
+    pub agent_hide_system: bool,
+    /// Opt-in: use the agent as the IDE's code assistant (reserved).
+    pub agent_as_code_assistant: bool,
+
+    pub ai_chat_input: String,
+    pub ai_chat_history: Vec<crate::core::agent::ChatMessage>,
+    pub ai_agent_running: bool,
+    pub ai_agent_status: String,
+
+    pub agent_rx: Option<std::sync::mpsc::Receiver<crate::core::agent::AgentMsg>>,
+    pub agent_tx: Option<std::sync::mpsc::Sender<crate::core::agent::AgentMsg>>,
+    /// The IDE action the agent is currently waiting on (compile/simulate/test).
+    pub pending_agent: Option<PendingAgent>,
 }
 
 impl Default for IkIdeApp {
@@ -376,6 +455,27 @@ impl Default for IkIdeApp {
             last_edit: None,
             last_checked_content: String::new(),
             action_popup: ActionPopup::None,
+
+            // LLM initialization
+            llm_provider: settings.llm_provider.clone(),
+            llm_api_key: settings.llm_api_key.clone(),
+            llm_model: settings.llm_model.clone(),
+            llm_endpoint: settings.llm_endpoint.clone(),
+            show_ai_chat: settings.show_ai_chat,
+            ai_chat_active_tab: settings.ai_chat_active_tab.clone(),
+            agent_cli_command: settings.agent_cli_command.clone(),
+            agent_autonomy: settings.agent_autonomy.clone(),
+            agent_hide_system: settings.agent_hide_system,
+            agent_as_code_assistant: settings.agent_as_code_assistant,
+
+            ai_chat_input: String::new(),
+            ai_chat_history: Vec::new(),
+            ai_agent_running: false,
+            ai_agent_status: "Idle".to_string(),
+
+            agent_rx: None,
+            agent_tx: None,
+            pending_agent: None,
         };
 
         app.scan_examples();
@@ -429,6 +529,18 @@ impl IkIdeApp {
             show_vm_trace: self.show_vm_trace,
             show_stats: self.show_stats,
             show_minimap: self.show_minimap,
+
+            // LLM settings snapshot
+            llm_provider: self.llm_provider.clone(),
+            llm_api_key: self.llm_api_key.clone(),
+            llm_model: self.llm_model.clone(),
+            llm_endpoint: self.llm_endpoint.clone(),
+            show_ai_chat: self.show_ai_chat,
+            ai_chat_active_tab: self.ai_chat_active_tab.clone(),
+            agent_cli_command: self.agent_cli_command.clone(),
+            agent_autonomy: self.agent_autonomy.clone(),
+            agent_hide_system: self.agent_hide_system,
+            agent_as_code_assistant: self.agent_as_code_assistant,
         }
     }
 
@@ -920,14 +1032,31 @@ impl IkIdeApp {
                 TaskMsg::Done => {
                     self.is_busy = false;
                     self.refresh_files();
+                    // An agent-triggered action finished: hand its result back.
+                    if let Some(p) = self.pending_agent.take() {
+                        let text = summarize_agent_result(&p.action, &p.buf);
+                        write_agent_result(&p.result_pipe, &p.id, &text);
+                    }
                 }
                 TaskMsg::Compile(out) => {
+                    if let Some(p) = &mut self.pending_agent {
+                        p.buf.push_str(&out);
+                    }
                     self.terminal_output.push_str(&stamp(&out));
                 }
                 TaskMsg::Vm(out) => {
+                    if let Some(p) = &mut self.pending_agent {
+                        p.buf.push_str(&out);
+                    }
                     self.vm_output.push_str(&stamp(&out));
                 }
                 TaskMsg::VmResult(res) => {
+                    if let Some(p) = &mut self.pending_agent {
+                        p.buf.push_str(&format!(
+                            "\n{} ({}): {} — {} instructions, {} cycles, R16=0x{:02X}",
+                            res.device, res.core, res.halt_reason, res.executed, res.cycles, res.regs[16]
+                        ));
+                    }
                     self.vm_result = Some(res);
                 }
                 TaskMsg::Upload(out) => {
@@ -935,6 +1064,9 @@ impl IkIdeApp {
                     self.show_terminal = true;
                 }
                 TaskMsg::Test(out) => {
+                    if let Some(p) = &mut self.pending_agent {
+                        p.buf.push_str(&out);
+                    }
                     self.terminal_output.push_str(&stamp(&out));
                     self.show_terminal = true;
                 }
@@ -946,6 +1078,151 @@ impl IkIdeApp {
                 }
             }
         }
+    }
+
+    pub fn handle_agent_tasks(&mut self) {
+        // IDE actions the agent requested (compile/simulate) are collected here and
+        // run after the receiver borrow ends, since they need `&mut self`.
+        let mut ide_cmds: Vec<(String, String, Option<String>, String)> = Vec::new();
+        if let Some(ref rx) = self.agent_rx {
+            while let Ok(msg) = rx.try_recv() {
+                match msg {
+                    crate::core::agent::AgentMsg::IdeCommand { id, action, file, result_pipe } => {
+                        ide_cmds.push((id, action, file, result_pipe));
+                    }
+                    crate::core::agent::AgentMsg::Progress(status) => {
+                        self.ai_agent_status = status;
+                    }
+                    crate::core::agent::AgentMsg::ToolCall { name, args } => {
+                        self.ai_chat_history.push(crate::core::agent::ChatMessage {
+                            role: "system".to_string(),
+                            content: format!("🔧 Calling tool {} with args: {}", name, args),
+                        });
+                    }
+                    crate::core::agent::AgentMsg::ToolResponse { name, response } => {
+                        let truncated: String = response.chars().take(500).collect();
+                        let truncated = if response.chars().count() > 500 { format!("{}...", truncated) } else { truncated };
+                        self.ai_chat_history.push(crate::core::agent::ChatMessage {
+                            role: "system".to_string(),
+                            content: format!("✅ Tool {} returned: {}", name, truncated),
+                        });
+                    }
+                    crate::core::agent::AgentMsg::Response(text) => {
+                        self.ai_chat_history.push(crate::core::agent::ChatMessage {
+                            role: "assistant".to_string(),
+                            content: text,
+                        });
+                        self.ai_agent_running = false;
+                        self.ai_agent_status = "Idle".to_string();
+                    }
+                    crate::core::agent::AgentMsg::Error(err) => {
+                        self.ai_chat_history.push(crate::core::agent::ChatMessage {
+                            role: "system".to_string(),
+                            content: format!("❌ Error: {}", err),
+                        });
+                        self.ai_agent_running = false;
+                        self.ai_agent_status = "Idle".to_string();
+                    }
+                }
+            }
+        }
+        for (id, action, file, result_pipe) in ide_cmds {
+            if self.is_busy {
+                write_agent_result(&result_pipe, &id, "The IDE is busy with another task; try again shortly.");
+                continue;
+            }
+            match action.as_str() {
+                "compile" => self.agent_compile(id, result_pipe, file),
+                "simulate" => self.agent_simulate(id, result_pipe, file),
+                "test" => self.agent_run_tests(id, result_pipe),
+                other => write_agent_result(&result_pipe, &id, &format!("Unknown action: {}", other)),
+            }
+        }
+    }
+
+    /// Open/refresh `file` (the agent just wrote it on disk) and compile it in the
+    /// Output panel — the same path as clicking Compile. Never saves over the
+    /// agent's edits.
+    fn agent_focus_disk(&mut self, file: Option<String>) {
+        if let Some(f) = file {
+            if !f.is_empty() {
+                let path = PathBuf::from(&f);
+                self.load_file(path.clone());
+                if let Some(idx) = self.open_tabs.iter().position(|t| t.path == path) {
+                    if let Ok(c) = std::fs::read_to_string(&path) {
+                        self.open_tabs[idx].content = c;
+                        self.open_tabs[idx].is_modified = false;
+                        self.open_tabs[idx].is_disk_different = false;
+                        self.open_tabs[idx].last_mtime =
+                            std::fs::metadata(&path).ok().and_then(|m| m.modified().ok());
+                    }
+                    self.active_tab = Some(idx);
+                }
+            }
+        }
+    }
+
+    fn agent_compile(&mut self, id: String, result_pipe: String, file: Option<String>) {
+        self.agent_focus_disk(file);
+        if !self.active_is_ik() {
+            write_agent_result(&result_pipe, &id, "No .ik file to compile (open one in the IDE or pass a path).");
+            return;
+        }
+        let _ = self.begin_task(false);
+        self.show_terminal = true;
+        self.terminal_output.push_str(&format!("{} --- Compiling (AI agent) ---\n", now_ts()));
+        let (path, content) = self
+            .active_tab
+            .map(|i| (Some(self.open_tabs[i].path.clone()), self.open_tabs[i].content.clone()))
+            .unwrap_or((None, String::new()));
+        runner::spawn_compile(self.workspace_dir.clone(), path, content, self.task_tx.clone());
+        self.pending_agent = Some(PendingAgent { id, result_pipe, action: "compile".to_string(), buf: String::new() });
+    }
+
+    fn agent_simulate(&mut self, id: String, result_pipe: String, file: Option<String>) {
+        self.agent_focus_disk(file);
+        if !self.active_is_ik() {
+            write_agent_result(&result_pipe, &id, "No .ik file to simulate (open one in the IDE or pass a path).");
+            return;
+        }
+        let cancel = self.begin_task(true);
+        self.show_vm_trace = true;
+        self.vm_output.clear();
+        self.vm_result = None;
+        self.vm_output.push_str(&format!("{} --- Simulation Starting (AI agent) ---\n", now_ts()));
+        let (path, text) = self
+            .active_tab
+            .map(|i| (Some(self.open_tabs[i].path.clone()), self.open_tabs[i].content.clone()))
+            .unwrap_or((None, String::new()));
+        runner::spawn_simulate(
+            self.workspace_dir.clone(),
+            path,
+            text,
+            self.task_tx.clone(),
+            self.sim_config(),
+            cancel,
+        );
+        self.pending_agent = Some(PendingAgent { id, result_pipe, action: "simulate".to_string(), buf: String::new() });
+    }
+
+    /// Run the workspace test suite in the Output panel — the same path as the
+    /// Run -> Run Tests menu, triggered by the agent.
+    fn agent_run_tests(&mut self, id: String, result_pipe: String) {
+        let cancel = self.begin_task(false);
+        self.show_terminal = true;
+        self.terminal_output.push_str(&format!("{} --- Running Tests (AI agent) ---\n", now_ts()));
+        let target = if self.avrdude_target.is_empty() {
+            "atmega328p".to_string()
+        } else {
+            self.avrdude_target.clone()
+        };
+        crate::core::testbed::spawn_run_tests(
+            self.workspace_dir.clone(),
+            target,
+            self.task_tx.clone(),
+            cancel,
+        );
+        self.pending_agent = Some(PendingAgent { id, result_pipe, action: "test".to_string(), buf: String::new() });
     }
 
     pub fn trigger_burn_bootloader(&mut self) {
@@ -1180,6 +1457,11 @@ impl eframe::App for IkIdeApp {
         }
 
         self.handle_background_tasks();
+        self.handle_agent_tasks();
+        // Keep repainting while a CLI agent streams so its activity log updates.
+        if self.ai_agent_running {
+            ctx.request_repaint_after(Duration::from_millis(120));
+        }
 
         // Stream any bytes the board sent into the serial monitor.
         self.pump_serial();
@@ -1299,6 +1581,7 @@ impl eframe::App for IkIdeApp {
                 ui.menu_button("View", |ui| {
                     ui.checkbox(&mut self.show_terminal, "Output");
                     ui.checkbox(&mut self.show_vm_trace, "Simulation");
+                    ui.checkbox(&mut self.show_ai_chat, "AI Chat");
                     ui.checkbox(&mut self.show_stats, "Resource Stats");
                     ui.checkbox(&mut self.show_minimap, "Minimap");
                     ui.checkbox(&mut self.show_serial, "Serial Monitor");
@@ -1408,12 +1691,10 @@ impl eframe::App for IkIdeApp {
                 .open(&mut show)
                 .show(ctx, |ui| {
                     ui.label(egui::RichText::new("⚙ Preferences").strong());
-                    ui.label(egui::RichText::new("Compiler & simulator are built in — only their settings are exposed.").weak().small());
                     ui.separator();
 
                     egui::ScrollArea::vertical().max_height(450.0).show(ui, |ui| {
                         egui::CollapsingHeader::new("Simulation").default_open(true).show(ui, |ui| {
-                            ui.label(egui::RichText::new("Runs in-process — no external VM binary.").weak().small());
                             egui::Grid::new("sim_grid").num_columns(2).spacing([10.0, 10.0]).show(ui, |ui| {
                                 ui.label("Max Instructions:");
                                 ui.add(egui::DragValue::new(&mut self.vm_max_cycles).speed(1000).range(0..=1_000_000_000))
@@ -1438,6 +1719,69 @@ impl eframe::App for IkIdeApp {
                                 ui.add(egui::DragValue::new(&mut self.sim_peek_len).speed(1).range(1..=256));
                                 ui.end_row();
                             });
+                        });
+
+                        ui.add_space(5.0);
+
+                        egui::CollapsingHeader::new("AI Chat").default_open(true).show(ui, |ui| {
+                            egui::Grid::new("ai_chat_grid").num_columns(2).spacing([10.0, 10.0]).show(ui, |ui| {
+                                ui.label("Agent CLI:");
+                                {
+                                    // Supported agent CLIs. Add a row here to expose a new one.
+                                    const AGENTS: [(&str, &str); 3] = [
+                                        ("claude", "Claude Code"),
+                                        ("codex", "Codex"),
+                                        ("gemini", "Gemini"),
+                                    ];
+                                    let current = AGENTS
+                                        .iter()
+                                        .find(|(id, _)| *id == self.llm_provider)
+                                        .map(|(_, label)| label.to_string())
+                                        .unwrap_or_else(|| self.llm_provider.clone());
+                                    egui::ComboBox::from_id_salt("agent_cli_select")
+                                        .selected_text(current)
+                                        .show_ui(ui, |ui| {
+                                            for (id, label) in AGENTS {
+                                                if ui
+                                                    .selectable_value(&mut self.llm_provider, id.to_string(), label)
+                                                    .clicked()
+                                                {
+                                                    self.agent_cli_command = id.to_string();
+                                                }
+                                            }
+                                        });
+                                }
+                                ui.end_row();
+
+                                ui.label("Autonomy:");
+                                ui.horizontal(|ui| {
+                                    ui.selectable_value(&mut self.agent_autonomy, "edits".to_string(), "Auto-edit")
+                                        .on_hover_text("Auto-approve file edits and ikmcp tools (recommended).");
+                                    ui.selectable_value(&mut self.agent_autonomy, "yolo".to_string(), "Full (YOLO)")
+                                        .on_hover_text("Auto-approve everything, including shell commands.");
+                                    ui.selectable_value(&mut self.agent_autonomy, "readonly".to_string(), "Read-only")
+                                        .on_hover_text("No file changes; read and analyze only.");
+                                });
+                                ui.end_row();
+
+                                ui.label("Chat:");
+                                let mut show_sys = !self.agent_hide_system;
+                                if ui.checkbox(&mut show_sys, "Show tool/system activity")
+                                    .on_hover_text("Show the agent's tool calls and system messages in the chat.")
+                                    .changed()
+                                {
+                                    self.agent_hide_system = !show_sys;
+                                }
+                                ui.end_row();
+
+                                ui.label("Code assistant:");
+                                ui.checkbox(&mut self.agent_as_code_assistant, "Enable as code assistant")
+                                    .on_hover_text("Use this agent for inline code suggestions and helpers across the IDE. (Reserved — integration coming.)");
+                                ui.end_row();
+                            });
+                            ui.label(egui::RichText::new(
+                                "Sign in once in a terminal: claude, codex or gemini.",
+                            ).weak().small());
                         });
 
                         ui.add_space(5.0);
@@ -1811,7 +2155,7 @@ impl eframe::App for IkIdeApp {
             terminal::render(self, ctx);
         }
         explorer::render(self, ctx);
-        if self.show_vm_trace {
+        if self.show_vm_trace || self.show_ai_chat {
             right_panel::render(self, ctx);
         }
         crate::ui::serial::render(self, ctx);

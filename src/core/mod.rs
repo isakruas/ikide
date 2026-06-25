@@ -22,3 +22,5 @@ pub mod settings;
 pub mod sim_live;
 pub mod testbed;
 pub mod workspace;
+pub mod agent;
+

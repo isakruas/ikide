@@ -4,6 +4,7 @@
 [submodule "ik8bvm"]
 	path = tools/ik8bvm
 	url = https://github.com/isakruas/ik8bvm
-[submodule "ikmcp"]
+[submodule "tools/ikmcp"]
 	path = tools/ikmcp
-	url = https://github.com/isakruas/ikmcp
+	url = git@github.com:isakruas/ikmcp.git
+	branch = rust
