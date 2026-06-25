@@ -67,11 +67,11 @@ fn target_file(args: &serde_json::Value) -> Option<String> {
 }
 
 /// Append a command for the IDE to run, returning the request id to await.
-fn send_command(action: &str, file: Option<String>) -> Result<String, String> {
+fn send_command(action: &str, file: Option<String>, payload: Option<String>) -> Result<String, String> {
     let pipe = std::env::var(ENV_CMD_PIPE)
         .map_err(|_| "the IDE bridge is unavailable (run this from the IKIDE AI chat)".to_string())?;
     let id = next_id();
-    let line = serde_json::json!({ "id": id, "action": action, "file": file });
+    let line = serde_json::json!({ "id": id, "action": action, "file": file, "payload": payload });
     let mut f = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -111,7 +111,69 @@ fn await_result(id: &str) -> String {
 
 /// Ask the IDE to run `action` on `file` and return the IDE's own result.
 fn drive_ide(action: &str, file: Option<String>) -> Result<serde_json::Value, String> {
-    let id = send_command(action, file)?;
+    let id = send_command(action, file, None)?;
+    Ok(serde_json::Value::String(await_result(&id)))
+}
+
+/// Board pins available on the active file's target MCU (for wiring devices).
+fn active_target_pins() -> (Option<String>, Vec<String>) {
+    let file = match std::env::var(ENV_ACTIVE_FILE) {
+        Ok(s) if !s.is_empty() => s,
+        _ => return (None, Vec::new()),
+    };
+    let src = match std::fs::read_to_string(&file) {
+        Ok(s) => s,
+        Err(_) => return (None, Vec::new()),
+    };
+    match crate::core::board::target_of(&src) {
+        Some(dev) => {
+            let pins = crate::core::board::pins(&dev).into_iter().map(|p| p.name).collect();
+            (Some(dev), pins)
+        }
+        None => (None, Vec::new()),
+    }
+}
+
+/// List the device catalog and the target's board pins, so the agent knows what
+/// it can place and how to wire it. Read-only — answered in-process.
+fn ide_breadboard_catalog(_paths: &Paths, _args: serde_json::Value) -> Result<serde_json::Value, String> {
+    let catalog = crate::core::devices::catalog();
+    let devices: Vec<serde_json::Value> = catalog
+        .iter()
+        .map(|s| {
+            let terminals: Vec<serde_json::Value> = s
+                .pins
+                .iter()
+                .map(|p| serde_json::json!({ "name": p.name, "mode": format!("{:?}", p.mode) }))
+                .collect();
+            serde_json::json!({
+                "id": s.id,
+                "name": s.name,
+                "bus": format!("{:?}", s.bus),
+                "terminals": terminals,
+            })
+        })
+        .collect();
+    let (target, board_pins) = active_target_pins();
+    Ok(serde_json::json!({
+        "target": target,
+        "board_pins": board_pins,
+        "devices": devices,
+        "config_format": "Pass to ide_breadboard_set as {\"config\":{\"clock_hz\":16000000,\"spi_miso\":255,\"devices\":[{\"spec_id\":\"<id>\",\"pins\":{\"<terminal>\":\"<board_pin>\"},\"adc\":{\"<terminal>\":<ch>}}]}}",
+    }))
+}
+
+fn ide_breadboard_get(_paths: &Paths, _args: serde_json::Value) -> Result<serde_json::Value, String> {
+    let id = send_command("bb_get", None, None)?;
+    Ok(serde_json::Value::String(await_result(&id)))
+}
+
+fn ide_breadboard_set(_paths: &Paths, args: serde_json::Value) -> Result<serde_json::Value, String> {
+    let cfg = args
+        .get("config")
+        .ok_or("missing `config` object (see ide_breadboard_catalog for the format)")?;
+    let payload = serde_json::to_string(cfg).map_err(|e| e.to_string())?;
+    let id = send_command("bb_set", None, Some(payload))?;
     Ok(serde_json::Value::String(await_result(&id)))
 }
 
@@ -163,5 +225,33 @@ pub fn register(server: &mut Server) {
         "Run the workspace's test suite (tests/*.rhai) in the RUNNING IKIDE, exactly as clicking Run Tests does — it runs in the IDE's Output panel and the PASS/FAIL report is returned to you. Prefer this over ide_run_tests when working inside the IDE.",
         serde_json::json!({ "type": "object", "properties": {} }),
         ide_test,
+    );
+    // Breadboard control: assemble the user's circuit for them.
+    server.register_tool(
+        "ide_breadboard_catalog",
+        "List the breadboard device catalog and the target MCU's board pins, so you know which devices you can place (spec ids, terminals, modes) and which pins to wire them to. Call this first when assembling a breadboard.",
+        serde_json::json!({ "type": "object", "properties": {} }),
+        ide_breadboard_catalog,
+    );
+    server.register_tool(
+        "ide_breadboard_get",
+        "Return the IDE's current breadboard setup (placed devices + wiring + clock) as JSON.",
+        serde_json::json!({ "type": "object", "properties": {} }),
+        ide_breadboard_get,
+    );
+    server.register_tool(
+        "ide_breadboard_set",
+        "Assemble the breadboard in the RUNNING IKIDE: replace the placed devices with the given configuration (devices wired by board-pin name). Use ide_breadboard_catalog for valid spec ids, terminals and pins. This sets up the board so the user can just run it.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "config": {
+                    "type": "object",
+                    "description": "Breadboard config: {clock_hz, spi_miso, devices:[{spec_id, pins:{terminal:board_pin}, adc:{terminal:ch}}]}"
+                }
+            },
+            "required": ["config"]
+        }),
+        ide_breadboard_set,
     );
 }

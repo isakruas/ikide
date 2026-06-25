@@ -92,6 +92,120 @@ impl Instance {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Portable breadboard configuration (export / import / agent control)
+// ---------------------------------------------------------------------------
+
+fn default_miso() -> u8 {
+    0xFF
+}
+
+/// A portable snapshot of a breadboard setup: which devices are placed and how
+/// each terminal is wired (by board-pin *name*, so it survives across sessions
+/// and is what the AI agent reads/writes to assemble a board).
+#[derive(serde::Serialize, serde::Deserialize, Clone, Default)]
+pub struct BreadboardConfig {
+    #[serde(default)]
+    pub clock_hz: u32,
+    #[serde(default = "default_miso")]
+    pub spi_miso: u8,
+    #[serde(default)]
+    pub devices: Vec<DeviceConfig>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Default)]
+pub struct DeviceConfig {
+    /// Catalog device id (see ide_breadboard_catalog).
+    pub spec_id: String,
+    /// terminal name -> board pin name (e.g. "DIN" -> "PB0").
+    #[serde(default)]
+    pub pins: std::collections::BTreeMap<String, String>,
+    /// ADC terminal name -> channel number.
+    #[serde(default)]
+    pub adc: std::collections::BTreeMap<String, u8>,
+}
+
+/// Board pins for the current target (from the active file's `target`, falling
+/// back to the breadboard's cached device).
+pub fn current_board_pins(app: &IkIdeApp) -> Vec<Pin> {
+    let dev = app
+        .active_tab
+        .and_then(|i| app.open_tabs.get(i))
+        .and_then(|t| board::target_of(&t.content))
+        .unwrap_or_else(|| app.breadboard.device_name().to_string());
+    if dev.is_empty() {
+        Vec::new()
+    } else {
+        board::pins(&dev)
+    }
+}
+
+/// Snapshot the placed devices + clock + MISO into a portable config.
+pub fn export_config(app: &IkIdeApp) -> BreadboardConfig {
+    let board_pins = current_board_pins(app);
+    let devices = app
+        .bb_instances
+        .iter()
+        .map(|inst| {
+            let w = inst.wiring(&app.device_catalog, &board_pins);
+            DeviceConfig {
+                spec_id: w.spec_id,
+                pins: w.pins.into_iter().collect(),
+                adc: w.adc.into_iter().collect(),
+            }
+        })
+        .collect();
+    BreadboardConfig {
+        clock_hz: app.bb_clock_hz,
+        spi_miso: app.bb_spi_miso,
+        devices,
+    }
+}
+
+/// Replace the placed devices with `cfg`. Returns the number of devices placed,
+/// or an error listing any unknown spec ids (the rest are still placed).
+pub fn apply_config(app: &mut IkIdeApp, cfg: &BreadboardConfig) -> Result<usize, String> {
+    let board_pins = current_board_pins(app);
+    app.bb_instances.clear();
+    let mut placed = 0usize;
+    let mut missing: Vec<String> = Vec::new();
+    for d in &cfg.devices {
+        let spec = match app.device_catalog.iter().find(|s| s.id == d.spec_id) {
+            Some(s) => s.clone(),
+            None => {
+                missing.push(d.spec_id.clone());
+                continue;
+            }
+        };
+        let mut inst = Instance::new(&spec, &board_pins);
+        for (t, def) in spec.pins.iter().enumerate() {
+            if let Some(pin_name) = d.pins.get(&def.name) {
+                inst.pins[t] = board_pins.iter().position(|p| &p.name == pin_name);
+            }
+            if let Some(ch) = d.adc.get(&def.name) {
+                if t < inst.adc_ch.len() {
+                    inst.adc_ch[t] = *ch;
+                }
+            }
+        }
+        app.bb_instances.push(inst);
+        placed += 1;
+    }
+    if cfg.clock_hz > 0 {
+        app.bb_clock_hz = cfg.clock_hz;
+    }
+    app.bb_spi_miso = cfg.spi_miso;
+    if missing.is_empty() {
+        Ok(placed)
+    } else {
+        Err(format!(
+            "placed {} device(s); unknown spec id(s): {}",
+            placed,
+            missing.join(", ")
+        ))
+    }
+}
+
 /// The board model: placed instances plus the cached pin map of the target.
 #[derive(Default)]
 pub struct Breadboard {
@@ -143,6 +257,8 @@ struct Actions {
     remove: Option<usize>,
     refresh_catalog: bool,
     new_script: bool,
+    export: bool,
+    import: bool,
     /// (PINx addr, bit, level) inputs from pin-bound buttons.
     inputs: Vec<(u32, u8, bool)>,
     /// ADC values from pin-bound sliders.
@@ -457,6 +573,13 @@ fn board_tab(app: &mut IkIdeApp, ui: &mut egui::Ui, act: &mut Actions) {
         }
         if ui.button("⟳").on_hover_text("Reload the device catalog (built-ins + devices/*.rhai).").clicked() {
             act.refresh_catalog = true;
+        }
+        ui.separator();
+        if ui.button("⬆ Export").on_hover_text("Save this breadboard (devices + wiring) to a JSON file.").clicked() {
+            act.export = true;
+        }
+        if ui.button("⬇ Import").on_hover_text("Load a breadboard setup from a JSON file.").clicked() {
+            act.import = true;
         }
     });
     ui.add_space(4.0);
@@ -928,6 +1051,42 @@ fn apply_actions(app: &mut IkIdeApp, act: Actions) {
     }
     if act.refresh_catalog {
         app.device_catalog = crate::core::devices::catalog();
+    }
+    // Export / import open a native file dialog, which must run OFF the UI thread
+    // or egui freezes ("not responding"). The work is handed to a worker and its
+    // outcome is drained on the main thread by `pump_bb_dialog`.
+    if act.export && app.bb_dialog_rx.is_none() {
+        let json = serde_json::to_string_pretty(&export_config(app)).unwrap_or_else(|_| "{}".to_string());
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.bb_dialog_rx = Some(rx);
+        std::thread::spawn(move || {
+            let msg = match rfd::FileDialog::new()
+                .add_filter("breadboard", &["json"])
+                .set_file_name("breadboard.json")
+                .save_file()
+            {
+                Some(path) => match std::fs::write(&path, json) {
+                    Ok(_) => crate::app::BbDialog::Status(format!("Exported breadboard to {}", path.display())),
+                    Err(e) => crate::app::BbDialog::Status(format!("Export failed: {}", e)),
+                },
+                None => crate::app::BbDialog::Status("Export cancelled.".to_string()),
+            };
+            let _ = tx.send(msg);
+        });
+    }
+    if act.import && app.bb_dialog_rx.is_none() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.bb_dialog_rx = Some(rx);
+        std::thread::spawn(move || {
+            let msg = match rfd::FileDialog::new().add_filter("breadboard", &["json"]).pick_file() {
+                Some(path) => match std::fs::read_to_string(&path) {
+                    Ok(s) => crate::app::BbDialog::ImportContent(s),
+                    Err(e) => crate::app::BbDialog::Status(format!("Import failed: {}", e)),
+                },
+                None => crate::app::BbDialog::Status("Import cancelled.".to_string()),
+            };
+            let _ = tx.send(msg);
+        });
     }
     if act.new_script {
         let dir = std::path::Path::new("devices");

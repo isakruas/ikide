@@ -55,6 +55,7 @@ pub enum AgentMsg {
         id: String,
         action: String,
         file: Option<String>,
+        payload: Option<String>,
         result_pipe: String,
     },
 }
@@ -65,7 +66,15 @@ const IDE_GUIDANCE: &str = "You are the coding assistant embedded in the IKIDE I
 (ik8b / AVR-8). To build or compile, call the `ide_compile` tool; to run or simulate, call `ide_simulate`; \
 to run the test suite, call `ide_test`. Those run inside the IDE and show their output in its Output and \
 Simulation panels — do NOT use ik_compile, ik_simulate or ide_run_tests, and never paste raw Intel HEX into \
-the chat. Edit the user's .ik files directly to make changes. \
+the chat. To set up the breadboard/circuit for the user's program, call `ide_breadboard_catalog` to see the \
+available devices and target pins, then `ide_breadboard_set` to place and wire them. \
+For special cases the ide_* tools don't cover (e.g. capturing a full instruction trace, custom flags), \
+you can run the IDE's own toolchain directly via the shell using the $IKIDE_BIN executable — the same \
+compiler/simulator the IDE uses. Examples: `\"$IKIDE_BIN\" build file.ik -o out.hex`, \
+`\"$IKIDE_BIN\" sim out.hex --mcu atmega328p --trace --limit 200000`, `\"$IKIDE_BIN\" run file.ik --dump`. \
+Run `\"$IKIDE_BIN\" help` to see every subcommand and flag. Prefer the ide_* tools for normal builds/runs \
+(they show in the IDE); use $IKIDE_BIN only when you need a capability they don't expose. \
+Edit the user's .ik files directly to make changes. \
 Reply in PLAIN TEXT only, suitable for a narrow side panel: no Markdown at all — no **bold**, no #headings, \
 no `backticks` or code fences, no tables, no bullet/list markup. Keep replies short and focused on what you \
 did and why.";
@@ -102,10 +111,12 @@ fn drain_ide_commands(path: &Path, processed: &mut usize, tx: &Sender<AgentMsg>,
                     if !action.is_empty() {
                         let id = v.get("id").and_then(|i| i.as_str()).unwrap_or("").to_string();
                         let file = v.get("file").and_then(|f| f.as_str()).map(|s| s.to_string());
+                        let payload = v.get("payload").and_then(|p| p.as_str()).map(|s| s.to_string());
                         let _ = tx.send(AgentMsg::IdeCommand {
                             id,
                             action: action.to_string(),
                             file,
+                            payload,
                             result_pipe: result_pipe.to_string(),
                         });
                     }

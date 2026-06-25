@@ -140,6 +140,14 @@ pub enum ActionPopup {
     Delete { path: PathBuf },
 }
 
+/// Result of the off-thread breadboard file dialog (so the UI never blocks).
+pub enum BbDialog {
+    /// A status line to show (export outcome, cancellation, errors).
+    Status(String),
+    /// Raw JSON read from a chosen file, to parse and apply on the main thread.
+    ImportContent(String),
+}
+
 /// An IDE action the agent requested and is awaiting the result of. The relevant
 /// task output is accumulated in `buf` and written back to `result_pipe` (keyed
 /// by `id`) when the task completes.
@@ -322,6 +330,8 @@ pub struct IkIdeApp {
     pub agent_tx: Option<std::sync::mpsc::Sender<crate::core::agent::AgentMsg>>,
     /// The IDE action the agent is currently waiting on (compile/simulate/test).
     pub pending_agent: Option<PendingAgent>,
+    /// In-flight breadboard export/import file dialog (kept off the UI thread).
+    pub bb_dialog_rx: Option<Receiver<BbDialog>>,
 }
 
 impl Default for IkIdeApp {
@@ -476,6 +486,7 @@ impl Default for IkIdeApp {
             agent_rx: None,
             agent_tx: None,
             pending_agent: None,
+            bb_dialog_rx: None,
         };
 
         app.scan_examples();
@@ -1026,6 +1037,28 @@ impl IkIdeApp {
         }
     }
 
+    /// Drain the breadboard file-dialog thread: show its status, or parse and
+    /// apply an imported config. Runs on the main thread (apply needs `&mut self`).
+    pub fn pump_bb_dialog(&mut self) {
+        let msg = self.bb_dialog_rx.as_ref().and_then(|rx| rx.try_recv().ok());
+        if let Some(m) = msg {
+            self.bb_dialog_rx = None;
+            match m {
+                BbDialog::Status(s) => self.live_status = s,
+                BbDialog::ImportContent(s) => {
+                    self.live_status =
+                        match serde_json::from_str::<crate::ui::breadboard::BreadboardConfig>(&s) {
+                            Ok(cfg) => match crate::ui::breadboard::apply_config(self, &cfg) {
+                                Ok(n) => format!("Imported {} device(s).", n),
+                                Err(e) => format!("Imported with warnings: {}", e),
+                            },
+                            Err(e) => format!("Import failed: {}", e),
+                        };
+                }
+            }
+        }
+    }
+
     pub fn handle_background_tasks(&mut self) {
         while let Ok(msg) = self.task_rx.try_recv() {
             match msg {
@@ -1083,12 +1116,12 @@ impl IkIdeApp {
     pub fn handle_agent_tasks(&mut self) {
         // IDE actions the agent requested (compile/simulate) are collected here and
         // run after the receiver borrow ends, since they need `&mut self`.
-        let mut ide_cmds: Vec<(String, String, Option<String>, String)> = Vec::new();
+        let mut ide_cmds: Vec<(String, String, Option<String>, Option<String>, String)> = Vec::new();
         if let Some(ref rx) = self.agent_rx {
             while let Ok(msg) = rx.try_recv() {
                 match msg {
-                    crate::core::agent::AgentMsg::IdeCommand { id, action, file, result_pipe } => {
-                        ide_cmds.push((id, action, file, result_pipe));
+                    crate::core::agent::AgentMsg::IdeCommand { id, action, file, payload, result_pipe } => {
+                        ide_cmds.push((id, action, file, payload, result_pipe));
                     }
                     crate::core::agent::AgentMsg::Progress(status) => {
                         self.ai_agent_status = status;
@@ -1126,7 +1159,22 @@ impl IkIdeApp {
                 }
             }
         }
-        for (id, action, file, result_pipe) in ide_cmds {
+        for (id, action, file, payload, result_pipe) in ide_cmds {
+            // Breadboard ops are quick state changes — handle them even while busy.
+            match action.as_str() {
+                "bb_get" => {
+                    let cfg = crate::ui::breadboard::export_config(self);
+                    let text = serde_json::to_string_pretty(&cfg).unwrap_or_else(|_| "{}".to_string());
+                    write_agent_result(&result_pipe, &id, &text);
+                    continue;
+                }
+                "bb_set" => {
+                    let text = self.agent_breadboard_set(payload);
+                    write_agent_result(&result_pipe, &id, &text);
+                    continue;
+                }
+                _ => {}
+            }
             if self.is_busy {
                 write_agent_result(&result_pipe, &id, "The IDE is busy with another task; try again shortly.");
                 continue;
@@ -1137,6 +1185,27 @@ impl IkIdeApp {
                 "test" => self.agent_run_tests(id, result_pipe),
                 other => write_agent_result(&result_pipe, &id, &format!("Unknown action: {}", other)),
             }
+        }
+    }
+
+    /// Apply an agent-provided breadboard configuration (places devices + wiring).
+    fn agent_breadboard_set(&mut self, payload: Option<String>) -> String {
+        let payload = match payload {
+            Some(p) => p,
+            None => return "bb_set: missing config payload.".to_string(),
+        };
+        match serde_json::from_str::<crate::ui::breadboard::BreadboardConfig>(&payload) {
+            Ok(cfg) => {
+                self.show_breadboard = true;
+                match crate::ui::breadboard::apply_config(self, &cfg) {
+                    Ok(n) => format!(
+                        "Placed {} device(s) on the breadboard. Open the Breadboard panel to run it.",
+                        n
+                    ),
+                    Err(e) => format!("Applied breadboard with warnings: {}", e),
+                }
+            }
+            Err(e) => format!("bb_set: invalid config JSON: {}", e),
         }
     }
 
@@ -1458,6 +1527,7 @@ impl eframe::App for IkIdeApp {
 
         self.handle_background_tasks();
         self.handle_agent_tasks();
+        self.pump_bb_dialog();
         // Keep repainting while a CLI agent streams so its activity log updates.
         if self.ai_agent_running {
             ctx.request_repaint_after(Duration::from_millis(120));
@@ -1531,7 +1601,7 @@ impl eframe::App for IkIdeApp {
         
         self.render_popups(ctx);
 
-        if self.is_busy || self.dialog_rx.is_some() {
+        if self.is_busy || self.dialog_rx.is_some() || self.bb_dialog_rx.is_some() {
             ctx.request_repaint();
         }
 
