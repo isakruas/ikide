@@ -589,7 +589,7 @@ pub fn spawn_run_tests(workspace: Option<PathBuf>, target: String, tx: Sender<Ta
 
         for file in &files {
             if cancel.load(Ordering::Relaxed) {
-                let _ = tx.send(TaskMsg::Test("\n⏹ Cancelled — remaining files skipped.\n".to_string()));
+                let _ = tx.send(TaskMsg::Test("\n Cancelled — remaining files skipped.\n".to_string()));
                 break;
             }
 
@@ -623,7 +623,7 @@ pub fn spawn_run_tests(workspace: Option<PathBuf>, target: String, tx: Sender<Ta
 
             // A cancel aborts mid-script: report it as cancelled, not an error.
             if cancel.load(Ordering::Relaxed) {
-                let _ = tx.send(TaskMsg::Test("  ⏹ cancelled\n".to_string()));
+                let _ = tx.send(TaskMsg::Test("cancelled\n".to_string()));
                 break;
             }
 

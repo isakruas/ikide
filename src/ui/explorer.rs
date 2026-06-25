@@ -130,34 +130,64 @@ pub fn render(app: &mut IkIdeApp, ctx: &egui::Context) {
                 });
             });
             ui.separator();
-            egui::ScrollArea::both()
+            let mut to_load = None;
+            let mut needs_refresh = false;
+            // Screen rect of each file row this frame, for rubber-band hit-testing.
+            let mut row_rects: Vec<(std::path::PathBuf, egui::Rect)> = Vec::new();
+            let active_path = app.active_tab.map(|idx| app.open_tabs[idx].path.clone());
+
+            let scroll_out = egui::ScrollArea::both()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    let mut to_load = None;
-                    let mut needs_refresh = false;
-
-                    let active_path = app.active_tab.map(|idx| app.open_tabs[idx].path.clone());
-
                     if let Some(tree) = &app.workspace_tree {
                         if let Some(path) = crate::ui::explorer::render_node(
                             ui,
                             tree,
                             &active_path,
+                            &mut app.explorer_selection,
                             app.workspace_dir.as_deref(),
                             &mut app.action_popup,
                             &mut needs_refresh,
+                            &mut row_rects,
                         ) {
                             to_load = Some(path);
                         }
                     }
-
-                    if let Some(path) = to_load {
-                        app.load_file(path);
-                    }
-                    if needs_refresh {
-                        app.refresh_files();
-                    }
                 });
+
+            // Rubber-band: drag across the file list to select every file the
+            // rectangle touches. Uses the global pointer (not per-row hover, which
+            // egui suppresses mid-drag). Ctrl/Cmd keeps the existing selection.
+            let viewport = scroll_out.inner_rect;
+            let pointer = ui.input(|i| i.pointer.clone());
+            if pointer.primary_down() {
+                if let (Some(origin), Some(cur)) = (pointer.press_origin(), pointer.interact_pos()) {
+                    if viewport.contains(origin) && (origin - cur).length() > 4.0 {
+                        let band = egui::Rect::from_two_pos(origin, cur);
+                        let additive = ui.input(|i| i.modifiers.ctrl || i.modifiers.command);
+                        if !additive {
+                            app.explorer_selection.clear();
+                        }
+                        for (path, rect) in &row_rects {
+                            if band.intersects(*rect) {
+                                app.explorer_selection.insert(path.clone());
+                            }
+                        }
+                        ui.painter().rect_filled(
+                            band,
+                            2.0,
+                            egui::Color32::from_rgba_unmultiplied(100, 150, 255, 30),
+                        );
+                    }
+                }
+            }
+
+            if let Some(path) = to_load {
+                app.load_file(path);
+            }
+            if needs_refresh {
+                app.refresh_files();
+            }
         });
 }
 
@@ -179,10 +209,12 @@ fn duplicate_target(src: &std::path::Path) -> std::path::PathBuf {
 fn render_node(
     ui: &mut egui::Ui,
     node: &crate::core::workspace::FileNode,
-    selected: &Option<std::path::PathBuf>,
+    active: &Option<std::path::PathBuf>,
+    selection: &mut std::collections::HashSet<std::path::PathBuf>,
     workspace_dir: Option<&std::path::Path>,
     action_popup: &mut ActionPopup,
     needs_refresh: &mut bool,
+    row_rects: &mut Vec<(std::path::PathBuf, egui::Rect)>,
 ) -> Option<std::path::PathBuf> {
     let mut clicked_path = None;
 
@@ -192,7 +224,7 @@ fn render_node(
             .default_open(is_root)
             .show(ui, |ui| {
                 for child in &node.children {
-                    if let Some(path) = render_node(ui, child, selected, workspace_dir, action_popup, needs_refresh) {
+                    if let Some(path) = render_node(ui, child, active, selection, workspace_dir, action_popup, needs_refresh, row_rects) {
                         clicked_path = Some(path);
                     }
                 }
@@ -227,20 +259,31 @@ fn render_node(
                     ui.close_menu();
                 }
                 ui.separator();
-                if ui.button("🗑 Delete").clicked() {
+                if ui.button("Delete").clicked() {
                     *action_popup = ActionPopup::Delete {
-                        path: node.path.clone(),
+                        paths: vec![node.path.clone()],
                     };
                     ui.close_menu();
                 }
             }
         });
     } else {
-        let is_selected = selected.as_ref() == Some(&node.path);
-        let icon = if node.name.ends_with(".hex") { "⚙" } else { "📄" };
-        let response = ui.selectable_label(is_selected, format!("{} {}", icon, node.name));
+        let is_selected = selection.contains(&node.path) || active.as_ref() == Some(&node.path);
+        let response = ui.selectable_label(is_selected, format!("📄 {}", node.name));
+        row_rects.push((node.path.clone(), response.rect));
         if response.clicked() {
-            clicked_path = Some(node.path.clone());
+            // Ctrl/Cmd+click toggles this file in the multi-selection without
+            // opening it; a plain click selects just this one and opens it.
+            let multi = ui.input(|i| i.modifiers.ctrl || i.modifiers.command);
+            if multi {
+                if !selection.remove(&node.path) {
+                    selection.insert(node.path.clone());
+                }
+            } else {
+                selection.clear();
+                selection.insert(node.path.clone());
+                clicked_path = Some(node.path.clone());
+            }
         }
 
         response.context_menu(|ui| {
@@ -256,7 +299,7 @@ fn render_node(
                 };
                 ui.close_menu();
             }
-            if ui.button("⎘ Duplicate").clicked() {
+            if ui.button("Duplicate").clicked() {
                 let dst = duplicate_target(&node.path);
                 if std::fs::copy(&node.path, &dst).is_ok() {
                     *needs_refresh = true;
@@ -268,10 +311,19 @@ fn render_node(
                 ui.close_menu();
             }
             ui.separator();
-            if ui.button("🗑 Delete").clicked() {
-                *action_popup = ActionPopup::Delete {
-                    path: node.path.clone(),
+            let multi = selection.len() > 1 && selection.contains(&node.path);
+            let label = if multi {
+                format!("Delete {} selected", selection.len())
+            } else {
+                "Delete".to_string()
+            };
+            if ui.button(label).clicked() {
+                let paths = if multi {
+                    selection.iter().cloned().collect()
+                } else {
+                    vec![node.path.clone()]
                 };
+                *action_popup = ActionPopup::Delete { paths };
                 ui.close_menu();
             }
         });

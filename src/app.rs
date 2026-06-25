@@ -137,7 +137,29 @@ pub enum ActionPopup {
     Rename { path: PathBuf, new_name: String },
     CreateFile { parent_dir: PathBuf, new_name: String },
     CreateDir { parent_dir: PathBuf, new_name: String },
-    Delete { path: PathBuf },
+    Delete { paths: Vec<PathBuf> },
+}
+
+/// Which category is shown in the Preferences window. Each maps to one panel
+/// so settings are grouped instead of stacked together in a single scroll.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PrefSection {
+    AiAssistant,
+    Shortcuts,
+    Simulation,
+    Upload,
+    BurnBootloader,
+}
+
+impl PrefSection {
+    /// (variant, sidebar label) for every section, in display order.
+    pub const ALL: [(PrefSection, &'static str); 5] = [
+        (PrefSection::AiAssistant, "AI Assistant"),
+        (PrefSection::Shortcuts, "Shortcuts"),
+        (PrefSection::Simulation, "Simulation"),
+        (PrefSection::Upload, "Upload"),
+        (PrefSection::BurnBootloader, "Burn Bootloader"),
+    ];
 }
 
 /// Result of the off-thread breadboard file dialog (so the UI never blocks).
@@ -305,6 +327,9 @@ pub struct IkIdeApp {
     pub last_checked_content: String,
 
     pub action_popup: ActionPopup,
+    /// Files multi-selected in the explorer (Ctrl/Cmd+click to add). Drives
+    /// highlighting and bulk actions like delete.
+    pub explorer_selection: std::collections::HashSet<PathBuf>,
 
     // LLM / AI Chat config & state
     pub llm_provider: String,
@@ -320,8 +345,30 @@ pub struct IkIdeApp {
     pub agent_hide_system: bool,
     /// Opt-in: use the agent as the IDE's code assistant (reserved).
     pub agent_as_code_assistant: bool,
+    /// Preferred reply language ("auto" or a human language name).
+    pub response_language: String,
+    /// User-provided context preloaded (hidden) into every agent turn.
+    pub agent_context: String,
+    /// Command line for the "custom" agent provider (see settings).
+    pub custom_agent_command: String,
+    /// Editable invocation presets for the built-in Claude/Codex CLIs.
+    pub claude_command: String,
+    pub codex_command: String,
+    /// User-configurable keyboard shortcuts.
+    pub keymap: crate::core::keymap::Keymap,
+    /// Index (into `Keymap::entries`) of the shortcut currently listening for a
+    /// new key combo in Preferences, if any.
+    pub rebinding: Option<usize>,
+    /// Selected category in the Preferences window (UI state, not persisted).
+    pub pref_section: PrefSection,
 
     pub ai_chat_input: String,
+    /// Inline "AI edit" prompt box (code-assistant), open via Ctrl+I.
+    pub ai_edit_open: bool,
+    pub ai_edit_input: String,
+    /// When the AI edit prompt was opened from a selection, the selected
+    /// snippet is stashed here so the request is scoped to it.
+    pub ai_edit_selection: Option<String>,
     pub ai_chat_history: Vec<crate::core::agent::ChatMessage>,
     pub ai_agent_running: bool,
     pub ai_agent_status: String,
@@ -465,9 +512,14 @@ impl Default for IkIdeApp {
             last_edit: None,
             last_checked_content: String::new(),
             action_popup: ActionPopup::None,
+            explorer_selection: std::collections::HashSet::new(),
 
-            // LLM initialization
-            llm_provider: settings.llm_provider.clone(),
+            // LLM initialization. Gemini was removed; migrate old configs to Claude.
+            llm_provider: if settings.llm_provider == "gemini" {
+                "claude".to_string()
+            } else {
+                settings.llm_provider.clone()
+            },
             llm_api_key: settings.llm_api_key.clone(),
             llm_model: settings.llm_model.clone(),
             llm_endpoint: settings.llm_endpoint.clone(),
@@ -477,8 +529,19 @@ impl Default for IkIdeApp {
             agent_autonomy: settings.agent_autonomy.clone(),
             agent_hide_system: settings.agent_hide_system,
             agent_as_code_assistant: settings.agent_as_code_assistant,
+            response_language: settings.response_language.clone(),
+            agent_context: settings.agent_context.clone(),
+            custom_agent_command: settings.custom_agent_command.clone(),
+            claude_command: settings.claude_command.clone(),
+            codex_command: settings.codex_command.clone(),
+            keymap: settings.keymap.clone(),
+            rebinding: None,
+            pref_section: PrefSection::AiAssistant,
 
             ai_chat_input: String::new(),
+            ai_edit_open: false,
+            ai_edit_input: String::new(),
+            ai_edit_selection: None,
             ai_chat_history: Vec::new(),
             ai_agent_running: false,
             ai_agent_status: "Idle".to_string(),
@@ -507,6 +570,425 @@ impl IkIdeApp {
     }
 
     /// Snapshot the current preferences / layout / open project for saving.
+    /// Preferences → AI Assistant: agent CLI, autonomy, chat display, code
+    /// assistant, reply language and the hidden preloaded context.
+    fn render_pref_ai(&mut self, ui: &mut egui::Ui) {
+        egui::Grid::new("ai_chat_grid").num_columns(2).spacing([10.0, 10.0]).show(ui, |ui| {
+            ui.label("Agent CLI:");
+            {
+                // Supported agent CLIs. Add a row here to expose a new one.
+                const AGENTS: [(&str, &str); 3] = [
+                    ("claude", "Claude Code"),
+                    ("codex", "Codex"),
+                    ("custom", "Custom command"),
+                ];
+                let current = AGENTS
+                    .iter()
+                    .find(|(id, _)| *id == self.llm_provider)
+                    .map(|(_, label)| label.to_string())
+                    .unwrap_or_else(|| self.llm_provider.clone());
+                egui::ComboBox::from_id_salt("agent_cli_select")
+                    .selected_text(current)
+                    .show_ui(ui, |ui| {
+                        for (id, label) in AGENTS {
+                            if ui
+                                .selectable_value(&mut self.llm_provider, id.to_string(), label)
+                                .clicked()
+                            {
+                                self.agent_cli_command = id.to_string();
+                            }
+                        }
+                    });
+            }
+            ui.end_row();
+
+            ui.label("Reply language:");
+            {
+                // "auto" mirrors the user's message; the rest force a language.
+                const LANGS: [&str; 8] = [
+                    "auto", "Português", "English", "Español", "Français", "Deutsch", "Italiano", "Japanese",
+                ];
+                let shown = if self.response_language.trim().is_empty()
+                    || self.response_language == "auto"
+                {
+                    "Auto (match my message)".to_string()
+                } else {
+                    self.response_language.clone()
+                };
+                egui::ComboBox::from_id_salt("reply_lang_select")
+                    .selected_text(shown)
+                    .show_ui(ui, |ui| {
+                        for l in LANGS {
+                            let label = if l == "auto" { "Auto (match my message)" } else { l };
+                            ui.selectable_value(&mut self.response_language, l.to_string(), label);
+                        }
+                    });
+            }
+            ui.end_row();
+
+            ui.label("Autonomy:");
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.agent_autonomy, "edits".to_string(), "Auto-edit")
+                    .on_hover_text("Auto-approve file edits and ikmcp tools (recommended).");
+                ui.selectable_value(&mut self.agent_autonomy, "yolo".to_string(), "Full (YOLO)")
+                    .on_hover_text("Auto-approve everything, including shell commands.");
+                ui.selectable_value(&mut self.agent_autonomy, "readonly".to_string(), "Read-only")
+                    .on_hover_text("No file changes; read and analyze only.");
+            });
+            ui.end_row();
+
+            ui.label("Chat:");
+            let mut show_sys = !self.agent_hide_system;
+            if ui.checkbox(&mut show_sys, "Show tool/system activity")
+                .on_hover_text("Show the agent's tool calls and system messages in the chat.")
+                .changed()
+            {
+                self.agent_hide_system = !show_sys;
+            }
+            ui.end_row();
+
+            ui.label("Code assistant:");
+            let assist_hint = format!(
+                "Enables {} and the selection actions (AI Edit / Explain) in the editor.",
+                self.keymap.ai_edit.label()
+            );
+            ui.checkbox(&mut self.agent_as_code_assistant, "Enable as code assistant")
+                .on_hover_text(assist_hint);
+            ui.end_row();
+        });
+
+        // Provider command. The built-in CLIs expose their full invocation as an
+        // editable preset, so a CLI flag change can be fixed here without a new
+        // IDE build. The custom provider is a free-form command.
+        ui.add_space(6.0);
+        match self.llm_provider.as_str() {
+            "custom" => {
+                ui.label(egui::RichText::new("Custom command").strong());
+                ui.label(
+                    egui::RichText::new(
+                        "First token is the executable; {prompt} is replaced with the message (else appended last). No MCP/ide_* wiring.",
+                    )
+                    .small()
+                    .weak(),
+                );
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.custom_agent_command)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("e.g. my-llm --stdin {prompt}"),
+                );
+            }
+            "claude" => Self::render_command_preset(
+                ui,
+                "Claude command preset",
+                &mut self.claude_command,
+                crate::core::settings::DEFAULT_CLAUDE_COMMAND,
+            ),
+            "codex" => Self::render_command_preset(
+                ui,
+                "Codex command preset",
+                &mut self.codex_command,
+                crate::core::settings::DEFAULT_CODEX_COMMAND,
+            ),
+            _ => {}
+        }
+
+        ui.add_space(8.0);
+        ui.label(egui::RichText::new("Preloaded context").strong());
+        ui.label(
+            egui::RichText::new(
+                "Sent silently with every message (hidden from the chat): project notes, target board, conventions.",
+            )
+            .small()
+            .weak(),
+        );
+        ui.add(
+            egui::TextEdit::multiline(&mut self.agent_context)
+                .desired_rows(4)
+                .desired_width(f32::INFINITY)
+                .hint_text("e.g. Target ATmega328P @ 16 MHz. Prefer interrupt-driven UART. Keep ISRs short."),
+        );
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new("Sign in once in a terminal (e.g. claude or codex).")
+                .weak()
+                .small(),
+        );
+    }
+
+    /// Editable command preset for a built-in agent CLI, with a reset button.
+    /// Static so it borrows only the one command string, not all of `self`.
+    fn render_command_preset(ui: &mut egui::Ui, title: &str, command: &mut String, default: &str) {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(title).strong());
+            if ui.small_button("Reset").on_hover_text("Restore the shipped default").clicked() {
+                *command = default.to_string();
+            }
+        });
+        ui.label(
+            egui::RichText::new(
+                "Placeholders: {prompt} {guidance} {mcp} {exe} {autonomy} {full_prompt}. Edit if the CLI's flags change.",
+            )
+            .small()
+            .weak(),
+        );
+        ui.add(
+            egui::TextEdit::multiline(command)
+                .desired_rows(3)
+                .desired_width(f32::INFINITY)
+                .font(egui::TextStyle::Monospace),
+        );
+    }
+
+    /// Preferences → Shortcuts: list every command binding and rebind it.
+    fn render_pref_shortcuts(&mut self, ui: &mut egui::Ui) {
+        ui.label(
+            egui::RichText::new("Click Rebind, then press the new key combination.")
+                .small()
+                .weak(),
+        );
+        ui.add_space(4.0);
+
+        // If a rebind is in progress, capture the next key press (Esc cancels).
+        if let Some(active) = self.rebinding {
+            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                self.rebinding = None;
+            } else if let Some(press) = ui.input(crate::core::keymap::captured_press) {
+                // Ignore a lone modifier or the Escape used to cancel.
+                if press.key != "Escape" && !press.key.is_empty() {
+                    // Pressing Enter/Tab while listening is a poor binding; allow
+                    // anything else. Apply to the active entry.
+                    if let Some((_, sc)) = self.keymap.entries().get_mut(active) {
+                        **sc = press;
+                    }
+                    self.rebinding = None;
+                }
+            }
+        }
+
+        let rebinding = self.rebinding;
+        egui::Grid::new("shortcuts_grid").num_columns(3).spacing([12.0, 8.0]).show(ui, |ui| {
+            for (idx, (label, sc)) in self.keymap.entries().into_iter().enumerate() {
+                ui.label(label);
+                if rebinding == Some(idx) {
+                    ui.label(egui::RichText::new("press keys…").italics().color(egui::Color32::from_rgb(120, 200, 255)));
+                } else {
+                    ui.label(egui::RichText::new(sc.label()).monospace());
+                }
+                if rebinding == Some(idx) {
+                    if ui.button("Cancel").clicked() {
+                        self.rebinding = None;
+                    }
+                } else if ui.button("Rebind").clicked() {
+                    self.rebinding = Some(idx);
+                }
+                ui.end_row();
+            }
+        });
+
+        ui.add_space(8.0);
+        if ui.button("Reset all to defaults").clicked() {
+            self.keymap = crate::core::keymap::Keymap::default();
+            self.rebinding = None;
+        }
+    }
+
+    /// Preferences → Simulation: ik8bvm run options.
+    fn render_pref_simulation(&mut self, ui: &mut egui::Ui) {
+        egui::Grid::new("sim_grid").num_columns(2).spacing([10.0, 10.0]).show(ui, |ui| {
+            ui.label("Max Instructions:");
+            ui.add(egui::DragValue::new(&mut self.vm_max_cycles).speed(1000).range(0..=1_000_000_000))
+                .on_hover_text("Stop after this many executed instructions. 0 = run until the core halts.");
+            ui.end_row();
+
+            ui.label("Instruction Trace:");
+            ui.checkbox(&mut self.sim_trace, "Log each executed instruction (-t)")
+                .on_hover_text("Capture a per-instruction trace into the log. Capped to keep the UI responsive.");
+            ui.end_row();
+
+            ui.label("Dump Registers:");
+            ui.checkbox(&mut self.sim_dump_regs, "Append register/flag dump to the log");
+            ui.end_row();
+
+            ui.label("Memory Peek Addr:");
+            ui.text_edit_singleline(&mut self.sim_peek_addr)
+                .on_hover_text("Data-space address to read at the end of the run (0x-hex or decimal). Blank = off.");
+            ui.end_row();
+
+            ui.label("Peek Length:");
+            ui.add(egui::DragValue::new(&mut self.sim_peek_len).speed(1).range(1..=256));
+            ui.end_row();
+        });
+    }
+
+    /// Preferences → Upload: method choice plus avrdude and bootloader options.
+    fn render_pref_upload(&mut self, ui: &mut egui::Ui) {
+        ui.label(egui::RichText::new("Upload method").strong());
+        ui.horizontal(|ui| {
+            ui.radio_value(&mut self.use_bootloader, true, "Bootloader")
+                .on_hover_text("Flash through the ik serial bootloader running on the board.");
+            ui.radio_value(&mut self.use_bootloader, false, "avrdude")
+                .on_hover_text("Flash with an external programmer via avrdude.");
+        });
+        ui.label(egui::RichText::new("\"Upload to Board\" uses the selected method.").small().weak());
+        ui.add_space(5.0);
+
+        egui::CollapsingHeader::new("Avrdude Configuration").default_open(!self.use_bootloader).show(ui, |ui| {
+            ui.add_enabled_ui(!self.use_bootloader, |ui| {
+            egui::Grid::new("avrdude_grid").num_columns(2).spacing([10.0, 10.0]).show(ui, |ui| {
+                ui.label("Executable Path:");
+                ui.text_edit_singleline(&mut self.avrdude_path);
+                ui.end_row();
+
+                ui.label("Target MCU:");
+                let items: Vec<(String, String)> = self.devices.iter().map(|(d, _)| (d.clone(), d.clone())).collect();
+                let sel = if self.avrdude_target.is_empty() { "Select MCU...".to_string() } else { self.avrdude_target.clone() };
+                if let Some(d) = crate::ui::widgets::filter_combo(ui, "mcu_target", &sel, &items) {
+                    self.avrdude_target = d;
+                }
+                ui.end_row();
+
+                ui.label("Programmer:");
+                egui::ComboBox::from_id_salt("programmer_target")
+                    .selected_text(&self.avrdude_programmer)
+                    .show_ui(ui, |ui| {
+                        for p in ["arduino", "usbasp", "usbtiny", "avrispmkII", "stk500v1", "stk500v2", "micronucleus"] {
+                            ui.selectable_value(&mut self.avrdude_programmer, p.to_string(), p);
+                        }
+                    });
+                ui.end_row();
+
+                ui.label("Port:");
+                ui.text_edit_singleline(&mut self.avrdude_port);
+                ui.end_row();
+
+                ui.label("Baudrate (opt):");
+                ui.text_edit_singleline(&mut self.avrdude_baudrate);
+                ui.end_row();
+
+                ui.label("Additional Flags:");
+                ui.text_edit_singleline(&mut self.avrdude_additional_flags);
+                ui.end_row();
+            });
+            });
+        });
+
+        ui.add_space(5.0);
+        egui::CollapsingHeader::new("Bootloader Upload").default_open(true).show(ui, |ui| {
+            ui.label(egui::RichText::new(
+                "Flash through the ik serial bootloader running on the board.",
+            ).small().weak());
+            egui::Grid::new("bootloader_grid").num_columns(2).spacing([10.0, 10.0]).show(ui, |ui| {
+                ui.label("Serial Port:");
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.bootloader_port)
+                            .desired_width(160.0)
+                            .hint_text("/dev/ttyUSB0"),
+                    );
+                    egui::ComboBox::from_id_salt("bootloader_port_pick")
+                        .selected_text("▾")
+                        .width(16.0)
+                        .show_ui(ui, |ui| {
+                            let ports = crate::core::serial::list_ports();
+                            if ports.is_empty() {
+                                ui.label(egui::RichText::new("no ports found").weak());
+                            }
+                            for p in ports {
+                                ui.selectable_value(&mut self.bootloader_port, p.clone(), p);
+                            }
+                        });
+                });
+                ui.end_row();
+
+                ui.label("Baud:");
+                let mut baud_str = self.bootloader_baud.to_string();
+                if ui.text_edit_singleline(&mut baud_str).changed() {
+                    if let Ok(b) = baud_str.trim().parse::<u32>() {
+                        self.bootloader_baud = b;
+                    }
+                }
+                ui.end_row();
+            });
+            ui.label(egui::RichText::new(
+                "Baud must match the bootloader's BL_UBRR (default 9600 @ 8 MHz).",
+            ).small().weak());
+        });
+    }
+
+    /// Preferences → Burn Bootloader: compile + flash the stock bootloader.
+    fn render_pref_burn(&mut self, ui: &mut egui::Ui) {
+        ui.label(egui::RichText::new(
+            "Compile the standard bootloader for a target chip and write it using avrdude with fuses.",
+        ).small().weak());
+
+        egui::Grid::new("burn_bootloader_grid").num_columns(2).spacing([10.0, 10.0]).show(ui, |ui| {
+            ui.label("Executable Path:");
+            ui.text_edit_singleline(&mut self.burn_path);
+            ui.end_row();
+
+            ui.label("Target MCU:");
+            let items: Vec<(String, String)> = self
+                .devices
+                .iter()
+                .filter(|(d, _)| crate::core::bootloader::has_bootloader_support(d))
+                .map(|(d, _)| (d.clone(), d.clone()))
+                .collect();
+            let display_text = if self.burn_target.is_empty() { "Select MCU...".to_string() } else { self.burn_target.clone() };
+            if let Some(d) = crate::ui::widgets::filter_combo(ui, "burn_target_pick", &display_text, &items) {
+                self.burn_target = d;
+                self.burn_additional_flags = crate::core::bootloader::suggest_burn_fuse_flags(&self.burn_target);
+            }
+            ui.end_row();
+
+            ui.label("Clock F_CPU (Hz):");
+            ui.add(egui::DragValue::new(&mut self.burn_f_cpu).speed(1000000).range(1_000_000..=32_000_000))
+                .on_hover_text("Calculates the bootloader UART divisor based on this crystal/internal clock frequency.");
+            ui.end_row();
+
+            ui.label("Baudrate (bps):");
+            let mut baud_str = self.burn_baud.to_string();
+            if ui.text_edit_singleline(&mut baud_str).changed() {
+                if let Ok(b) = baud_str.trim().parse::<u32>() {
+                    self.burn_baud = b;
+                }
+            }
+            ui.end_row();
+
+            ui.label("Programmer:");
+            egui::ComboBox::from_id_salt("burn_programmer_pick")
+                .selected_text(&self.burn_programmer)
+                .show_ui(ui, |ui| {
+                    for p in ["arduino", "usbasp", "usbtiny", "avrispmkII", "stk500v1", "stk500v2", "micronucleus"] {
+                        ui.selectable_value(&mut self.burn_programmer, p.to_string(), p);
+                    }
+                });
+            ui.end_row();
+
+            ui.label("Port:");
+            ui.text_edit_singleline(&mut self.burn_port);
+            ui.end_row();
+
+            ui.label("Baudrate (opt):");
+            ui.text_edit_singleline(&mut self.burn_baudrate);
+            ui.end_row();
+
+            ui.label("Additional Flags:");
+            ui.text_edit_singleline(&mut self.burn_additional_flags)
+                .on_hover_text("Specify avrdude flags here, including fuses (e.g. -U lfuse:w:0xFF:m -U hfuse:w:0xD8:m).");
+            ui.end_row();
+        });
+
+        ui.add_space(5.0);
+        ui.horizontal(|ui| {
+            let can_burn = !self.is_busy && !self.burn_target.is_empty();
+            ui.add_enabled_ui(can_burn, |ui| {
+                if ui.button("Burn Bootloader").clicked() {
+                    self.trigger_burn_bootloader();
+                }
+            });
+        });
+    }
+
     pub fn current_settings(&self) -> crate::core::settings::Settings {
         crate::core::settings::Settings {
             last_workspace: self.workspace_dir.clone(),
@@ -552,6 +1034,12 @@ impl IkIdeApp {
             agent_autonomy: self.agent_autonomy.clone(),
             agent_hide_system: self.agent_hide_system,
             agent_as_code_assistant: self.agent_as_code_assistant,
+            response_language: self.response_language.clone(),
+            agent_context: self.agent_context.clone(),
+            custom_agent_command: self.custom_agent_command.clone(),
+            claude_command: self.claude_command.clone(),
+            codex_command: self.codex_command.clone(),
+            keymap: self.keymap.clone(),
         }
     }
 
@@ -1029,7 +1517,7 @@ impl IkIdeApp {
         self.task_tx = tx;
         self.task_rx = rx;
         self.is_busy = false;
-        let note = format!("{} ⏹ Cancelled.\n", now_ts());
+        let note = format!("{} Cancelled.\n", now_ts());
         if self.busy_writes_vm {
             self.vm_output.push_str(&note);
         } else {
@@ -1056,6 +1544,175 @@ impl IkIdeApp {
                         };
                 }
             }
+        }
+    }
+
+    /// Begin one agent turn for `prompt`, showing it in the AI chat. Shared by
+    /// the chat input and the in-editor code assistant.
+    pub fn start_agent_turn(&mut self, prompt: String, ctx: &egui::Context) {
+        if prompt.trim().is_empty() || self.ai_agent_running {
+            return;
+        }
+        self.show_ai_chat = true;
+        self.ai_chat_history.push(crate::core::agent::ChatMessage {
+            role: "user".to_string(),
+            content: prompt.clone(),
+        });
+        self.ai_agent_running = true;
+        self.ai_agent_status = "Starting agent...".to_string();
+
+        // The CLI agent is stateless across turns, so feed it the conversation so
+        // far (user/assistant turns only). Without this each message starts fresh
+        // and the agent loses all context (e.g. a follow-up "sim" means nothing).
+        let agent_prompt = {
+            let turns: Vec<String> = self
+                .ai_chat_history
+                .iter()
+                .filter(|m| m.role == "user" || m.role == "assistant")
+                .map(|m| {
+                    let who = if m.role == "user" { "User" } else { "Assistant" };
+                    format!("{}: {}", who, m.content)
+                })
+                .collect();
+            if turns.len() <= 1 {
+                prompt.clone()
+            } else {
+                // Bound the transcript so it can't grow without limit.
+                const MAX_CHARS: usize = 16_000;
+                let mut transcript = turns.join("\n\n");
+                let n = transcript.chars().count();
+                if n > MAX_CHARS {
+                    transcript = transcript.chars().skip(n - MAX_CHARS).collect();
+                }
+                format!(
+                    "Ongoing conversation in the IDE's AI chat — continue it and reply to the final \
+User message. Earlier turns are context, and any actions you mentioned (edits, compiles, breadboard \
+changes) were really carried out:\n\n{}",
+                    transcript
+                )
+            }
+        };
+
+        let (tx, rx) = mpsc::channel();
+        self.agent_rx = Some(rx);
+        self.agent_tx = Some(tx.clone());
+
+        let workspace_dir = self.workspace_dir.clone();
+        let agent_kind = self.llm_provider.clone();
+        let autonomy = self.agent_autonomy.clone();
+        let active_file = self
+            .active_tab
+            .and_then(|i| self.open_tabs.get(i))
+            .map(|t| t.path.clone());
+        let cfg = crate::core::agent::AgentRunConfig {
+            kind: agent_kind,
+            autonomy,
+            language: self.response_language.clone(),
+            extra_context: self.agent_context.clone(),
+            custom_command: self.custom_agent_command.clone(),
+            claude_command: self.claude_command.clone(),
+            codex_command: self.codex_command.clone(),
+        };
+        let ctx_clone = ctx.clone();
+        std::thread::spawn(move || {
+            crate::core::agent::run_cli_agent(workspace_dir, cfg, agent_prompt, active_file, tx);
+            ctx_clone.request_repaint();
+        });
+    }
+
+    /// Code assistant: save the active file and ask the agent to apply
+    /// `instruction` to it directly. Gated by the code-assistant flag.
+    pub fn start_code_assist(&mut self, instruction: String, ctx: &egui::Context) {
+        if instruction.trim().is_empty() || self.ai_agent_running {
+            return;
+        }
+        self.save_active_file();
+        let path = self
+            .active_tab
+            .and_then(|i| self.open_tabs.get(i))
+            .map(|t| t.path.display().to_string())
+            .unwrap_or_default();
+        // If the request was opened from a selection, scope it to that snippet
+        // so the agent edits the right place instead of the whole file.
+        let prompt = match self.ai_edit_selection.take() {
+            Some(sel) => format!(
+                "{}\n\nApply this to the following selected snippet from the file currently open in the editor ({}):\n\n```\n{}\n```\n\nEdit that file directly, changing only what the request needs.",
+                instruction.trim(),
+                path,
+                sel
+            ),
+            None => format!(
+                "{}\n\n(Apply this to the file currently open in the editor: {}. Edit that file directly.)",
+                instruction.trim(),
+                path
+            ),
+        };
+        self.start_agent_turn(prompt, ctx);
+    }
+
+    /// The inline "AI edit" prompt (Ctrl+I), shown when the code assistant is on.
+    pub fn render_ai_edit(&mut self, ctx: &egui::Context) {
+        if !self.ai_edit_open {
+            return;
+        }
+        let mut submit = false;
+        let mut close = false;
+        egui::Window::new("AI Edit")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_TOP, [0.0, 80.0])
+            .show(ctx, |ui| {
+                match &self.ai_edit_selection {
+                    Some(_) => ui.label(egui::RichText::new("Ask the AI to edit the selection").strong()),
+                    None => ui.label(egui::RichText::new("Ask the AI to edit this file").strong()),
+                };
+                if let Some(sel) = &self.ai_edit_selection {
+                    let preview: String = sel.chars().take(80).collect();
+                    let ell = if sel.chars().count() > 80 { "…" } else { "" };
+                    ui.label(
+                        egui::RichText::new(format!("selection: {}{}", preview.replace('\n', " "), ell))
+                            .monospace()
+                            .small()
+                            .weak(),
+                    );
+                }
+                ui.add_space(4.0);
+                let resp = ui.add_sized(
+                    [360.0, 28.0],
+                    egui::TextEdit::singleline(&mut self.ai_edit_input)
+                        .hint_text("e.g. add a comment to each function"),
+                );
+                resp.request_focus();
+                if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    submit = true;
+                }
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Send").clicked() {
+                        submit = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        close = true;
+                    }
+                });
+                ui.label(
+                    egui::RichText::new("The agent edits the open file; the editor reloads when it's done.")
+                        .weak()
+                        .small(),
+                );
+            });
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            close = true;
+        }
+        if submit {
+            let instr = self.ai_edit_input.trim().to_string();
+            self.ai_edit_open = false;
+            self.ai_edit_input.clear();
+            self.start_code_assist(instr, ctx);
+        } else if close {
+            self.ai_edit_open = false;
+            self.ai_edit_input.clear();
+            self.ai_edit_selection = None;
         }
     }
 
@@ -1370,7 +2027,7 @@ impl IkIdeApp {
                 });
             }
             ActionPopup::CreateFile { parent_dir, new_name } => {
-                egui::Window::new("Create File").title_bar(false).collapsible(false).resizable(false).show(ctx, |ui| {
+                egui::Window::new("📄 Create File").title_bar(false).collapsible(false).resizable(false).show(ctx, |ui| {
                     ui.label(egui::RichText::new("📄 Create File").strong());
                     ui.separator();
                     let dir_clone = parent_dir.clone();
@@ -1400,7 +2057,7 @@ impl IkIdeApp {
                 });
             }
             ActionPopup::CreateDir { parent_dir, new_name } => {
-                egui::Window::new("Create Directory").title_bar(false).collapsible(false).resizable(false).show(ctx, |ui| {
+                egui::Window::new("📁 Create Directory").title_bar(false).collapsible(false).resizable(false).show(ctx, |ui| {
                     ui.label(egui::RichText::new("📁 Create Directory").strong());
                     ui.separator();
                     let dir_clone = parent_dir.clone();
@@ -1429,18 +2086,24 @@ impl IkIdeApp {
                     });
                 });
             }
-            ActionPopup::Delete { path } => {
+            ActionPopup::Delete { paths } => {
                 egui::Window::new("Delete").title_bar(false).collapsible(false).resizable(false).show(ctx, |ui| {
-                    ui.label(egui::RichText::new("🗑 Confirm Delete").strong());
+                    ui.label(egui::RichText::new("Confirm Delete").strong());
                     ui.separator();
-                    ui.label(format!("Are you sure you want to delete {:?}?", path.file_name().unwrap_or_default()));
-                    let path_clone = path.clone();
+                    let prompt = match paths.as_slice() {
+                        [one] => format!("Are you sure you want to delete {:?}?", one.file_name().unwrap_or_default()),
+                        many => format!("Are you sure you want to delete these {} items?", many.len()),
+                    };
+                    ui.label(prompt);
+                    let paths_clone = paths.clone();
                     ui.horizontal(|ui| {
                         if ui.button("Yes").clicked() {
-                            if path_clone.is_dir() {
-                                let _ = std::fs::remove_dir_all(&path_clone);
-                            } else {
-                                let _ = std::fs::remove_file(&path_clone);
+                            for p in &paths_clone {
+                                if p.is_dir() {
+                                    let _ = std::fs::remove_dir_all(p);
+                                } else {
+                                    let _ = std::fs::remove_file(p);
+                                }
                             }
                             close_popup = true;
                         }
@@ -1454,6 +2117,7 @@ impl IkIdeApp {
         
         if close_popup {
             self.action_popup = ActionPopup::None;
+            self.explorer_selection.clear();
             self.refresh_files();
         }
     }
@@ -1520,9 +2184,21 @@ impl eframe::App for IkIdeApp {
         }
         ctx.request_repaint_after(Duration::from_secs(1));
 
-        // Keyboard shortcuts
-        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::S)) {
+        // Keyboard shortcuts. Suspended while rebinding so the captured combo
+        // doesn't also trigger its command.
+        let shortcuts_live = self.rebinding.is_none();
+        if shortcuts_live && ctx.input(|i| self.keymap.save.pressed(i)) {
             self.save_active_file();
+        }
+
+        // Code assistant: opens the inline "AI edit" prompt for the file.
+        if shortcuts_live
+            && self.agent_as_code_assistant
+            && self.active_is_ik()
+            && !self.ai_agent_running
+            && ctx.input(|i| self.keymap.ai_edit.pressed(i))
+        {
+            self.ai_edit_open = true;
         }
 
         self.handle_background_tasks();
@@ -1550,7 +2226,7 @@ impl eframe::App for IkIdeApp {
         }
 
         // Check shortcuts
-        if ctx.input(|i| i.modifiers.shift && i.key_pressed(egui::Key::R)) {
+        if shortcuts_live && ctx.input(|i| self.keymap.compile.pressed(i)) {
             if !self.is_busy && self.active_is_ik() {
                 self.save_active_file();
                 let _ = self.begin_task(false);
@@ -1564,7 +2240,7 @@ impl eframe::App for IkIdeApp {
             }
         }
 
-        if ctx.input(|i| i.modifiers.shift && i.key_pressed(egui::Key::S)) {
+        if shortcuts_live && ctx.input(|i| self.keymap.simulate.pressed(i)) {
             if !self.is_busy && self.active_is_ik() {
                 let cancel = self.begin_task(true);
                 self.show_vm_trace = true;
@@ -1600,6 +2276,7 @@ impl eframe::App for IkIdeApp {
         }
         
         self.render_popups(ctx);
+        self.render_ai_edit(ctx);
 
         if self.is_busy || self.dialog_rx.is_some() || self.bb_dialog_rx.is_some() {
             ctx.request_repaint();
@@ -1631,7 +2308,8 @@ impl eframe::App for IkIdeApp {
                         self.open_folder_dialog();
                         ui.close_menu();
                     }
-                    if ui.add_enabled(!self.is_busy && self.active_tab.is_some(), egui::Button::new("💾 Save (Ctrl+S)")).clicked() {
+                    let save_label = format!("💾 Save ({})", self.keymap.save.label());
+                    if ui.add_enabled(!self.is_busy && self.active_tab.is_some(), egui::Button::new(save_label)).clicked() {
                         self.save_active_file();
                         ui.close_menu();
                     }
@@ -1645,6 +2323,17 @@ impl eframe::App for IkIdeApp {
                             self.open_tabs[idx].is_modified = true;
                         }
                         ui.close_menu();
+                    }
+                    if self.agent_as_code_assistant {
+                        let ai_label = format!("AI Edit ({})", self.keymap.ai_edit.label());
+                        if ui
+                            .add_enabled(self.active_is_ik() && !self.ai_agent_running, egui::Button::new(ai_label))
+                            .on_hover_text("Ask the AI agent to edit the open file.")
+                            .clicked()
+                        {
+                            self.ai_edit_open = true;
+                            ui.close_menu();
+                        }
                     }
                 });
                 
@@ -1664,7 +2353,8 @@ impl eframe::App for IkIdeApp {
                 });
                 
                 ui.menu_button("Run", |ui| {
-                    if ui.add_enabled(!self.is_busy && self.active_is_ik(), egui::Button::new("🔨 Compile (Shift+R)")).clicked() {
+                    let compile_label = format!("🔨 Compile ({})", self.keymap.compile.label());
+                    if ui.add_enabled(!self.is_busy && self.active_is_ik(), egui::Button::new(compile_label)).clicked() {
                         self.save_active_file();
                         let _ = self.begin_task(false);
                         self.show_terminal = true;
@@ -1676,7 +2366,8 @@ impl eframe::App for IkIdeApp {
                         runner::spawn_compile(self.workspace_dir.clone(), path, content, self.task_tx.clone());
                         ui.close_menu();
                     }
-                    if ui.add_enabled(!self.is_busy && self.active_is_ik(), egui::Button::new("🚀 Simulate (Shift+S)")).clicked() {
+                    let simulate_label = format!("🚀 Simulate ({})", self.keymap.simulate.label());
+                    if ui.add_enabled(!self.is_busy && self.active_is_ik(), egui::Button::new(simulate_label)).clicked() {
                         let cancel = self.begin_task(true);
                         self.show_vm_trace = true;
                         self.vm_output.clear();
@@ -1688,7 +2379,7 @@ impl eframe::App for IkIdeApp {
                         runner::spawn_simulate(self.workspace_dir.clone(), path, text, self.task_tx.clone(), self.sim_config(), cancel);
                         ui.close_menu();
                     }
-                    if ui.add_enabled(!self.is_busy, egui::Button::new("🧪 Run Tests")).clicked() {
+                    if ui.add_enabled(!self.is_busy, egui::Button::new("Run Tests")).clicked() {
                         self.save_active_file();
                         let cancel = self.begin_task(false);
                         self.show_terminal = true;
@@ -1741,7 +2432,7 @@ impl eframe::App for IkIdeApp {
                 
                 if self.is_busy {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("⏹ Stop").on_hover_text("Cancel the running task").clicked() {
+                        if ui.button("Stop").on_hover_text("Cancel the running task").clicked() {
                             self.abandon_task();
                         }
                         ui.label("Working...");
@@ -1754,276 +2445,53 @@ impl eframe::App for IkIdeApp {
         if self.show_preferences {
             let mut show = self.show_preferences;
             let mut close = false;
+            // Fixed size: a content-sized window with INFINITY-width fields feeds
+            // back into the layout and grows every frame, so we pin the size and
+            // bound the inner width instead.
             egui::Window::new("Preferences")
                 .title_bar(false)
                 .collapsible(false)
                 .resizable(false)
+                .fixed_size(egui::vec2(700.0, 560.0))
                 .open(&mut show)
                 .show(ctx, |ui| {
-                    ui.label(egui::RichText::new("⚙ Preferences").strong());
+                    ui.label(egui::RichText::new("Preferences").strong());
                     ui.separator();
 
-                    egui::ScrollArea::vertical().max_height(450.0).show(ui, |ui| {
-                        egui::CollapsingHeader::new("Simulation").default_open(true).show(ui, |ui| {
-                            egui::Grid::new("sim_grid").num_columns(2).spacing([10.0, 10.0]).show(ui, |ui| {
-                                ui.label("Max Instructions:");
-                                ui.add(egui::DragValue::new(&mut self.vm_max_cycles).speed(1000).range(0..=1_000_000_000))
-                                    .on_hover_text("Stop after this many executed instructions. 0 = run until the core halts.");
-                                ui.end_row();
-
-                                ui.label("Instruction Trace:");
-                                ui.checkbox(&mut self.sim_trace, "Log each executed instruction (-t)")
-                                    .on_hover_text("Capture a per-instruction trace into the log. Capped to keep the UI responsive.");
-                                ui.end_row();
-
-                                ui.label("Dump Registers:");
-                                ui.checkbox(&mut self.sim_dump_regs, "Append register/flag dump to the log");
-                                ui.end_row();
-
-                                ui.label("Memory Peek Addr:");
-                                ui.text_edit_singleline(&mut self.sim_peek_addr)
-                                    .on_hover_text("Data-space address to read at the end of the run (0x-hex or decimal). Blank = off.");
-                                ui.end_row();
-
-                                ui.label("Peek Length:");
-                                ui.add(egui::DragValue::new(&mut self.sim_peek_len).speed(1).range(1..=256));
-                                ui.end_row();
-                            });
-                        });
-
-                        ui.add_space(5.0);
-
-                        egui::CollapsingHeader::new("AI Chat").default_open(true).show(ui, |ui| {
-                            egui::Grid::new("ai_chat_grid").num_columns(2).spacing([10.0, 10.0]).show(ui, |ui| {
-                                ui.label("Agent CLI:");
+                    // Left: one entry per category. Right: only the selected
+                    // category's settings, so nothing is stacked together.
+                    ui.horizontal_top(|ui| {
+                        ui.vertical(|ui| {
+                            ui.set_min_width(150.0);
+                            ui.set_max_width(150.0);
+                            for (section, label) in PrefSection::ALL {
+                                if ui
+                                    .selectable_label(self.pref_section == section, label)
+                                    .clicked()
                                 {
-                                    // Supported agent CLIs. Add a row here to expose a new one.
-                                    const AGENTS: [(&str, &str); 3] = [
-                                        ("claude", "Claude Code"),
-                                        ("codex", "Codex"),
-                                        ("gemini", "Gemini"),
-                                    ];
-                                    let current = AGENTS
-                                        .iter()
-                                        .find(|(id, _)| *id == self.llm_provider)
-                                        .map(|(_, label)| label.to_string())
-                                        .unwrap_or_else(|| self.llm_provider.clone());
-                                    egui::ComboBox::from_id_salt("agent_cli_select")
-                                        .selected_text(current)
-                                        .show_ui(ui, |ui| {
-                                            for (id, label) in AGENTS {
-                                                if ui
-                                                    .selectable_value(&mut self.llm_provider, id.to_string(), label)
-                                                    .clicked()
-                                                {
-                                                    self.agent_cli_command = id.to_string();
-                                                }
-                                            }
-                                        });
+                                    self.pref_section = section;
                                 }
-                                ui.end_row();
-
-                                ui.label("Autonomy:");
-                                ui.horizontal(|ui| {
-                                    ui.selectable_value(&mut self.agent_autonomy, "edits".to_string(), "Auto-edit")
-                                        .on_hover_text("Auto-approve file edits and ikmcp tools (recommended).");
-                                    ui.selectable_value(&mut self.agent_autonomy, "yolo".to_string(), "Full (YOLO)")
-                                        .on_hover_text("Auto-approve everything, including shell commands.");
-                                    ui.selectable_value(&mut self.agent_autonomy, "readonly".to_string(), "Read-only")
-                                        .on_hover_text("No file changes; read and analyze only.");
-                                });
-                                ui.end_row();
-
-                                ui.label("Chat:");
-                                let mut show_sys = !self.agent_hide_system;
-                                if ui.checkbox(&mut show_sys, "Show tool/system activity")
-                                    .on_hover_text("Show the agent's tool calls and system messages in the chat.")
-                                    .changed()
-                                {
-                                    self.agent_hide_system = !show_sys;
-                                }
-                                ui.end_row();
-
-                                ui.label("Code assistant:");
-                                ui.checkbox(&mut self.agent_as_code_assistant, "Enable as code assistant")
-                                    .on_hover_text("Use this agent for inline code suggestions and helpers across the IDE. (Reserved — integration coming.)");
-                                ui.end_row();
-                            });
-                            ui.label(egui::RichText::new(
-                                "Sign in once in a terminal: claude, codex or gemini.",
-                            ).weak().small());
+                            }
                         });
-
-                        ui.add_space(5.0);
-
-                        ui.label(egui::RichText::new("Upload method").strong());
-                        ui.horizontal(|ui| {
-                            ui.radio_value(&mut self.use_bootloader, true, "Bootloader")
-                                .on_hover_text("Flash through the ik serial bootloader running on the board.");
-                            ui.radio_value(&mut self.use_bootloader, false, "avrdude")
-                                .on_hover_text("Flash with an external programmer via avrdude.");
-                        });
-                        ui.label(egui::RichText::new("\"Upload to Board\" uses the selected method.").small().weak());
-                        ui.add_space(5.0);
-
-                        egui::CollapsingHeader::new("Avrdude Configuration").default_open(!self.use_bootloader).show(ui, |ui| {
-                            ui.add_enabled_ui(!self.use_bootloader, |ui| {
-                            egui::Grid::new("avrdude_grid").num_columns(2).spacing([10.0, 10.0]).show(ui, |ui| {
-                                ui.label("Executable Path:");
-                                ui.text_edit_singleline(&mut self.avrdude_path);
-                                ui.end_row();
-
-                                ui.label("Target MCU:");
-                                let items: Vec<(String, String)> = self.devices.iter().map(|(d, _)| (d.clone(), d.clone())).collect();
-                                let sel = if self.avrdude_target.is_empty() { "Select MCU...".to_string() } else { self.avrdude_target.clone() };
-                                if let Some(d) = crate::ui::widgets::filter_combo(ui, "mcu_target", &sel, &items) {
-                                    self.avrdude_target = d;
-                                }
-                                ui.end_row();
-                                
-                                ui.label("Programmer:");
-                                egui::ComboBox::from_id_salt("programmer_target")
-                                    .selected_text(&self.avrdude_programmer)
-                                    .show_ui(ui, |ui| {
-                                        for p in ["arduino", "usbasp", "usbtiny", "avrispmkII", "stk500v1", "stk500v2", "micronucleus"] {
-                                            ui.selectable_value(&mut self.avrdude_programmer, p.to_string(), p);
-                                        }
-                                    });
-                                ui.end_row();
-                                
-                                ui.label("Port:");
-                                ui.text_edit_singleline(&mut self.avrdude_port);
-                                ui.end_row();
-
-                                ui.label("Baudrate (opt):");
-                                ui.text_edit_singleline(&mut self.avrdude_baudrate);
-                                ui.end_row();
-                                
-                                ui.label("Additional Flags:");
-                                ui.text_edit_singleline(&mut self.avrdude_additional_flags);
-                                ui.end_row();
-                            });
-                            });
-                        });
-
-                        ui.add_space(5.0);
-                        egui::CollapsingHeader::new("Bootloader Upload").default_open(true).show(ui, |ui| {
-                            ui.label(egui::RichText::new(
-                                "Flash through the ik serial bootloader running on the board.",
-                            ).small().weak());
-                            egui::Grid::new("bootloader_grid").num_columns(2).spacing([10.0, 10.0]).show(ui, |ui| {
-                                ui.label("Serial Port:");
-                                ui.horizontal(|ui| {
-                                    ui.add(
-                                        egui::TextEdit::singleline(&mut self.bootloader_port)
-                                            .desired_width(160.0)
-                                            .hint_text("/dev/ttyUSB0"),
-                                    );
-                                    egui::ComboBox::from_id_salt("bootloader_port_pick")
-                                        .selected_text("▾")
-                                        .width(16.0)
-                                        .show_ui(ui, |ui| {
-                                            let ports = crate::core::serial::list_ports();
-                                            if ports.is_empty() {
-                                                ui.label(egui::RichText::new("no ports found").weak());
-                                            }
-                                            for p in ports {
-                                                ui.selectable_value(&mut self.bootloader_port, p.clone(), p);
-                                            }
-                                        });
-                                });
-                                ui.end_row();
-
-                                ui.label("Baud:");
-                                let mut baud_str = self.bootloader_baud.to_string();
-                                if ui.text_edit_singleline(&mut baud_str).changed() {
-                                    if let Ok(b) = baud_str.trim().parse::<u32>() {
-                                        self.bootloader_baud = b;
-                                    }
-                                }
-                                ui.end_row();
-                            });
-                            ui.label(egui::RichText::new(
-                                "Baud must match the bootloader's BL_UBRR (default 9600 @ 8 MHz).",
-                            ).small().weak());
-                        });
-
-                        ui.add_space(5.0);
-                        egui::CollapsingHeader::new("Burn Bootloader").default_open(false).show(ui, |ui| {
-                            ui.label(egui::RichText::new(
-                                "Compile the standard bootloader for a target chip and write it using avrdude with fuses.",
-                            ).small().weak());
-                            
-                            egui::Grid::new("burn_bootloader_grid").num_columns(2).spacing([10.0, 10.0]).show(ui, |ui| {
-                                ui.label("Executable Path:");
-                                ui.text_edit_singleline(&mut self.burn_path);
-                                ui.end_row();
-
-                                ui.label("Target MCU:");
-                                let items: Vec<(String, String)> = self
-                                    .devices
-                                    .iter()
-                                    .filter(|(d, _)| crate::core::bootloader::has_bootloader_support(d))
-                                    .map(|(d, _)| (d.clone(), d.clone()))
-                                    .collect();
-                                let display_text = if self.burn_target.is_empty() { "Select MCU...".to_string() } else { self.burn_target.clone() };
-                                if let Some(d) = crate::ui::widgets::filter_combo(ui, "burn_target_pick", &display_text, &items) {
-                                    self.burn_target = d;
-                                    self.burn_additional_flags = crate::core::bootloader::suggest_burn_fuse_flags(&self.burn_target);
-                                }
-                                ui.end_row();
-
-                                ui.label("Clock F_CPU (Hz):");
-                                ui.add(egui::DragValue::new(&mut self.burn_f_cpu).speed(1000000).range(1_000_000..=32_000_000))
-                                    .on_hover_text("Calculates the bootloader UART divisor based on this crystal/internal clock frequency.");
-                                ui.end_row();
-
-                                ui.label("Baudrate (bps):");
-                                let mut baud_str = self.burn_baud.to_string();
-                                if ui.text_edit_singleline(&mut baud_str).changed() {
-                                    if let Ok(b) = baud_str.trim().parse::<u32>() {
-                                        self.burn_baud = b;
-                                    }
-                                }
-                                ui.end_row();
-
-                                ui.label("Programmer:");
-                                egui::ComboBox::from_id_salt("burn_programmer_pick")
-                                    .selected_text(&self.burn_programmer)
-                                    .show_ui(ui, |ui| {
-                                        for p in ["arduino", "usbasp", "usbtiny", "avrispmkII", "stk500v1", "stk500v2", "micronucleus"] {
-                                            ui.selectable_value(&mut self.burn_programmer, p.to_string(), p);
-                                        }
-                                    });
-                                ui.end_row();
-
-                                ui.label("Port:");
-                                ui.text_edit_singleline(&mut self.burn_port);
-                                ui.end_row();
-
-                                ui.label("Baudrate (opt):");
-                                ui.text_edit_singleline(&mut self.burn_baudrate);
-                                ui.end_row();
-
-                                ui.label("Additional Flags:");
-                                ui.text_edit_singleline(&mut self.burn_additional_flags)
-                                    .on_hover_text("Specify avrdude flags here, including fuses (e.g. -U lfuse:w:0xFF:m -U hfuse:w:0xD8:m).");
-                                ui.end_row();
-                            });
-
-                            ui.add_space(5.0);
-                            ui.horizontal(|ui| {
-                                let can_burn = !self.is_busy && !self.burn_target.is_empty();
-                                ui.add_enabled_ui(can_burn, |ui| {
-                                    if ui.button("🔥 Burn Bootloader").clicked() {
-                                        self.trigger_burn_bootloader();
+                        ui.separator();
+                        ui.vertical(|ui| {
+                            egui::ScrollArea::vertical()
+                                .auto_shrink([false, false])
+                                .max_height(470.0)
+                                .show(ui, |ui| {
+                                    ui.set_width(ui.available_width());
+                                    match self.pref_section {
+                                        PrefSection::AiAssistant => self.render_pref_ai(ui),
+                                        PrefSection::Shortcuts => self.render_pref_shortcuts(ui),
+                                        PrefSection::Simulation => self.render_pref_simulation(ui),
+                                        PrefSection::Upload => self.render_pref_upload(ui),
+                                        PrefSection::BurnBootloader => self.render_pref_burn(ui),
                                     }
                                 });
-                            });
                         });
                     });
 
-                    ui.add_space(10.0);
+                    ui.add_space(8.0);
                     ui.separator();
                     ui.horizontal(|ui| {
                         if ui.button("Save & Close").clicked() {
@@ -2095,7 +2563,7 @@ impl eframe::App for IkIdeApp {
         if self.show_examples {
             let mut show = self.show_examples;
             let mut load_example_idx = None;
-            egui::Window::new("Examples Library")
+            egui::Window::new("📚 Examples Library")
                 .title_bar(false)
                 .collapsible(false)
                 .resizable(false)
@@ -2196,7 +2664,7 @@ impl eframe::App for IkIdeApp {
                             show = false;
                         }
                         if self.workspace_dir.is_none() {
-                            ui.label(egui::RichText::new("⚠️ Open a folder workspace first to load examples.").weak().small());
+                            ui.label(egui::RichText::new("⚠ Open a folder workspace first to load examples.").weak().small());
                         }
                     });
                 });

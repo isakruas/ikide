@@ -46,7 +46,7 @@ pub fn render(app: &mut IkIdeApp, ctx: &egui::Context) {
                         if ui.button("✖").on_hover_text("Close").clicked() {
                             app.show_vm_trace = false;
                         }
-                        if ui.button("🗑 Clear").clicked() {
+                        if ui.button("Clear").clicked() {
                             app.vm_output.clear();
                             app.vm_result = None;
                         }
@@ -92,10 +92,10 @@ fn render_ai_chat(ui: &mut egui::Ui, app: &mut IkIdeApp, ctx: &egui::Context) {
             if ui.button("✖").on_hover_text("Close").clicked() {
                 app.show_ai_chat = false;
             }
-            if ui.button("🗑").on_hover_text("Clear conversation").clicked() {
+            if ui.button("Clear").on_hover_text("Clear conversation").clicked() {
                 app.ai_chat_history.clear();
             }
-            let eye = if app.agent_hide_system { "👁" } else { "🛠" };
+            let eye = if app.agent_hide_system { "Show" } else { "Hide" };
             let hint = if app.agent_hide_system {
                 "Show tool/system activity"
             } else {
@@ -186,7 +186,8 @@ fn render_message(ui: &mut egui::Ui, msg: &crate::core::agent::ChatMessage) {
     ui.group(|ui| {
         ui.set_width(ui.available_width());
         ui.label(egui::RichText::new(label).strong().color(color).small());
-        ui.label(egui::RichText::new(&msg.content));
+        // Wrap the content so a long line can't push the panel wider every frame.
+        ui.add(egui::Label::new(egui::RichText::new(&msg.content)).wrap());
     });
 }
 
@@ -195,37 +196,8 @@ fn send_ai_message(app: &mut IkIdeApp, ctx: &egui::Context) {
     if msg.is_empty() {
         return;
     }
-
-    app.ai_chat_history.push(crate::core::agent::ChatMessage {
-        role: "user".to_string(),
-        content: msg.clone(),
-    });
     app.ai_chat_input.clear();
-
-    app.ai_agent_running = true;
-    app.ai_agent_status = "Starting agent...".to_string();
-
-    let (tx, rx) = std::sync::mpsc::channel();
-    app.agent_rx = Some(rx);
-    app.agent_tx = Some(tx.clone());
-
-    let workspace_dir = app.workspace_dir.clone();
-    let agent_kind = app.llm_provider.clone();
-    let autonomy = app.agent_autonomy.clone();
-    // The file currently open in the editor — the default target for ide_compile
-    // / ide_simulate when the agent doesn't name one.
-    let active_file = app
-        .active_tab
-        .and_then(|i| app.open_tabs.get(i))
-        .map(|t| t.path.clone());
-    let ctx_clone = ctx.clone();
-
-    // Each turn is an independent, headless CLI run wired to ikmcp + the IDE bridge.
-    std::thread::spawn(move || {
-        crate::core::agent::run_cli_agent(workspace_dir, agent_kind, autonomy, msg, active_file, tx);
-        // Request an immediate redraw on thread exit so the final reply shows.
-        ctx_clone.request_repaint();
-    });
+    app.start_agent_turn(msg, ctx);
 }
 
 /// Compact, readable view of the final core state from a simulation run.

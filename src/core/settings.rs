@@ -90,7 +90,34 @@ pub struct Settings {
     /// Opt-in: use the agent as the IDE's code assistant (inline suggestions,
     /// helpers). Reserved for the upcoming assistant integration.
     pub agent_as_code_assistant: bool,
+    /// Preferred language for the agent's replies. "auto" mirrors the language
+    /// of the user's message; otherwise a human language name (e.g. "Português").
+    pub response_language: String,
+    /// Free-form context the user wants preloaded into every agent turn
+    /// (project notes, conventions, target board). Hidden from the chat;
+    /// appended to the hidden system guidance.
+    pub agent_context: String,
+    /// Command line for the "custom" agent provider. `{prompt}` is replaced with
+    /// the guidance + user message; if absent, that text is appended as the last
+    /// argument. Example: `my-llm --stdin {prompt}`.
+    pub custom_agent_command: String,
+    /// Editable invocation preset for the Claude Code CLI. Placeholders:
+    /// `{prompt}`, `{guidance}`, `{mcp}`, `{exe}`, `{autonomy}`, `{full_prompt}`.
+    /// Exposed so a CLI flag change can be fixed here without a new IDE build.
+    pub claude_command: String,
+    /// Editable invocation preset for the Codex CLI (same placeholders).
+    pub codex_command: String,
+    /// User-configurable keyboard shortcuts.
+    pub keymap: crate::core::keymap::Keymap,
 }
+
+/// Default Claude Code invocation. `{autonomy}` expands to its permission-mode
+/// flags; `{prompt}`/`{guidance}`/`{mcp}` to single arguments.
+pub const DEFAULT_CLAUDE_COMMAND: &str = "claude -p {prompt} --append-system-prompt {guidance} --output-format stream-json --verbose --mcp-config {mcp} --strict-mcp-config --allowedTools mcp__ikmcp {autonomy}";
+
+/// Default Codex invocation. `{full_prompt}` folds guidance + message into the
+/// single positional Codex exec expects; `{autonomy}` expands to sandbox flags.
+pub const DEFAULT_CODEX_COMMAND: &str = "codex exec --skip-git-repo-check --json -c mcp_servers.ikmcp.command=\"{exe}\" -c mcp_servers.ikmcp.args=[\"mcp\"] {autonomy} {full_prompt}";
 
 impl Default for Settings {
     fn default() -> Self {
@@ -128,7 +155,7 @@ impl Default for Settings {
             show_minimap: true,
  
             // AI agent defaults. `llm_provider` now selects the CLI agent
-            // (claude/codex/gemini), driven via the user's own subscription —
+            // (claude/codex/custom), driven via the user's own subscription —
             // no API key. The llm_* fields below are retained only for
             // backward-compatible settings round-tripping.
             llm_provider: "claude".to_string(),
@@ -141,6 +168,12 @@ impl Default for Settings {
             agent_autonomy: "edits".to_string(),
             agent_hide_system: true,
             agent_as_code_assistant: false,
+            response_language: "auto".to_string(),
+            agent_context: String::new(),
+            custom_agent_command: String::new(),
+            claude_command: DEFAULT_CLAUDE_COMMAND.to_string(),
+            codex_command: DEFAULT_CODEX_COMMAND.to_string(),
+            keymap: crate::core::keymap::Keymap::default(),
         }
     }
 }

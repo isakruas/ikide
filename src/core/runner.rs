@@ -317,7 +317,7 @@ pub fn spawn_simulate(workspace_dir: Option<PathBuf>, selected_file: Option<Path
             }
             if cancelled {
                 let _ = tx.send(TaskMsg::Vm(format!(
-                    "\n⏹ Cancelled after {} instructions.\n",
+                    "\n Cancelled after {} instructions.\n",
                     executed
                 )));
                 let _ = tx.send(TaskMsg::Done);

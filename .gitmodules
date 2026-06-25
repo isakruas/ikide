@@ -8,3 +8,4 @@
 	path = tools/ikmcp
 	url = git@github.com:isakruas/ikmcp.git
 	branch = rust
+	ignore = dirty

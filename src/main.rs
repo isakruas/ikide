@@ -140,7 +140,7 @@ fn run_tests(rest: &[String], program: &str) -> ! {
 
 /// Serve the bundled ikmcp tools over stdio (Model Context Protocol).
 ///
-/// This is what the IDE's AI agents (the `claude`, `codex` and `gemini` CLIs)
+/// This is what the IDE's AI agents (the `claude` and `codex` CLIs)
 /// spawn as their MCP server — re-executing this same binary as `ikide mcp` —
 /// so they can drive the ik compiler, simulator and IDE tools using the user's
 /// own CLI subscription, with no API key. It speaks JSON-RPC over stdin/stdout

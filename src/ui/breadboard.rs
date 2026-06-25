@@ -311,7 +311,7 @@ pub fn render(app: &mut IkIdeApp, ctx: &egui::Context) {
                         act.start = true;
                     }
                 } else {
-                    if ui.button("⏹ Stop").clicked() {
+                    if ui.button("Stop").clicked() {
                         act.stop = true;
                     }
                     let (txt, col) = if app.live_running {
@@ -515,8 +515,8 @@ pub fn render(app: &mut IkIdeApp, ctx: &egui::Context) {
 
             ui.separator();
             ui.horizontal(|ui| {
-                ui.selectable_value(&mut app.bb_tab, BreadboardTab::Schematic, "🧩 Board");
-                ui.selectable_value(&mut app.bb_tab, BreadboardTab::Uart, "🖧 UART");
+                ui.selectable_value(&mut app.bb_tab, BreadboardTab::Schematic, "Board");
+                ui.selectable_value(&mut app.bb_tab, BreadboardTab::Uart, "UART");
                 ui.selectable_value(&mut app.bb_tab, BreadboardTab::Spi, "🔗 SPI");
                 ui.selectable_value(&mut app.bb_tab, BreadboardTab::I2c, "🔗 I2C");
             });
@@ -740,7 +740,7 @@ fn render_view_element(
         }
         ViewKind::Button => {
             let label = view.label.as_deref().unwrap_or("hold");
-            let b = ui.add(egui::Button::new(format!("⏺ {}", label)).min_size(egui::vec2(64.0, 28.0)));
+            let b = ui.add(egui::Button::new(format!("{}", label)).min_size(egui::vec2(64.0, 28.0)));
             let down = b.is_pointer_button_down_on();
             let was = app.bb_instances[i].pressed.get(&e).copied().unwrap_or(false);
             app.bb_instances[i].pressed.insert(e, down);

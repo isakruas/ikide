@@ -45,7 +45,7 @@ pub fn render(app: &mut IkIdeApp, ctx: &egui::Context) {
                     if ui.button("✖").clicked() {
                         app.show_terminal = false;
                     }
-                    if ui.button("🗑 Clear").clicked() {
+                    if ui.button("Clear").clicked() {
                         app.terminal_output.clear();
                     }
                     // Copy the whole output/VM log to the clipboard — handy when it

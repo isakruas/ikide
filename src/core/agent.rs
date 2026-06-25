@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Drives an installed coding-agent CLI (`claude`, `codex` or `gemini`) as a
-//! subprocess, wired to the bundled `ikmcp` tools.
+//! Drives an installed coding-agent CLI (`claude`, `codex`, or a user-defined
+//! custom command) as a subprocess, wired to the bundled `ikmcp` tools.
 //!
 //! Crucially this needs **no API key**: each CLI runs with the user's own
 //! subscription login. The agent reaches the ik compiler, simulator and IDE
@@ -21,7 +21,7 @@
 //! and register it with the CLI:
 //!   * Claude:  `--mcp-config '{"mcpServers":{"ikmcp":{...}}}'`
 //!   * Codex:   `-c mcp_servers.ikmcp.command=...`
-//!   * Gemini:  a merged `<workspace>/.gemini/settings.json`
+//!   * Custom:  user's own command (`{prompt}` placeholder; no MCP wiring)
 //!
 //! Output is streamed back over an [`AgentMsg`] channel: tool calls/responses as
 //! they happen (for the panel's activity log) plus a final assistant reply.
@@ -60,10 +60,13 @@ pub enum AgentMsg {
     },
 }
 
-/// System guidance prepended to every agent run: steer it to drive the IDE
+/// Base system guidance prepended to every agent run: steer it to drive the IDE
 /// (ide_compile / ide_simulate) instead of dumping artifacts into the chat.
-const IDE_GUIDANCE: &str = "You are the coding assistant embedded in the IKIDE IDE for the ik language \
-(ik8b / AVR-8). To build or compile, call the `ide_compile` tool; to run or simulate, call `ide_simulate`; \
+/// [`build_guidance`] wraps this with the user's preset context and language.
+const IDE_GUIDANCE_BASE: &str = "You are the coding assistant embedded in the IKIDE IDE for the ik language \
+(ik8b / AVR-8). ik is a small, strongly typed, bare-metal language for 8-bit AVR microcontrollers: no heap, \
+no runtime, compiling straight to Intel HEX. \
+To build or compile, call the `ide_compile` tool; to run or simulate, call `ide_simulate`; \
 to run the test suite, call `ide_test`. Those run inside the IDE and show their output in its Output and \
 Simulation panels — do NOT use ik_compile, ik_simulate or ide_run_tests, and never paste raw Intel HEX into \
 the chat. To set up the breadboard/circuit for the user's program, call `ide_breadboard_catalog` to see the \
@@ -74,10 +77,40 @@ compiler/simulator the IDE uses. Examples: `\"$IKIDE_BIN\" build file.ik -o out.
 `\"$IKIDE_BIN\" sim out.hex --mcu atmega328p --trace --limit 200000`, `\"$IKIDE_BIN\" run file.ik --dump`. \
 Run `\"$IKIDE_BIN\" help` to see every subcommand and flag. Prefer the ide_* tools for normal builds/runs \
 (they show in the IDE); use $IKIDE_BIN only when you need a capability they don't expose. \
+When unsure about ik syntax, the standard library or a device model, consult the ikmcp knowledge tools \
+(ik_* resources) rather than guessing — they read the pinned, always-accurate reference. \
 Edit the user's .ik files directly to make changes. \
+Follow the project's file layout when creating files, and never scatter them elsewhere: \
+the entry source is `main.ik` with any extra `.ik` modules beside it at the workspace root; \
+tests go in `tests/*.rhai`; custom virtual devices/peripherals go in `devices/*.rhai` (then they appear \
+in the breadboard catalog); the compiled `.hex` is written to `build/` by ide_compile — it is a generated \
+artifact, so never hand-write or edit it. Set up the breadboard with the `ide_breadboard_catalog` / \
+`ide_breadboard_set` tools rather than writing board files by hand; an exported board is a `.json` \
+(e.g. `breadboard.json`). \
 Reply in PLAIN TEXT only, suitable for a narrow side panel: no Markdown at all — no **bold**, no #headings, \
 no `backticks` or code fences, no tables, no bullet/list markup. Keep replies short and focused on what you \
 did and why.";
+
+/// Build the full hidden system guidance for one turn: the base IDE steering,
+/// plus the user's preset project context and preferred reply language. Both
+/// extras are optional and trimmed; empty/"auto" values are skipped.
+fn build_guidance(language: &str, extra_context: &str) -> String {
+    let mut out = String::from(IDE_GUIDANCE_BASE);
+    let lang = language.trim();
+    if !lang.is_empty() && !lang.eq_ignore_ascii_case("auto") {
+        out.push_str(&format!(
+            " Always write your replies to the user in {}, regardless of the language of their message \
+(keep code, identifiers and tool arguments unchanged).",
+            lang
+        ));
+    }
+    let ctx = extra_context.trim();
+    if !ctx.is_empty() {
+        out.push_str("\n\n--- Project context provided by the user (treat as background, always relevant) ---\n");
+        out.push_str(ctx);
+    }
+    out
+}
 
 /// Absolute path to the running ikide executable, used as the MCP server
 /// command (`ikide mcp`). Falls back to the bare name so a PATH install works.
@@ -126,37 +159,54 @@ fn drain_ide_commands(path: &Path, processed: &mut usize, tx: &Sender<AgentMsg>,
     }
 }
 
+/// Everything the agent run needs beyond the prompt: which CLI, its autonomy,
+/// reply language, preloaded context and the editable command presets. Bundled
+/// so the runner's signature stays small as options grow.
+pub struct AgentRunConfig {
+    pub kind: String,
+    pub autonomy: String,
+    pub language: String,
+    pub extra_context: String,
+    pub custom_command: String,
+    pub claude_command: String,
+    pub codex_command: String,
+}
+
 /// Run one turn of the selected agent CLI against `prompt`.
 ///
-/// `agent_kind` is `"claude"`, `"codex"` or `"gemini"`; `autonomy` is `"edits"`
-/// (auto-accept edits), `"yolo"` (auto-accept everything) or `"readonly"`.
-/// Each invocation is independent — the CLIs are stateless across turns here.
+/// `cfg.kind` is `"claude"`, `"codex"` or `"custom"`; `cfg.autonomy` is
+/// `"edits"` (auto-accept edits), `"yolo"` (auto-accept everything) or
+/// `"readonly"`. Each invocation is independent — the CLIs are stateless here.
 pub fn run_cli_agent(
     workspace_dir: Option<PathBuf>,
-    agent_kind: String,
-    autonomy: String,
+    cfg: AgentRunConfig,
     prompt: String,
     active_file: Option<PathBuf>,
     tx: Sender<AgentMsg>,
 ) {
+    let AgentRunConfig {
+        kind: agent_kind,
+        autonomy,
+        language,
+        extra_context,
+        custom_command,
+        claude_command,
+        codex_command,
+    } = cfg;
     let workspace = workspace_dir.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
     let exe = ikide_exe();
+    let guidance = build_guidance(&language, &extra_context);
 
-    let mut cmd = match agent_kind.as_str() {
-        "claude" => build_claude(&exe, &autonomy, &prompt),
-        "codex" => build_codex(&exe, &autonomy, &prompt),
-        "gemini" => match build_gemini(&workspace, &exe, &autonomy, &prompt, &tx) {
-            Ok(c) => c,
-            Err(e) => {
-                let _ = tx.send(AgentMsg::Error(e));
-                return;
-            }
-        },
-        other => {
-            let _ = tx.send(AgentMsg::Error(format!(
-                "Unknown agent '{}'. Pick claude, codex or gemini.",
-                other
-            )));
+    let built = match agent_kind.as_str() {
+        "claude" => build_templated(&claude_command, &prompt, &guidance, &exe, claude_autonomy(&autonomy)),
+        "codex" => build_templated(&codex_command, &prompt, &guidance, &exe, codex_autonomy(&autonomy)),
+        "custom" => build_custom(&custom_command, &prompt, &guidance),
+        other => Err(format!("Unknown agent '{}'. Pick claude, codex or custom.", other)),
+    };
+    let mut cmd = match built {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = tx.send(AgentMsg::Error(e));
             return;
         }
     };
@@ -308,110 +358,94 @@ pub fn run_cli_agent(
 
 // --- Per-agent command construction ----------------------------------------
 
-fn build_claude(exe: &str, autonomy: &str, prompt: &str) -> Command {
-    let mode = match autonomy {
-        "yolo" => "bypassPermissions",
-        "readonly" => "plan",
-        _ => "acceptEdits",
-    };
-    let mut cmd = Command::new("claude");
-    cmd.arg("-p").arg(prompt);
-    cmd.arg("--append-system-prompt").arg(IDE_GUIDANCE);
-    // stream-json (+ --verbose, which it requires) lets us show live tool calls.
-    cmd.arg("--output-format").arg("stream-json");
-    cmd.arg("--verbose");
-    cmd.arg("--mcp-config").arg(mcp_config_json(exe));
-    cmd.arg("--strict-mcp-config");
-    // Pre-approve every ikmcp tool; file edits are covered by the permission mode.
-    cmd.arg("--allowedTools").arg("mcp__ikmcp");
-    cmd.arg("--permission-mode").arg(mode);
-    cmd
-}
-
-fn build_codex(exe: &str, autonomy: &str, prompt: &str) -> Command {
-    let mut cmd = Command::new("codex");
-    cmd.arg("exec");
-    cmd.arg("--skip-git-repo-check");
-    cmd.arg("--json");
-    // TOML overrides: register ikmcp as an MCP server (command quoted as a string).
-    cmd.arg("-c").arg(format!("mcp_servers.ikmcp.command=\"{}\"", exe));
-    cmd.arg("-c").arg("mcp_servers.ikmcp.args=[\"mcp\"]");
+/// Claude's autonomy → permission-mode flags, substituted for `{autonomy}`.
+fn claude_autonomy(autonomy: &str) -> &'static str {
     match autonomy {
-        "yolo" => {
-            cmd.arg("--dangerously-bypass-approvals-and-sandbox");
-        }
-        "readonly" => {
-            cmd.arg("-s").arg("read-only");
-            cmd.arg("-a").arg("never");
-        }
-        _ => {
-            cmd.arg("-s").arg("workspace-write");
-            cmd.arg("-a").arg("never");
-        }
+        "yolo" => "--permission-mode bypassPermissions",
+        "readonly" => "--permission-mode plan",
+        _ => "--permission-mode acceptEdits",
     }
-    // Prompt is the trailing positional argument (guidance folded in — Codex exec
-    // has no separate system-prompt flag).
-    cmd.arg(format!("{}\n\n---\n\n{}", IDE_GUIDANCE, prompt));
-    cmd
 }
 
-fn build_gemini(
-    workspace: &Path,
-    exe: &str,
-    autonomy: &str,
+/// Codex's autonomy → sandbox flags, substituted for `{autonomy}`. Codex exec
+/// is non-interactive (no approval prompts), and the `-a/--ask-for-approval`
+/// flag was removed in recent versions — passing it makes `codex exec` abort.
+fn codex_autonomy(autonomy: &str) -> &'static str {
+    match autonomy {
+        "yolo" => "--dangerously-bypass-approvals-and-sandbox",
+        "readonly" => "-s read-only",
+        _ => "-s workspace-write",
+    }
+}
+
+/// Build a command from an editable preset template (the claude/codex presets).
+/// The template is whitespace-split into tokens; the first token is the program.
+/// Standalone placeholder tokens expand to a single argument each — `{prompt}`,
+/// `{guidance}`, `{full_prompt}` (guidance + message folded for Codex), `{mcp}`
+/// (the inline MCP-server JSON) — while `{autonomy}` expands to zero or more
+/// flag arguments. Any other token has `{exe}` substituted in place. Keeping the
+/// flags in a user-editable preset means a CLI change can be fixed in Preferences
+/// instead of needing a new IDE build.
+fn build_templated(
+    template: &str,
     prompt: &str,
-    tx: &Sender<AgentMsg>,
+    guidance: &str,
+    exe: &str,
+    autonomy_flags: &str,
 ) -> Result<Command, String> {
-    // Gemini has no inline MCP flag: it reads `mcpServers` from settings.json.
-    // Merge ikmcp into the project-scoped `<workspace>/.gemini/settings.json`,
-    // preserving anything the user already configured there.
-    let dir = workspace.join(".gemini");
-    std::fs::create_dir_all(&dir).map_err(|e| format!("Cannot create {:?}: {}", dir, e))?;
-    let settings_path = dir.join("settings.json");
-
-    let mut root: serde_json::Value = std::fs::read_to_string(&settings_path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_else(|| serde_json::json!({}));
-    if !root.is_object() {
-        root = serde_json::json!({});
-    }
-    {
-        let obj = root.as_object_mut().unwrap();
-        let servers = obj
-            .entry("mcpServers")
-            .or_insert_with(|| serde_json::json!({}));
-        if !servers.is_object() {
-            *servers = serde_json::json!({});
+    let full = format!("{}\n\n---\n\n{}", guidance, prompt);
+    let mcp = mcp_config_json(exe);
+    let mut args: Vec<String> = Vec::new();
+    for token in template.split_whitespace() {
+        match token {
+            "{prompt}" => args.push(prompt.to_string()),
+            "{guidance}" => args.push(guidance.to_string()),
+            "{full_prompt}" => args.push(full.clone()),
+            "{mcp}" => args.push(mcp.clone()),
+            "{autonomy}" => args.extend(autonomy_flags.split_whitespace().map(String::from)),
+            other => args.push(other.replace("{exe}", exe)),
         }
-        servers.as_object_mut().unwrap().insert(
-            "ikmcp".to_string(),
-            serde_json::json!({ "command": exe, "args": ["mcp"] }),
-        );
     }
-    let pretty = serde_json::to_string_pretty(&root).unwrap_or_else(|_| "{}".to_string());
-    std::fs::write(&settings_path, pretty)
-        .map_err(|e| format!("Cannot write {:?}: {}", settings_path, e))?;
-    let _ = tx.send(AgentMsg::Progress(format!(
-        "Registered ikmcp in {}",
-        settings_path.display()
-    )));
-
-    let approval = match autonomy {
-        "yolo" => "yolo",
-        "readonly" => "plan",
-        _ => "auto_edit",
+    let Some((program, rest)) = args.split_first() else {
+        return Err("Agent command preset is empty. Set it in Preferences → AI Assistant.".to_string());
     };
-    let mut cmd = Command::new("gemini");
-    cmd.arg("-p").arg(format!("{}\n\n---\n\n{}", IDE_GUIDANCE, prompt));
-    cmd.arg("--approval-mode").arg(approval);
-    cmd.arg("--allowed-mcp-server-names").arg("ikmcp");
+    let mut cmd = Command::new(program);
+    cmd.args(rest);
+    Ok(cmd)
+}
+
+/// User-defined agent. `command` is a whitespace-split command line; the first
+/// token is the executable, the rest are arguments. The token `{prompt}` (in any
+/// argument) is replaced with the guidance + user message; if no token is
+/// present, that combined text is appended as a final argument. Output is read
+/// as plain text — MCP/ide_* wiring is not assumed for arbitrary CLIs.
+fn build_custom(command: &str, prompt: &str, guidance: &str) -> Result<Command, String> {
+    let full = format!("{}\n\n---\n\n{}", guidance, prompt);
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    let Some((program, rest)) = tokens.split_first() else {
+        return Err(
+            "Custom agent command is empty. Set it in Preferences → AI Assistant.".to_string(),
+        );
+    };
+    let mut cmd = Command::new(program);
+    let mut substituted = false;
+    for arg in rest {
+        if arg.contains("{prompt}") {
+            cmd.arg(arg.replace("{prompt}", &full));
+            substituted = true;
+        } else {
+            cmd.arg(arg);
+        }
+    }
+    if !substituted {
+        cmd.arg(&full);
+    }
     Ok(cmd)
 }
 
 // --- Per-agent stdout parsing ----------------------------------------------
 
-/// Plain-text streaming (Gemini, and a safe fallback): every non-empty line is
+/// Plain-text streaming (custom agents, and a safe fallback): every non-empty line is
 /// both a progress tick and part of the final reply.
 fn handle_text_line(line: &str, tx: &Sender<AgentMsg>, final_text: &mut String) {
     if line.trim().is_empty() {

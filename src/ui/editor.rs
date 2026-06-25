@@ -266,7 +266,45 @@ pub fn render(app: &mut IkIdeApp, ctx: &egui::Context) {
                             layout_job.wrap.max_width = wrap_width;
                             ui.fonts(|f| f.layout_job(layout_job))
                         };
-                        
+
+                        // Tab / Shift+Tab indentation. egui's default Shift+Tab
+                        // deletes text instead of un-indenting, so we handle both
+                        // ourselves: Shift+Tab always dedents the touched lines;
+                        // Tab indents them when a multi-line block is selected
+                        // (single-caret Tab still falls through to egui → 4 spaces).
+                        if ui.memory(|m| m.has_focus(text_edit_id)) {
+                            let sel = egui::TextEdit::load_state(ui.ctx(), text_edit_id)
+                                .and_then(|s| s.cursor.char_range())
+                                .map(|r| {
+                                    (
+                                        r.primary.index.min(r.secondary.index),
+                                        r.primary.index.max(r.secondary.index),
+                                    )
+                                });
+                            if let Some((smin, smax)) = sel {
+                                let multiline =
+                                    tab.content.chars().skip(smin).take(smax - smin).any(|c| c == '\n');
+                                let dedent = ui.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::Tab));
+                                let indent = !dedent
+                                    && multiline
+                                    && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Tab));
+                                if dedent || indent {
+                                    let (new_text, nmin, nmax) = reindent(&tab.content, smin, smax, dedent);
+                                    if new_text != tab.content {
+                                        tab.content = new_text;
+                                        tab.is_modified = true;
+                                        app.last_edit = Some(Instant::now());
+                                    }
+                                    if let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), text_edit_id) {
+                                        let primary = egui::text::CCursor::new(nmax);
+                                        let secondary = egui::text::CCursor::new(nmin);
+                                        state.cursor.set_char_range(Some(egui::text::CCursorRange { primary, secondary }));
+                                        egui::TextEdit::store_state(ui.ctx(), text_edit_id, state);
+                                    }
+                                }
+                            }
+                        }
+
                         let mut text = tab.content.clone();
                         let text_edit_output = egui::TextEdit::multiline(&mut text)
                             .id(text_edit_id)
@@ -308,7 +346,7 @@ pub fn render(app: &mut IkIdeApp, ctx: &egui::Context) {
                             if let Some(range) = state.cursor.char_range() {
                                 let cursor_idx = range.primary.index;
                                 let text_up_to_cursor: String = text.chars().take(cursor_idx).collect();
-                                let force_autocomplete = is_ik && ui.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Space));
+                                let force_autocomplete = is_ik && ui.input(|i| app.keymap.autocomplete.pressed(i));
                                 let key = egui::Id::new("autocomplete_sugs");
                                 let is_sug_open = ui.data_mut(|d| d.get_temp::<(usize, usize, Vec<analysis::CompletionItem>)>(key)).is_some();
 
@@ -362,6 +400,28 @@ pub fn render(app: &mut IkIdeApp, ctx: &egui::Context) {
                             Some(t) => d.insert_temp(egui::Id::new("kw_help_word"), t),
                             None => {
                                 d.remove_temp::<(usize, usize, String)>(egui::Id::new("kw_help_word"));
+                            }
+                        });
+
+                        // A broader (multi-char) selection feeds the code-assistant
+                        // action bar. Unlike the keyword card it isn't length-capped.
+                        let mut snippet: Option<(usize, usize, String)> = None;
+                        if let Some(state) = egui::TextEdit::load_state(ui.ctx(), response.id) {
+                            if let Some(range) = state.cursor.char_range() {
+                                let a = range.primary.index.min(range.secondary.index);
+                                let b = range.primary.index.max(range.secondary.index);
+                                if is_ik && b > a {
+                                    let sel: String = text.chars().skip(a).take(b - a).collect();
+                                    if !sel.trim().is_empty() {
+                                        snippet = Some((a, b, sel));
+                                    }
+                                }
+                            }
+                        }
+                        ui.data_mut(|d| match snippet {
+                            Some(t) => d.insert_temp(egui::Id::new("ai_sel_snippet"), t),
+                            None => {
+                                d.remove_temp::<(usize, usize, String)>(egui::Id::new("ai_sel_snippet"));
                             }
                         });
 
@@ -425,6 +485,13 @@ pub fn render(app: &mut IkIdeApp, ctx: &egui::Context) {
                 let autocomplete_open = ui
                     .data_mut(|d| d.get_temp::<(usize, usize, Vec<analysis::CompletionItem>)>(egui::Id::new("autocomplete_sugs")))
                     .is_some();
+                // Precedence near the cursor so popups never overlap:
+                // autocomplete > keyword/snippet card > AI action bar. The card is
+                // shown when a recognised keyword is selected; the AI bar yields to it.
+                let kw_help_active = !autocomplete_open
+                    && ui
+                        .data_mut(|d| d.get_temp::<(usize, usize, String)>(egui::Id::new("kw_help_word")))
+                        .map_or(false, |(_, _, w)| analysis::keyword_help(&w).is_some());
                 if !autocomplete_open {
                     if let Some((sel_start, sel_end, word)) = ui.data_mut(|d| d.get_temp::<(usize, usize, String)>(egui::Id::new("kw_help_word"))) {
                         if let Some(help) = analysis::keyword_help(&word) {
@@ -468,6 +535,53 @@ pub fn render(app: &mut IkIdeApp, ctx: &egui::Context) {
                     }
                 }
 
+                // Code-assistant action bar: when a snippet is selected in an .ik
+                // file (and the agent is enabled as code assistant), float a small
+                // toolbar near the selection to edit or explain it with the agent.
+                // Suppressed while autocomplete or the keyword card is showing, so
+                // the three never stack on the same spot.
+                if app.agent_as_code_assistant && !autocomplete_open && !kw_help_active {
+                    let snippet: Option<String> = ui
+                        .data_mut(|d| d.get_temp::<(usize, usize, String)>(egui::Id::new("ai_sel_snippet")))
+                        .map(|(_, _, s)| s)
+                        .filter(|s| !s.trim().is_empty());
+                    if let Some(snippet) = snippet {
+                        let mut pos = ui
+                            .data_mut(|d| d.get_temp::<egui::Pos2>(egui::Id::new("cursor_screen_pos")))
+                            .unwrap_or(egui::pos2(120.0, 120.0));
+                        pos.y += 20.0;
+                        egui::Window::new("AiSelectionActions")
+                            .title_bar(false)
+                            .resizable(false)
+                            .collapsible(false)
+                            .fixed_pos(pos)
+                            .show(ctx, |ui| {
+                                ui.horizontal(|ui| {
+                                    let busy = app.ai_agent_running;
+                                    if ui
+                                        .add_enabled(!busy, egui::Button::new("AI Edit"))
+                                        .on_hover_text("Ask the agent to rewrite the selected code")
+                                        .clicked()
+                                    {
+                                        app.ai_edit_selection = Some(snippet.clone());
+                                        app.ai_edit_open = true;
+                                    }
+                                    if ui
+                                        .add_enabled(!busy, egui::Button::new("Explain"))
+                                        .on_hover_text("Ask the agent to explain it in the AI chat")
+                                        .clicked()
+                                    {
+                                        let prompt = format!(
+                                            "Explain this ik code:\n\n```\n{}\n```",
+                                            snippet
+                                        );
+                                        app.start_agent_turn(prompt, ctx);
+                                    }
+                                });
+                            });
+                    }
+                }
+
                 ui.data_mut(|d| {
                     d.insert_temp(egui::Id::new("editor_y_offset"), output.state.offset.y);
                     d.insert_temp(egui::Id::new("editor_content_h"), output.content_size.y);
@@ -476,4 +590,132 @@ pub fn render(app: &mut IkIdeApp, ctx: &egui::Context) {
             }
         }
     });
+}
+
+/// Indent or dedent every line touched by the selection `[sel_min, sel_max)` by
+/// one 4-space step. Returns the new text and the adjusted (min, max) selection,
+/// both as char indices. Dedent removes up to 4 leading spaces (or one tab) per
+/// line; indent prepends 4 spaces to each non-empty line.
+fn reindent(content: &str, sel_min: usize, sel_max: usize, dedent: bool) -> (String, usize, usize) {
+    const STEP: usize = 4;
+    let chars: Vec<char> = content.chars().collect();
+    let n = chars.len();
+    let smin = sel_min.min(n);
+    let smax = sel_max.min(n);
+
+    // Start of the first line the selection touches.
+    let mut first = smin;
+    while first > 0 && chars[first - 1] != '\n' {
+        first -= 1;
+    }
+    // A selection ending exactly at a line start doesn't include that line.
+    let end = if smax > smin && smax > 0 && chars[smax - 1] == '\n' {
+        smax - 1
+    } else {
+        smax
+    };
+
+    let mut out: Vec<char> = chars[..first].to_vec();
+    let mut i = first;
+    let mut dmin: isize = 0;
+    let mut dmax: isize = 0;
+    loop {
+        if dedent {
+            let mut removed = 0usize;
+            let mut j = i;
+            if j < n && chars[j] == '\t' {
+                j += 1;
+                removed = 1;
+            } else {
+                while removed < STEP && j < n && chars[j] == ' ' {
+                    j += 1;
+                    removed += 1;
+                }
+            }
+            if i < smin {
+                dmin -= removed.min(smin - i) as isize;
+            }
+            if i <= smax {
+                dmax -= removed.min(smax.saturating_sub(i)) as isize;
+            }
+            let mut k = j;
+            while k < n && chars[k] != '\n' {
+                k += 1;
+            }
+            if k < n {
+                k += 1;
+            }
+            out.extend_from_slice(&chars[j..k]);
+            i = k;
+        } else {
+            // Indent: skip blank lines so we don't add trailing whitespace.
+            if i < n && chars[i] != '\n' {
+                for _ in 0..STEP {
+                    out.push(' ');
+                }
+                if i < smin {
+                    dmin += STEP as isize;
+                }
+                if i <= smax {
+                    dmax += STEP as isize;
+                }
+            }
+            let mut k = i;
+            while k < n && chars[k] != '\n' {
+                k += 1;
+            }
+            if k < n {
+                k += 1;
+            }
+            out.extend_from_slice(&chars[i..k]);
+            i = k;
+        }
+        if i > end || i >= n {
+            break;
+        }
+    }
+    out.extend_from_slice(&chars[i.min(n)..]);
+
+    let new_min = (smin as isize + dmin).max(0) as usize;
+    let new_max = (smax as isize + dmax).max(0) as usize;
+    (out.into_iter().collect(), new_min, new_max)
+}
+
+#[cfg(test)]
+mod reindent_tests {
+    use super::reindent;
+
+    #[test]
+    fn dedent_single_line_removes_four_spaces() {
+        let (t, _, _) = reindent("    foo", 4, 4, true);
+        assert_eq!(t, "foo");
+    }
+
+    #[test]
+    fn dedent_tab_removes_one_tab() {
+        let (t, _, _) = reindent("\tfoo", 1, 1, true);
+        assert_eq!(t, "foo");
+    }
+
+    #[test]
+    fn indent_multiline_selection_prefixes_each_line() {
+        // select across both lines
+        let src = "a\nb\n";
+        let (t, _, _) = reindent(src, 0, 4, false);
+        assert_eq!(t, "    a\n    b\n");
+    }
+
+    #[test]
+    fn dedent_multiline_only_strips_present_indent() {
+        let src = "    a\n  b\n";
+        let (t, _, _) = reindent(src, 0, src.chars().count(), true);
+        assert_eq!(t, "a\nb\n");
+    }
+
+    #[test]
+    fn indent_skips_blank_lines() {
+        let src = "a\n\nb";
+        let (t, _, _) = reindent(src, 0, src.chars().count(), false);
+        assert_eq!(t, "    a\n\n    b");
+    }
 }
