@@ -45,6 +45,7 @@ pub fn render(app: &mut IkIdeApp, ctx: &egui::Context) {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("✖").clicked() {
                         app.show_terminal = false;
+                        app.output_dismissed = true;
                     }
                     if ui.button("◻ Clear").clicked() {
                         app.terminal_output.clear();
@@ -126,16 +127,17 @@ pub fn render(app: &mut IkIdeApp, ctx: &egui::Context) {
                 ui.separator();
             }
 
+            // Fill the remaining panel height so the log uses the whole open area.
             egui::ScrollArea::vertical()
                 .id_salt("output_scroll")
                 .stick_to_bottom(true)
+                .auto_shrink([false, false])
                 .show(ui, |ui| {
                     ui.add(
                         egui::TextEdit::multiline(&mut app.terminal_output)
                             .font(egui::TextStyle::Monospace)
                             .desired_width(f32::INFINITY)
-                            .desired_rows(8)
-                            .lock_focus(true)
+                            .lock_focus(true),
                     );
                 });
         });

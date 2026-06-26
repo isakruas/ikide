@@ -29,3 +29,6 @@ ik8bvm = { path = "tools/ik8b/tools/ik8bvm" }
 ikmcp = { path = "tools/ikmcp" }
 # HTTP client for communication with LLM providers
 ureq = { version = "2.9", features = ["json"] }
+# Interactive terminal: a real PTY plus a VT100/ANSI parser for the screen grid.
+portable-pty = "0.8"
+vt100 = "0.15"

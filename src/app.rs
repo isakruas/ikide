@@ -205,6 +205,15 @@ pub struct IkIdeApp {
     pub show_stats: bool,
     pub show_minimap: bool,
     pub show_preferences: bool,
+
+    /// Set when the user explicitly closes the Output panel, so build/run actions
+    /// stop auto-reopening it.
+    pub output_dismissed: bool,
+
+    /// Interactive terminal panel running a shell in the workspace directory.
+    pub show_shell: bool,
+    /// Live PTY terminal session, created on first open.
+    pub terminal: Option<crate::core::shell::Terminal>,
     pub show_about: bool,
     pub show_examples: bool,
     pub show_serial: bool,
@@ -420,6 +429,9 @@ impl Default for IkIdeApp {
             left_panel_width: settings.left_panel_width,
             right_panel_width: settings.right_panel_width,
             show_terminal: settings.show_terminal,
+            output_dismissed: false,
+            show_shell: false,
+            terminal: None,
             show_vm_trace: settings.show_vm_trace,
             show_stats: settings.show_stats,
             show_minimap: settings.show_minimap,
@@ -1463,7 +1475,7 @@ impl IkIdeApp {
             self.active_tab = Some(self.open_tabs.len() - 1);
         } else {
             self.terminal_output.push_str(&format!("{} Failed to load file: {:?}\n", now_ts(), path));
-            self.show_terminal = true;
+            if !self.output_dismissed { self.show_terminal = true; }
         }
     }
 
@@ -1478,7 +1490,7 @@ impl IkIdeApp {
             }
             if let Err(e) = std::fs::write(&tab.path, &tab.content) {
                 self.terminal_output.push_str(&format!("{} Failed to save file: {}\n", now_ts(), e));
-                self.show_terminal = true;
+                if !self.output_dismissed { self.show_terminal = true; }
             } else {
                 tab.is_modified = false;
                 tab.is_disk_different = false;
@@ -1657,6 +1669,7 @@ changes) were really carried out:\n\n{}",
         let mut submit = false;
         let mut close = false;
         egui::Window::new("AI Edit")
+            .title_bar(false)
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_TOP, [0.0, 80.0])
@@ -1676,9 +1689,9 @@ changes) were really carried out:\n\n{}",
                     );
                 }
                 ui.add_space(4.0);
-                let resp = ui.add_sized(
-                    [360.0, 28.0],
+                let resp = ui.add(
                     egui::TextEdit::singleline(&mut self.ai_edit_input)
+                        .desired_width(300.0)
                         .hint_text("e.g. add a comment to each function"),
                 );
                 resp.request_focus();
@@ -1750,14 +1763,14 @@ changes) were really carried out:\n\n{}",
                 }
                 TaskMsg::Upload(out) => {
                     self.terminal_output.push_str(&stamp(&out));
-                    self.show_terminal = true;
+                    if !self.output_dismissed { self.show_terminal = true; }
                 }
                 TaskMsg::Test(out) => {
                     if let Some(p) = &mut self.pending_agent {
                         p.buf.push_str(&out);
                     }
                     self.terminal_output.push_str(&stamp(&out));
-                    self.show_terminal = true;
+                    if !self.output_dismissed { self.show_terminal = true; }
                 }
                 TaskMsg::Stats(res) => {
                     self.stats_data = match res {
@@ -1894,7 +1907,7 @@ changes) were really carried out:\n\n{}",
             return;
         }
         let _ = self.begin_task(false);
-        self.show_terminal = true;
+        if !self.output_dismissed { self.show_terminal = true; }
         self.terminal_output.push_str(&format!("{} --- Compiling (AI agent) ---\n", now_ts()));
         let (path, content) = self
             .active_tab
@@ -1934,7 +1947,7 @@ changes) were really carried out:\n\n{}",
     /// Run -> Run Tests menu, triggered by the agent.
     fn agent_run_tests(&mut self, id: String, result_pipe: String) {
         let cancel = self.begin_task(false);
-        self.show_terminal = true;
+        if !self.output_dismissed { self.show_terminal = true; }
         self.terminal_output.push_str(&format!("{} --- Running Tests (AI agent) ---\n", now_ts()));
         let target = if self.avrdude_target.is_empty() {
             "atmega328p".to_string()
@@ -1961,7 +1974,7 @@ changes) were really carried out:\n\n{}",
         match crate::core::analysis::compile(&src) {
             Ok(artifact) => {
                 let _ = self.begin_task(false);
-                self.show_terminal = true;
+                if !self.output_dismissed { self.show_terminal = true; }
                 self.terminal_output.clear();
                 self.terminal_output.push_str(&format!("{} --- Burning Bootloader ---\n", now_ts()));
                 
@@ -1977,7 +1990,7 @@ changes) were really carried out:\n\n{}",
                 );
             }
             Err(diag) => {
-                self.show_terminal = true;
+                if !self.output_dismissed { self.show_terminal = true; }
                 self.terminal_output.clear();
                 self.terminal_output.push_str(&format!(
                     "{} Compilation failed — {}\n",
@@ -2229,7 +2242,7 @@ impl eframe::App for IkIdeApp {
             if !self.is_busy && self.active_is_ik() {
                 self.save_active_file();
                 let _ = self.begin_task(false);
-                self.show_terminal = true;
+                if !self.output_dismissed { self.show_terminal = true; }
                 self.terminal_output.clear();
                 self.terminal_output.push_str(&format!("{} --- Compiling ---\n", now_ts()));
                 let (path, content) = self.active_tab
@@ -2324,7 +2337,7 @@ impl eframe::App for IkIdeApp {
                         ui.close_menu();
                     }
                     if self.agent_as_code_assistant {
-                        let ai_label = format!("AI Edit ({})", self.keymap.ai_edit.label());
+                        let ai_label = format!("◻ AI Edit ({})", self.keymap.ai_edit.label());
                         if ui
                             .add_enabled(self.active_is_ik() && !self.ai_agent_running, egui::Button::new(ai_label))
                             .on_hover_text("Ask the AI agent to edit the open file.")
@@ -2337,18 +2350,21 @@ impl eframe::App for IkIdeApp {
                 });
                 
                 ui.menu_button("View", |ui| {
-                    ui.checkbox(&mut self.show_terminal, "Output");
-                    ui.checkbox(&mut self.show_vm_trace, "Simulation");
-                    ui.checkbox(&mut self.show_ai_chat, "AI Chat");
-                    ui.checkbox(&mut self.show_stats, "Resource Stats");
-                    ui.checkbox(&mut self.show_minimap, "Minimap");
-                    ui.checkbox(&mut self.show_serial, "Serial Monitor");
-                    ui.checkbox(&mut self.show_breadboard, "Breadboard");
-                    ui.separator();
-                    if ui.add_enabled(!self.is_busy, egui::Button::new("🔄 Refresh Explorer")).clicked() {
-                        self.refresh_files();
-                        ui.close_menu();
+                    // Bottom panels.
+                    if ui.checkbox(&mut self.show_terminal, "Output").changed() {
+                        self.output_dismissed = !self.show_terminal;
                     }
+                    ui.checkbox(&mut self.show_shell, "Terminal");
+                    ui.separator();
+                    // Tool views.
+                    ui.checkbox(&mut self.show_vm_trace, "Simulation");
+                    ui.checkbox(&mut self.show_breadboard, "Breadboard");
+                    ui.checkbox(&mut self.show_serial, "Serial Monitor");
+                    ui.checkbox(&mut self.show_ai_chat, "AI Chat");
+                    ui.separator();
+                    // Editor extras.
+                    ui.checkbox(&mut self.show_minimap, "Minimap");
+                    ui.checkbox(&mut self.show_stats, "Resource Stats");
                 });
                 
                 ui.menu_button("Run", |ui| {
@@ -2356,7 +2372,7 @@ impl eframe::App for IkIdeApp {
                     if ui.add_enabled(!self.is_busy && self.active_is_ik(), egui::Button::new(compile_label)).clicked() {
                         self.save_active_file();
                         let _ = self.begin_task(false);
-                        self.show_terminal = true;
+                        if !self.output_dismissed { self.show_terminal = true; }
                         self.terminal_output.clear();
                         self.terminal_output.push_str(&format!("{} --- Compiling ---\n", now_ts()));
                         let (path, content) = self.active_tab
@@ -2381,7 +2397,7 @@ impl eframe::App for IkIdeApp {
                     if ui.add_enabled(!self.is_busy, egui::Button::new("◻ Run Tests")).clicked() {
                         self.save_active_file();
                         let cancel = self.begin_task(false);
-                        self.show_terminal = true;
+                        if !self.output_dismissed { self.show_terminal = true; }
                         self.terminal_output.clear();
                         self.terminal_output.push_str(&format!("{} --- Running Tests ---\n", now_ts()));
                         let target = if self.avrdude_target.is_empty() {
@@ -2395,7 +2411,7 @@ impl eframe::App for IkIdeApp {
                     if ui.add_enabled(!self.is_busy && self.active_is_ik(), egui::Button::new("🔌 Upload to Board")).clicked() {
                         self.save_active_file();
                         let _ = self.begin_task(false);
-                        self.show_terminal = true;
+                        if !self.output_dismissed { self.show_terminal = true; }
                         self.terminal_output.clear();
                         let path = self.active_tab.map(|idx| self.open_tabs[idx].path.clone());
                         if self.use_bootloader {
@@ -2689,6 +2705,9 @@ impl eframe::App for IkIdeApp {
 
         if self.show_terminal {
             terminal::render(self, ctx);
+        }
+        if self.show_shell {
+            crate::ui::shell::render(self, ctx);
         }
         explorer::render(self, ctx);
         if self.show_vm_trace || self.show_ai_chat {
