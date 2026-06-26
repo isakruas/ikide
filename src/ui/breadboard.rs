@@ -358,9 +358,10 @@ pub fn render(app: &mut IkIdeApp, ctx: &egui::Context) {
                     .rounding(4.0)
                     .inner_margin(8.0)
                     .show(ui, |ui| {
-                        ui.columns(2, |columns| {
-                            // Left column: Registers
-                            columns[0].vertical(|ui| {
+                        // Registers and the RAM chart sit side by side when the
+                        // panel is wide enough, and stack vertically when it is
+                        // narrow so they never overlap.
+                        let regs = |ui: &mut egui::Ui| {
                                 ui.horizontal(|ui| {
                                     ui.monospace(format!("SREG: 0x{:02X}", app.live_sreg));
                                     ui.separator();
@@ -381,10 +382,9 @@ pub fn render(app: &mut IkIdeApp, ctx: &egui::Context) {
                                         ui.end_row();
                                     }
                                 });
-                            });
+                        };
 
-                            // Right column: RAM usage history chart
-                            columns[1].vertical(|ui| {
+                        let chart = |ui: &mut egui::Ui| {
                                 ui.horizontal(|ui| {
                                     ui.strong("📈 SRAM Usage (Static + Stack - 60s)");
                                 });
@@ -510,8 +510,24 @@ pub fn render(app: &mut IkIdeApp, ctx: &egui::Context) {
                                             .color(egui::Color32::from_rgb(255, 165, 0)),
                                     );
                                 });
+                        };
+
+                        if ui.available_width() >= 680.0 {
+                            ui.columns(2, |columns| {
+                                // Clip each column to its own rect so any overflow
+                                // is cut off rather than drawn over the neighbour.
+                                let r0 = columns[0].max_rect();
+                                columns[0].set_clip_rect(r0);
+                                regs(&mut columns[0]);
+                                let r1 = columns[1].max_rect();
+                                columns[1].set_clip_rect(r1);
+                                chart(&mut columns[1]);
                             });
-                        });
+                        } else {
+                            regs(ui);
+                            ui.add_space(8.0);
+                            chart(ui);
+                        }
                     });
             }
             if !app.live_status.is_empty() {
