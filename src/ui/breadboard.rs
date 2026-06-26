@@ -319,15 +319,15 @@ pub fn render(app: &mut IkIdeApp, ctx: &egui::Context) {
                     } else {
                         ("● halted", egui::Color32::GRAY)
                     };
-                    let stack_bytes = (app.live_sram_start + app.live_sram_bytes)
-                        .saturating_sub(1)
-                        .saturating_sub(app.live_sp as u32);
+                    // Stack-bytes count changes every frame and its digit width
+                    // jitters the whole line, so it's omitted here for a stable
+                    // readout (SP is fixed-width). The live Stack figure stays in
+                    // the SRAM usage panel.
                     let status_text = format!(
-                        "{}  ·  {} cyc  ·  SP: 0x{:04X} (Stack: {} B)",
+                        "{}  ·  {} cyc  ·  SP: 0x{:04X}",
                         txt,
                         app.live_cycles,
                         app.live_sp,
-                        stack_bytes
                     );
                     ui.label(egui::RichText::new(status_text).color(col));
                     ui.checkbox(&mut app.show_vm_registers, "Registers");

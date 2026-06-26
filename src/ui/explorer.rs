@@ -155,9 +155,8 @@ pub fn render(app: &mut IkIdeApp, ctx: &egui::Context) {
                     }
                 });
 
-            // Rubber-band: drag across the file list to select every file the
-            // rectangle touches. Uses the global pointer (not per-row hover, which
-            // egui suppresses mid-drag). Ctrl/Cmd keeps the existing selection.
+            // Drag across the file list to select every file whose row rect the
+            // drag rectangle intersects. Ctrl/Cmd keeps the existing selection.
             let viewport = scroll_out.inner_rect;
             let pointer = ui.input(|i| i.pointer.clone());
             if pointer.primary_down() {

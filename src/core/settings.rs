@@ -103,7 +103,6 @@ pub struct Settings {
     pub custom_agent_command: String,
     /// Editable invocation preset for the Claude Code CLI. Placeholders:
     /// `{prompt}`, `{guidance}`, `{mcp}`, `{exe}`, `{autonomy}`, `{full_prompt}`.
-    /// Exposed so a CLI flag change can be fixed here without a new IDE build.
     pub claude_command: String,
     /// Editable invocation preset for the Codex CLI (same placeholders).
     pub codex_command: String,

@@ -186,7 +186,7 @@ fn render_message(ui: &mut egui::Ui, msg: &crate::core::agent::ChatMessage) {
     ui.group(|ui| {
         ui.set_width(ui.available_width());
         ui.label(egui::RichText::new(label).strong().color(color).small());
-        // Wrap the content so a long line can't push the panel wider every frame.
+        // Wrap the content to the panel width; long lines break instead of widening it.
         ui.add(egui::Label::new(egui::RichText::new(&msg.content)).wrap());
     });
 }

@@ -1561,9 +1561,8 @@ impl IkIdeApp {
         self.ai_agent_running = true;
         self.ai_agent_status = "Starting agent...".to_string();
 
-        // The CLI agent is stateless across turns, so feed it the conversation so
-        // far (user/assistant turns only). Without this each message starts fresh
-        // and the agent loses all context (e.g. a follow-up "sim" means nothing).
+        // The CLI agent is stateless across turns; the prompt carries the
+        // conversation so far (user/assistant turns only) as context.
         let agent_prompt = {
             let turns: Vec<String> = self
                 .ai_chat_history
@@ -2445,9 +2444,8 @@ impl eframe::App for IkIdeApp {
         if self.show_preferences {
             let mut show = self.show_preferences;
             let mut close = false;
-            // Fixed size: a content-sized window with INFINITY-width fields feeds
-            // back into the layout and grows every frame, so we pin the size and
-            // bound the inner width instead.
+            // Fixed window size with a width-bounded inner area; required because
+            // the full-width fields inside have no intrinsic width limit.
             egui::Window::new("Preferences")
                 .title_bar(false)
                 .collapsible(false)

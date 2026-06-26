@@ -211,39 +211,19 @@ pub fn render(app: &mut IkIdeApp, ctx: &egui::Context) {
                     // share the same first-row baseline (default horizontal()
                     // centers them, which misaligns when their heights differ).
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {
-                        let lines_count = tab.content.lines().count().max(1);
-                        let extra_line = if tab.content.ends_with('\n') || tab.content.is_empty() { 1 } else { 0 };
-                        let total_lines = lines_count + extra_line;
-                        
-                        let digits = total_lines.to_string().len().max(3);
-                        let mut line_numbers = egui::text::LayoutJob::default();
-                        let format_normal = egui::TextFormat::simple(egui::FontId::monospace(14.0), egui::Color32::from_gray(100));
-                        let mut format_error = egui::TextFormat::simple(egui::FontId::monospace(14.0), egui::Color32::RED);
-                        format_error.background = egui::Color32::from_rgba_unmultiplied(255, 0, 0, 50);
-                        let mut format_warn = egui::TextFormat::simple(egui::FontId::monospace(14.0), egui::Color32::from_rgb(220, 150, 0));
-                        format_warn.background = egui::Color32::from_rgba_unmultiplied(220, 150, 0, 50);
-                        
-                        for i in 1..=total_lines {
-                            // No trailing newline on the last row, so the gutter
-                            // is exactly as tall as the text and rows line up.
-                            let text = if i == total_lines {
-                                format!("{:>width$}", i, width = digits)
-                            } else {
-                                format!("{:>width$}\n", i, width = digits)
-                            };
-                            if error_lines.contains(&i) {
-                                line_numbers.append(&text, 0.0, format_error.clone());
-                            } else if warn_lines.contains(&i) {
-                                line_numbers.append(&text, 0.0, format_warn.clone());
-                            } else {
-                                line_numbers.append(&text, 0.0, format_normal.clone());
-                            }
-                        }
+                        // Reserve the line-number gutter; the numbers are painted
+                        // after layout, aligned to the galley's visual rows. Each
+                        // logical line is numbered at its first visual row, leaving
+                        // wrapped continuation rows blank.
+                        let logical_total = tab.content.lines().count().max(1)
+                            + if tab.content.ends_with('\n') { 1 } else { 0 };
+                        let gutter_digits = logical_total.to_string().len().max(3);
+                        let gutter_font = egui::FontId::monospace(14.0);
+                        let gutter_char_w = ui.fonts(|f| f.glyph_width(&gutter_font, '0'));
+                        let gutter_w = gutter_char_w * gutter_digits as f32 + 6.0;
+                        let gutter_x = ui.cursor().min.x;
+                        ui.add_space(gutter_w + 8.0); // column + gap for the divider
 
-                        ui.add(egui::Label::new(line_numbers).wrap_mode(egui::TextWrapMode::Extend));
-
-                        ui.separator();
-                        
                         let text_edit_id = ui.id().with("editor_multiline");
                         let mut layouter = |ui: &egui::Ui, string: &str, wrap_width: f32| {
                             let mut selection = None;
@@ -267,11 +247,10 @@ pub fn render(app: &mut IkIdeApp, ctx: &egui::Context) {
                             ui.fonts(|f| f.layout_job(layout_job))
                         };
 
-                        // Tab / Shift+Tab indentation. egui's default Shift+Tab
-                        // deletes text instead of un-indenting, so we handle both
-                        // ourselves: Shift+Tab always dedents the touched lines;
-                        // Tab indents them when a multi-line block is selected
-                        // (single-caret Tab still falls through to egui → 4 spaces).
+                        // Indentation handling: Shift+Tab dedents the touched lines;
+                        // Tab indents them when a multi-line block is selected. A
+                        // single-caret Tab is left to the editor, which inserts 4
+                        // spaces.
                         if ui.memory(|m| m.has_focus(text_edit_id)) {
                             let sel = egui::TextEdit::load_state(ui.ctx(), text_edit_id)
                                 .and_then(|s| s.cursor.char_range())
@@ -315,9 +294,53 @@ pub fn render(app: &mut IkIdeApp, ctx: &egui::Context) {
                             .margin(egui::vec2(0.0, 0.0)) // Disable all margin for perfect alignment
                             .layouter(&mut layouter)
                             .show(ui);
-                            
+
+                        // Paint the gutter from the laid-out galley: number each
+                        // logical line at its first visual row, leaving wrapped
+                        // continuation rows blank, with a divider on the right edge.
+                        {
+                            let galley = &text_edit_output.galley;
+                            let gpos = text_edit_output.galley_pos;
+                            let painter = ui.painter();
+                            let div_x = gutter_x + gutter_w + 4.0;
+                            painter.line_segment(
+                                [egui::pos2(div_x, gpos.y), egui::pos2(div_x, gpos.y + galley.rect.height())],
+                                ui.visuals().widgets.noninteractive.bg_stroke,
+                            );
+                            let mut logical = 0usize;
+                            for (r, row) in galley.rows.iter().enumerate() {
+                                let is_line_start = r == 0 || galley.rows[r - 1].ends_with_newline;
+                                if !is_line_start {
+                                    continue;
+                                }
+                                logical += 1;
+                                let y = gpos.y + row.rect.min.y;
+                                let (color, bg) = if error_lines.contains(&logical) {
+                                    (egui::Color32::RED, Some(egui::Color32::from_rgba_unmultiplied(255, 0, 0, 50)))
+                                } else if warn_lines.contains(&logical) {
+                                    (egui::Color32::from_rgb(220, 150, 0), Some(egui::Color32::from_rgba_unmultiplied(220, 150, 0, 50)))
+                                } else {
+                                    (egui::Color32::from_gray(100), None)
+                                };
+                                if let Some(bg) = bg {
+                                    painter.rect_filled(
+                                        egui::Rect::from_min_size(egui::pos2(gutter_x, y), egui::vec2(gutter_w, row.rect.height())),
+                                        0.0,
+                                        bg,
+                                    );
+                                }
+                                painter.text(
+                                    egui::pos2(gutter_x + gutter_w, y),
+                                    egui::Align2::RIGHT_TOP,
+                                    logical.to_string(),
+                                    gutter_font.clone(),
+                                    color,
+                                );
+                            }
+                        }
+
                         let response = text_edit_output.response;
-                        
+
                         if response.changed() {
                             if text.contains('\t') {
                                 // Tab inserts 4 spaces. A plain global replace would
@@ -535,11 +558,10 @@ pub fn render(app: &mut IkIdeApp, ctx: &egui::Context) {
                     }
                 }
 
-                // Code-assistant action bar: when a snippet is selected in an .ik
-                // file (and the agent is enabled as code assistant), float a small
-                // toolbar near the selection to edit or explain it with the agent.
-                // Suppressed while autocomplete or the keyword card is showing, so
-                // the three never stack on the same spot.
+                // Code-assistant action bar: a snippet selected in an .ik file (with
+                // the agent enabled as code assistant) floats a toolbar near the
+                // selection to edit or explain it. Hidden while autocomplete or the
+                // keyword card occupies the cursor position.
                 if app.agent_as_code_assistant && !autocomplete_open && !kw_help_active {
                     let snippet: Option<String> = ui
                         .data_mut(|d| d.get_temp::<(usize, usize, String)>(egui::Id::new("ai_sel_snippet")))
@@ -648,7 +670,7 @@ fn reindent(content: &str, sel_min: usize, sel_max: usize, dedent: bool) -> (Str
             out.extend_from_slice(&chars[j..k]);
             i = k;
         } else {
-            // Indent: skip blank lines so we don't add trailing whitespace.
+            // Indent: blank lines are skipped to avoid trailing whitespace.
             if i < n && chars[i] != '\n' {
                 for _ in 0..STEP {
                     out.push(' ');

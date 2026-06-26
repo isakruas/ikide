@@ -383,9 +383,7 @@ fn codex_autonomy(autonomy: &str) -> &'static str {
 /// Standalone placeholder tokens expand to a single argument each — `{prompt}`,
 /// `{guidance}`, `{full_prompt}` (guidance + message folded for Codex), `{mcp}`
 /// (the inline MCP-server JSON) — while `{autonomy}` expands to zero or more
-/// flag arguments. Any other token has `{exe}` substituted in place. Keeping the
-/// flags in a user-editable preset means a CLI change can be fixed in Preferences
-/// instead of needing a new IDE build.
+/// flag arguments. Any other token has `{exe}` substituted in place.
 fn build_templated(
     template: &str,
     prompt: &str,
