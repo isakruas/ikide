@@ -16,152 +16,264 @@ use eframe::egui;
 use crate::app::IkIdeApp;
 
 const FONT_SIZE: f32 = 13.0;
+/// Fixed dark backdrop and light default text so the ANSI palette stays legible
+/// regardless of the IDE theme.
+const TERM_BG: egui::Color32 = egui::Color32::from_rgb(0x1e, 0x1e, 0x1e);
+const TERM_FG: egui::Color32 = egui::Color32::from_rgb(0xd6, 0xd6, 0xd6);
 
-/// Bottom terminal panel: a full interactive shell rendered from the PTY's
-/// VT100 screen grid, with keystrokes forwarded to the shell.
+/// Bottom terminal panel: tabbed interactive shells rendered from each PTY's
+/// VT100 screen grid, with keystrokes forwarded to the active shell.
 pub fn render(app: &mut IkIdeApp, ctx: &egui::Context) {
     egui::TopBottomPanel::bottom("shell_panel")
         .resizable(true)
         .min_height(140.0)
         .max_height((ctx.screen_rect().height() * 0.7).clamp(180.0, 600.0))
         .show(ctx, |ui| {
+            // Open the first session when the panel appears.
+            if app.terminals.is_empty() {
+                spawn_terminal(app, ctx);
+            }
+            if app.terminals.is_empty() {
+                ui.colored_label(egui::Color32::from_rgb(255, 120, 120), "Cannot start a terminal.");
+                return;
+            }
+            if app.active_terminal >= app.terminals.len() {
+                app.active_terminal = app.terminals.len() - 1;
+            }
+
+            let mut to_close: Option<usize> = None;
+            let mut add = false;
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("Terminal").strong());
-                let cwd = app
-                    .workspace_dir
-                    .as_ref()
-                    .map(|w| w.display().to_string())
-                    .unwrap_or_else(|| "(no folder open)".to_string());
-                ui.label(egui::RichText::new(cwd).weak().small());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("✖").on_hover_text("Close").clicked() {
+                    if ui.button("✖").on_hover_text("Hide panel").clicked() {
                         app.show_shell = false;
                     }
-                    if ui.button("◻ Restart").on_hover_text("Kill and restart the shell").clicked() {
-                        app.terminal = None;
+                    if ui.button("+").on_hover_text("New terminal").clicked() {
+                        add = true;
                     }
+                    // Remaining width, left to right: title + scrollable tab strip.
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        ui.label(egui::RichText::new("Terminal").strong());
+                        ui.separator();
+                        egui::ScrollArea::horizontal()
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    for i in 0..app.terminals.len() {
+                                        if i > 0 {
+                                            ui.separator();
+                                        }
+                                        if app.renaming_terminal == Some(i) {
+                                            // Inline title editor (double-click or Rename).
+                                            let resp = ui.add(
+                                                egui::TextEdit::singleline(&mut app.terminal_rename_buf)
+                                                    .desired_width(110.0),
+                                            );
+                                            resp.request_focus();
+                                            let commit = resp.lost_focus()
+                                                || ui.input(|inp| inp.key_pressed(egui::Key::Enter));
+                                            if commit {
+                                                let name = app.terminal_rename_buf.trim();
+                                                if !name.is_empty() {
+                                                    app.terminals[i].title = name.to_string();
+                                                }
+                                                app.renaming_terminal = None;
+                                            }
+                                        } else {
+                                            let selected = i == app.active_terminal;
+                                            let resp = ui.selectable_label(selected, &app.terminals[i].title);
+                                            if resp.clicked() {
+                                                app.active_terminal = i;
+                                            }
+                                            if resp.double_clicked() {
+                                                app.renaming_terminal = Some(i);
+                                                app.terminal_rename_buf = app.terminals[i].title.clone();
+                                            }
+                                            resp.context_menu(|ui| {
+                                                if ui.button("Rename").clicked() {
+                                                    app.renaming_terminal = Some(i);
+                                                    app.terminal_rename_buf = app.terminals[i].title.clone();
+                                                    ui.close_menu();
+                                                }
+                                                if ui.button("Close").clicked() {
+                                                    app.terminal_close_confirm = Some(i);
+                                                    ui.close_menu();
+                                                }
+                                            });
+                                            if ui.small_button("×").on_hover_text("Close terminal").clicked() {
+                                                app.terminal_close_confirm = Some(i);
+                                            }
+                                        }
+                                    }
+                                });
+                            });
+                    });
                 });
             });
             ui.separator();
 
-            // Spawn the shell session on first open.
-            if app.terminal.is_none() {
-                let repaint = {
-                    let ctx = ctx.clone();
-                    move || ctx.request_repaint()
-                };
-                match crate::core::shell::Terminal::spawn(app.workspace_dir.clone(), repaint) {
-                    Ok(t) => app.terminal = Some(t),
-                    Err(e) => {
-                        ui.colored_label(egui::Color32::from_rgb(255, 120, 120), format!("Cannot start terminal: {}", e));
-                        return;
-                    }
-                }
-            }
-            let term = app.terminal.as_mut().unwrap();
-
-            let font = egui::FontId::monospace(FONT_SIZE);
-            let (cell_w, cell_h) = ui.fonts(|f| (f.glyph_width(&font, 'M'), f.row_height(&font)));
-
-            // Fit the grid to the available area and resize the PTY to match.
-            let avail = ui.available_size();
-            let cols = (avail.x / cell_w).floor().clamp(20.0, 400.0) as u16;
-            let rows = (avail.y / cell_h).floor().clamp(4.0, 200.0) as u16;
-            term.resize(rows, cols);
-
-            let (resp, painter) = ui.allocate_painter(
-                egui::vec2(cols as f32 * cell_w, rows as f32 * cell_h),
-                egui::Sense::click(),
-            );
-            if resp.clicked() {
-                resp.request_focus();
-            }
-            let focused = resp.has_focus();
-            if focused {
-                // Keep Tab / arrows / Esc inside the terminal instead of moving focus.
-                ui.memory_mut(|m| {
-                    m.set_focus_lock_filter(
-                        resp.id,
-                        egui::EventFilter { tab: true, horizontal_arrows: true, vertical_arrows: true, escape: true },
-                    )
-                });
-            }
-
-            // Draw the screen grid.
-            let origin = resp.rect.min;
-            let default_fg = ui.visuals().text_color();
-            let default_bg = ui.visuals().extreme_bg_color;
-            let parser = term.parser();
-            if let Ok(guard) = parser.lock() {
-                let screen = guard.screen();
-                for row in 0..rows {
-                    for col in 0..cols {
-                        let Some(cell) = screen.cell(row, col) else { continue };
-                        let x = origin.x + col as f32 * cell_w;
-                        let y = origin.y + row as f32 * cell_h;
-                        let mut fg = conv(cell.fgcolor(), default_fg);
-                        let mut bg = conv_opt(cell.bgcolor());
-                        if cell.inverse() {
-                            // Swap foreground and background (default bg fills in).
-                            let new_bg = fg;
-                            fg = bg.unwrap_or(default_bg);
-                            bg = Some(new_bg);
-                        }
-                        let rect = egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(cell_w, cell_h));
-                        if let Some(bg) = bg {
-                            painter.rect_filled(rect, 0.0, bg);
-                        }
-                        let glyph = cell.contents();
-                        if !glyph.is_empty() {
-                            painter.text(egui::pos2(x, y), egui::Align2::LEFT_TOP, glyph, font.clone(), fg);
-                        }
-                    }
-                }
-                if !screen.hide_cursor() {
-                    let (cr, cc) = screen.cursor_position();
-                    let x = origin.x + cc as f32 * cell_w;
-                    let y = origin.y + cr as f32 * cell_h;
-                    let rect = egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(cell_w, cell_h));
-                    let color = if focused {
-                        egui::Color32::from_rgba_unmultiplied(180, 180, 180, 130)
-                    } else {
-                        egui::Color32::from_rgba_unmultiplied(120, 120, 120, 80)
-                    };
-                    painter.rect_filled(rect, 0.0, color);
+            // Confirm before killing a shell, to guard against accidental clicks.
+            if let Some(i) = app.terminal_close_confirm {
+                if i >= app.terminals.len() {
+                    app.terminal_close_confirm = None;
+                } else {
+                    let title = app.terminals[i].title.clone();
+                    egui::Window::new("close_terminal_confirm")
+                        .title_bar(false)
+                        .collapsible(false)
+                        .resizable(false)
+                        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                        .show(ctx, |ui| {
+                            ui.label(egui::RichText::new("Close terminal").strong());
+                            ui.label(format!("Close \"{}\"? Its running shell will be terminated.", title));
+                            ui.add_space(6.0);
+                            ui.horizontal(|ui| {
+                                if ui.button("Close").clicked() {
+                                    to_close = Some(i);
+                                    app.terminal_close_confirm = None;
+                                }
+                                if ui.button("Cancel").clicked() {
+                                    app.terminal_close_confirm = None;
+                                }
+                            });
+                        });
                 }
             }
 
-            if !focused {
-                painter.text(
-                    resp.rect.left_bottom() + egui::vec2(4.0, -4.0),
-                    egui::Align2::LEFT_BOTTOM,
-                    "click to focus",
-                    egui::FontId::proportional(11.0),
-                    egui::Color32::from_gray(120),
-                );
+            if add {
+                spawn_terminal(app, ctx);
+            }
+            if let Some(i) = to_close {
+                app.renaming_terminal = None;
+                app.terminals.remove(i); // Drop kills the child process.
+                if app.terminals.is_empty() {
+                    app.show_shell = false;
+                    return;
+                }
+                if app.active_terminal >= app.terminals.len() {
+                    app.active_terminal = app.terminals.len() - 1;
+                }
             }
 
-            // Forward keystrokes to the shell.
-            if focused {
-                let mut bytes: Vec<u8> = Vec::new();
-                ui.input(|i| {
-                    for ev in &i.events {
-                        match ev {
-                            egui::Event::Text(t) => bytes.extend_from_slice(t.as_bytes()),
-                            egui::Event::Paste(t) => bytes.extend_from_slice(t.as_bytes()),
-                            egui::Event::Key { key, pressed: true, modifiers, .. } => {
-                                translate_key(*key, *modifiers, &mut bytes)
-                            }
-                            _ => {}
-                        }
+            render_active(app, ctx, ui);
+        });
+}
+
+/// Create a new terminal tab and make it active.
+fn spawn_terminal(app: &mut IkIdeApp, ctx: &egui::Context) {
+    app.next_terminal_id += 1;
+    let title = format!("Terminal {}", app.next_terminal_id);
+    let repaint = {
+        let ctx = ctx.clone();
+        move || ctx.request_repaint()
+    };
+    if let Ok(t) = crate::core::shell::Terminal::spawn(app.workspace_dir.clone(), title, repaint) {
+        app.terminals.push(t);
+        app.active_terminal = app.terminals.len() - 1;
+    }
+}
+
+/// Draw the active terminal's grid and forward input to it.
+fn render_active(app: &mut IkIdeApp, ctx: &egui::Context, ui: &mut egui::Ui) {
+    let term = &mut app.terminals[app.active_terminal];
+
+    let font = egui::FontId::monospace(FONT_SIZE);
+    let (cell_w, cell_h) = ui.fonts(|f| (f.glyph_width(&font, 'M'), f.row_height(&font)));
+
+    let avail = ui.available_size();
+    let cols = (avail.x / cell_w).floor().clamp(20.0, 400.0) as u16;
+    let rows = (avail.y / cell_h).floor().clamp(4.0, 200.0) as u16;
+    term.resize(rows, cols);
+
+    let (resp, painter) = ui.allocate_painter(
+        egui::vec2(cols as f32 * cell_w, rows as f32 * cell_h),
+        egui::Sense::click(),
+    );
+    if resp.clicked() {
+        resp.request_focus();
+    }
+    let focused = resp.has_focus();
+    if focused {
+        // Keep Tab / arrows / Esc inside the terminal instead of moving focus.
+        ui.memory_mut(|m| {
+            m.set_focus_lock_filter(
+                resp.id,
+                egui::EventFilter { tab: true, horizontal_arrows: true, vertical_arrows: true, escape: true },
+            )
+        });
+    }
+
+    // Dark backdrop, then the cells over it.
+    painter.rect_filled(resp.rect, 0.0, TERM_BG);
+    let origin = resp.rect.min;
+    let parser = term.parser();
+    if let Ok(guard) = parser.lock() {
+        let screen = guard.screen();
+        for row in 0..rows {
+            for col in 0..cols {
+                let Some(cell) = screen.cell(row, col) else { continue };
+                let x = origin.x + col as f32 * cell_w;
+                let y = origin.y + row as f32 * cell_h;
+                let mut fg = conv(cell.fgcolor(), TERM_FG);
+                let mut bg = conv_opt(cell.bgcolor());
+                if cell.inverse() {
+                    let new_bg = fg;
+                    fg = bg.unwrap_or(TERM_BG);
+                    bg = Some(new_bg);
+                }
+                let rect = egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(cell_w, cell_h));
+                if let Some(bg) = bg {
+                    painter.rect_filled(rect, 0.0, bg);
+                }
+                let glyph = cell.contents();
+                if !glyph.is_empty() {
+                    painter.text(egui::pos2(x, y), egui::Align2::LEFT_TOP, glyph, font.clone(), fg);
+                }
+            }
+        }
+        if !screen.hide_cursor() {
+            let (cr, cc) = screen.cursor_position();
+            let x = origin.x + cc as f32 * cell_w;
+            let y = origin.y + cr as f32 * cell_h;
+            let rect = egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(cell_w, cell_h));
+            let color = if focused {
+                egui::Color32::from_rgba_unmultiplied(210, 210, 210, 140)
+            } else {
+                egui::Color32::from_rgba_unmultiplied(150, 150, 150, 80)
+            };
+            painter.rect_filled(rect, 0.0, color);
+        }
+    }
+
+    if !focused {
+        painter.text(
+            resp.rect.left_bottom() + egui::vec2(4.0, -4.0),
+            egui::Align2::LEFT_BOTTOM,
+            "click to focus",
+            egui::FontId::proportional(11.0),
+            egui::Color32::from_gray(140),
+        );
+    }
+
+    if focused {
+        let mut bytes: Vec<u8> = Vec::new();
+        ui.input(|i| {
+            for ev in &i.events {
+                match ev {
+                    egui::Event::Text(t) => bytes.extend_from_slice(t.as_bytes()),
+                    egui::Event::Paste(t) => bytes.extend_from_slice(t.as_bytes()),
+                    egui::Event::Key { key, pressed: true, modifiers, .. } => {
+                        translate_key(*key, *modifiers, &mut bytes)
                     }
-                });
-                if !bytes.is_empty() {
-                    term.send(&bytes);
-                    ctx.request_repaint();
+                    _ => {}
                 }
             }
         });
+        if !bytes.is_empty() {
+            term.send(&bytes);
+            ctx.request_repaint();
+        }
+    }
 }
 
 /// Translate a non-text key press into the bytes a terminal expects.
@@ -211,24 +323,25 @@ fn conv_opt(c: vt100::Color) -> Option<egui::Color32> {
     }
 }
 
-/// The standard xterm 256-colour palette.
+/// The xterm 256-colour palette, with the dim blue lightened so it reads on the
+/// dark terminal background.
 fn ansi256(i: u8) -> egui::Color32 {
     let (r, g, b) = match i {
-        0 => (0, 0, 0),
-        1 => (205, 0, 0),
-        2 => (0, 205, 0),
-        3 => (205, 205, 0),
-        4 => (0, 0, 238),
-        5 => (205, 0, 205),
-        6 => (0, 205, 205),
-        7 => (229, 229, 229),
+        0 => (30, 30, 30),
+        1 => (224, 80, 80),
+        2 => (120, 200, 120),
+        3 => (210, 195, 110),
+        4 => (90, 140, 240),
+        5 => (210, 120, 210),
+        6 => (90, 200, 205),
+        7 => (210, 210, 210),
         8 => (127, 127, 127),
-        9 => (255, 0, 0),
-        10 => (0, 255, 0),
-        11 => (255, 255, 0),
-        12 => (92, 92, 255),
-        13 => (255, 0, 255),
-        14 => (0, 255, 255),
+        9 => (255, 110, 110),
+        10 => (120, 230, 120),
+        11 => (240, 230, 120),
+        12 => (120, 165, 255),
+        13 => (240, 130, 240),
+        14 => (110, 230, 235),
         15 => (255, 255, 255),
         16..=231 => {
             let i = i - 16;

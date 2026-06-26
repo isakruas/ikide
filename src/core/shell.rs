@@ -26,6 +26,7 @@ use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, Pt
 /// One live terminal session: the PTY master, a writer to its input, and the
 /// shared parser the reader thread fills from the PTY output.
 pub struct Terminal {
+    pub title: String,
     parser: Arc<Mutex<vt100::Parser>>,
     writer: Box<dyn Write + Send>,
     master: Box<dyn MasterPty + Send>,
@@ -48,6 +49,7 @@ impl Terminal {
     /// arrives so the UI can redraw.
     pub fn spawn<F: Fn() + Send + 'static>(
         workspace: Option<PathBuf>,
+        title: String,
         repaint: F,
     ) -> Result<Terminal, String> {
         let rows: u16 = 24;
@@ -89,7 +91,7 @@ impl Terminal {
             }
         });
 
-        Ok(Terminal { parser, writer, master: pair.master, killer, rows, cols })
+        Ok(Terminal { title, parser, writer, master: pair.master, killer, rows, cols })
     }
 
     /// Send raw bytes (a keystroke translation) to the shell.

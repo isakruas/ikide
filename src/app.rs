@@ -210,10 +210,18 @@ pub struct IkIdeApp {
     /// stop auto-reopening it.
     pub output_dismissed: bool,
 
-    /// Interactive terminal panel running a shell in the workspace directory.
+    /// Interactive terminal panel running shells in the workspace directory.
     pub show_shell: bool,
-    /// Live PTY terminal session, created on first open.
-    pub terminal: Option<crate::core::shell::Terminal>,
+    /// Open terminal sessions (tabs) and which one is shown.
+    pub terminals: Vec<crate::core::shell::Terminal>,
+    pub active_terminal: usize,
+    /// Monotonic counter for stable terminal tab numbering.
+    pub next_terminal_id: usize,
+    /// Tab whose title is being edited inline, and the edit buffer.
+    pub renaming_terminal: Option<usize>,
+    pub terminal_rename_buf: String,
+    /// Tab awaiting close confirmation (guards against an accidental click).
+    pub terminal_close_confirm: Option<usize>,
     pub show_about: bool,
     pub show_examples: bool,
     pub show_serial: bool,
@@ -431,7 +439,12 @@ impl Default for IkIdeApp {
             show_terminal: settings.show_terminal,
             output_dismissed: false,
             show_shell: false,
-            terminal: None,
+            terminals: Vec::new(),
+            active_terminal: 0,
+            next_terminal_id: 0,
+            renaming_terminal: None,
+            terminal_rename_buf: String::new(),
+            terminal_close_confirm: None,
             show_vm_trace: settings.show_vm_trace,
             show_stats: settings.show_stats,
             show_minimap: settings.show_minimap,
