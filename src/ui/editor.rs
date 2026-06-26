@@ -118,9 +118,17 @@ pub fn render(app: &mut IkIdeApp, ctx: &egui::Context) {
                     });
                     ui.separator();
                 }
-                // Compiled .hex files open as a read-only AVR disassembly.
+                // Compiled .hex files open as a read-only AVR disassembly. When the
+                // debugger is stepping this same file, its PC drives a highlight.
                 if tab.path.extension().map_or(false, |e| e.eq_ignore_ascii_case("hex")) {
-                    render_hex_disasm(ui, &tab.path, &tab.content, app.show_minimap);
+                    let cur_pc = if app.show_debugger
+                        && app.debug_source_path.as_deref() == Some(tab.path.as_path())
+                    {
+                        app.debug_vm.as_ref().map(|v| v.pc)
+                    } else {
+                        None
+                    };
+                    render_hex_disasm(ui, &tab.path, &tab.content, app.show_minimap, cur_pc);
                     return;
                 }
 
@@ -716,13 +724,19 @@ fn reindent(content: &str, sel_min: usize, sel_max: usize, dedent: bool) -> (Str
 /// Read-only AVR disassembly view for a `.hex` file. The listing is decoded from
 /// the in-memory content (the file is never modified), cached per path, syntax
 /// coloured, and shown with a synced minimap.
-fn render_hex_disasm(ui: &mut egui::Ui, path: &std::path::Path, content: &str, show_minimap: bool) {
+fn render_hex_disasm(
+    ui: &mut egui::Ui,
+    path: &std::path::Path,
+    content: &str,
+    show_minimap: bool,
+    cur_pc: Option<u32>,
+) {
     let key = egui::Id::new("hex_disasm").with(path);
     let cached: Option<(usize, std::sync::Arc<String>)> = ui.data(|d| d.get_temp(key));
     let listing = match cached {
         Some((len, text)) if len == content.len() => text,
         _ => {
-            let text = std::sync::Arc::new(ik8bvm::disasm::disassemble_ihex(content));
+            let text = std::sync::Arc::new(ik8bvm::disasm::disassemble_annotated(content));
             ui.data_mut(|d| d.insert_temp(key, (content.len(), text.clone())));
             text
         }
@@ -745,7 +759,7 @@ fn render_hex_disasm(ui: &mut egui::Ui, path: &std::path::Path, content: &str, s
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         let resp = ui.add(
-                            egui::Label::new(highlight_asm(&listing, 3.0))
+                            egui::Label::new(highlight_asm(&listing, 3.0, cur_pc))
                                 .selectable(false)
                                 .sense(egui::Sense::click_and_drag()),
                         );
@@ -774,6 +788,22 @@ fn render_hex_disasm(ui: &mut egui::Ui, path: &std::path::Path, content: &str, s
             });
     }
 
+    // When the debugger's PC moves, scroll the current instruction into view.
+    if let Some(pc) = cur_pc {
+        let last: Option<u32> = ui.data(|d| d.get_temp(egui::Id::new("hex_pc")));
+        if last != Some(pc) {
+            let prefix = format!("{:06X}:", pc);
+            if let Some(idx) = listing.lines().position(|l| l.starts_with(&prefix)) {
+                let row_h = ui.fonts(|f| f.row_height(&egui::FontId::monospace(14.0)));
+                let target = (idx as f32 * row_h - view_h / 2.0).max(0.0);
+                ui.data_mut(|d| {
+                    d.insert_temp(egui::Id::new("hex_force_scroll"), target);
+                    d.insert_temp(egui::Id::new("hex_pc"), pc);
+                });
+            }
+        }
+    }
+
     let force = ui.data_mut(|d| {
         let v = d.get_temp::<f32>(egui::Id::new("hex_force_scroll"));
         if v.is_some() {
@@ -786,7 +816,7 @@ fn render_hex_disasm(ui: &mut egui::Ui, path: &std::path::Path, content: &str, s
         scroll = scroll.vertical_scroll_offset(target);
     }
     let out = scroll.show(ui, |ui| {
-        ui.add(egui::Label::new(highlight_asm(&listing, 14.0)).wrap_mode(egui::TextWrapMode::Extend));
+        ui.add(egui::Label::new(highlight_asm(&listing, 14.0, cur_pc)).wrap_mode(egui::TextWrapMode::Extend));
     });
     ui.data_mut(|d| {
         d.insert_temp(egui::Id::new("hex_y_offset"), out.state.offset.y);
@@ -797,18 +827,36 @@ fn render_hex_disasm(ui: &mut egui::Ui, path: &std::path::Path, content: &str, s
 
 /// Colour an AVR disassembly listing: address/byte columns dimmed, mnemonics,
 /// registers and hex literals each in their own colour.
-fn highlight_asm(text: &str, size: f32) -> egui::text::LayoutJob {
+fn highlight_asm(text: &str, size: f32, highlight_addr: Option<u32>) -> egui::text::LayoutJob {
     use egui::text::{LayoutJob, TextFormat};
     let font = egui::FontId::monospace(size);
-    let fmt = |c: egui::Color32| TextFormat::simple(font.clone(), c);
+    // Build a text format, optionally with the current-instruction background.
+    let hl_bg = egui::Color32::from_rgb(40, 60, 95);
+    let make = |c: egui::Color32, hl: bool| {
+        let mut f = TextFormat::simple(font.clone(), c);
+        if hl {
+            f.background = hl_bg;
+        }
+        f
+    };
     let prefix = egui::Color32::from_gray(110);
     let instr = egui::Color32::from_rgb(120, 190, 255);
     let reg = egui::Color32::from_rgb(150, 220, 150);
     let num = egui::Color32::from_rgb(230, 180, 110);
     let def = egui::Color32::from_gray(205);
+    let label = egui::Color32::from_rgb(220, 190, 120);
 
+    let hl_prefix = highlight_addr.map(|a| format!("{:06X}:", a));
     let mut job = LayoutJob::default();
     for line in text.lines() {
+        let hl = hl_prefix.as_deref().map_or(false, |p| line.starts_with(p));
+        let fmt = |c: egui::Color32| make(c, hl);
+        // A label line ("reset:", "L_000034:") names a jump target.
+        if line.ends_with(':') && !line.contains(' ') {
+            job.append(line, 0.0, fmt(label));
+            job.append("\n", 0.0, fmt(def));
+            continue;
+        }
         // Lines are "AAAAAA:  WWWW WWWW  MNEMONIC operands"; the 20-char prefix is
         // the address and byte columns. Anything else is shown plain.
         if line.len() >= 20 && line.as_bytes().get(6) == Some(&b':') {

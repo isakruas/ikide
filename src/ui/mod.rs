@@ -13,6 +13,7 @@
 // limitations under the License.
 
 pub mod breadboard;
+pub mod debugger;
 pub mod editor;
 pub mod explorer;
 pub mod serial;

@@ -180,6 +180,10 @@ pub struct PendingAgent {
     pub buf: String,
 }
 
+/// Visible span of the debugger's RAM-usage graph, in CPU cycles. Older samples
+/// scroll off the left so the curve keeps a fixed scale instead of compressing.
+pub const DEBUG_RAM_WINDOW_CYCLES: u64 = 1024;
+
 pub struct IkIdeApp {
     pub workspace_dir: Option<PathBuf>,
     pub workspace_tree: Option<FileNode>,
@@ -209,6 +213,22 @@ pub struct IkIdeApp {
     /// Set when the user explicitly closes the Output panel, so build/run actions
     /// stop auto-reopening it.
     pub output_dismissed: bool,
+
+    /// Step-by-step debugger: an in-process VM stepped one instruction at a time.
+    pub show_debugger: bool,
+    pub debug_vm: Option<ik8bvm::core::AvrVm>,
+    /// Program image (flash bytes) and target loaded into the debugger, kept so
+    /// Reset can rebuild the VM without recompiling.
+    pub debug_flash: Vec<u8>,
+    pub debug_device: String,
+    pub debug_executed: u64,
+    pub debug_status: String,
+    /// Stack-usage samples (cycle, bytes) collected as the debugger steps, shown
+    /// over a fixed cycle window so the graph slides instead of compressing.
+    pub debug_ram_history: Vec<(u64, u16)>,
+    /// File currently loaded in the debugger, so a newly selected .hex auto-loads
+    /// once instead of every frame.
+    pub debug_source_path: Option<PathBuf>,
 
     /// Interactive terminal panel running shells in the workspace directory.
     pub show_shell: bool,
@@ -438,6 +458,14 @@ impl Default for IkIdeApp {
             right_panel_width: settings.right_panel_width,
             show_terminal: settings.show_terminal,
             output_dismissed: false,
+            show_debugger: false,
+            debug_vm: None,
+            debug_flash: Vec::new(),
+            debug_device: "atmega328p".to_string(),
+            debug_executed: 0,
+            debug_status: String::new(),
+            debug_ram_history: Vec::new(),
+            debug_source_path: None,
             show_shell: false,
             terminals: Vec::new(),
             active_terminal: 0,
@@ -1074,6 +1102,136 @@ impl IkIdeApp {
     }
 
     /// Drain whatever the serial reader thread produced into the monitor log.
+    /// Load the active file into the debugger: compile an .ik source or parse a
+    /// .hex, then build a fresh VM and reset it. Returns an error on failure.
+    pub fn start_debug(&mut self) -> Result<(), String> {
+        let Some(idx) = self.active_tab else {
+            return Err("No file open to debug.".to_string());
+        };
+        let tab = &self.open_tabs[idx];
+        let source_path = tab.path.clone();
+        let is_hex = tab.path.extension().map_or(false, |e| e.eq_ignore_ascii_case("hex"));
+        let (hex_text, device) = if is_hex {
+            (tab.content.clone(), self.debug_device.clone())
+        } else {
+            crate::core::analysis::sync_std_imports(&tab.content);
+            let artifact = crate::core::analysis::compile(&tab.content).map_err(|d| {
+                let loc = if d.line > 0 { format!("line {}: ", d.line) } else { String::new() };
+                format!("Compilation failed — {}{}", loc, d.message)
+            })?;
+            (artifact.hex, artifact.device)
+        };
+        let flash = ik8bvm::disasm::parse_ihex(&hex_text);
+        if flash.is_empty() {
+            return Err("Empty program — nothing to debug.".to_string());
+        }
+        self.debug_flash = flash;
+        self.debug_device = device;
+        self.debug_source_path = Some(source_path);
+        self.debug_build_vm();
+        self.show_debugger = true;
+        Ok(())
+    }
+
+    /// Drive the debugger's visibility from the active file: it shows for a .hex
+    /// (auto-loaded once per file) or for the source currently being debugged, and
+    /// hides otherwise — so there is no manual close that could strand it.
+    pub fn maybe_autoload_debugger(&mut self) {
+        let active_path = self
+            .active_tab
+            .and_then(|i| self.open_tabs.get(i))
+            .map(|t| t.path.clone());
+        let active_is_hex = active_path
+            .as_ref()
+            .map_or(false, |p| p.extension().map_or(false, |e| e.eq_ignore_ascii_case("hex")));
+
+        if active_is_hex {
+            let p = active_path.unwrap();
+            if self.debug_source_path.as_ref() != Some(&p) {
+                self.debug_source_path = Some(p);
+                if let Err(e) = self.start_debug() {
+                    self.debug_status = e;
+                }
+            }
+            self.show_debugger = true;
+        } else if self.debug_vm.is_some() && active_path.is_some() && self.debug_source_path == active_path {
+            // The active (non-hex) file is the one being debugged.
+            self.show_debugger = true;
+        } else {
+            self.show_debugger = false;
+        }
+    }
+
+    /// (Re)build the debugger VM from the loaded flash image and reset it.
+    fn debug_build_vm(&mut self) {
+        let mut vm = crate::core::runner::build_vm(&self.debug_device);
+        let n = self.debug_flash.len().min(vm.flash.len());
+        vm.flash[..n].copy_from_slice(&self.debug_flash[..n]);
+        vm.reset();
+        self.debug_executed = 0;
+        self.debug_status = "ready".to_string();
+        self.debug_ram_history.clear();
+        self.debug_vm = Some(vm);
+    }
+
+    /// Restart the loaded program from the beginning.
+    pub fn debug_reset(&mut self) {
+        if !self.debug_flash.is_empty() {
+            self.debug_build_vm();
+        }
+    }
+
+    /// Execute up to `count` instructions, stopping early on halt or a bad opcode.
+    pub fn debug_step(&mut self, count: usize) {
+        // Sample roughly this often (in cycles) so the window has resolution
+        // without recording every instruction on a long Run.
+        const SAMPLE_INTERVAL: u64 = 8;
+        let mut steps = 0u64;
+        let mut status = self.debug_status.clone();
+        let mut samples: Vec<(u64, u16)> = Vec::new();
+        if let Some(vm) = &mut self.debug_vm {
+            let top = vm.sram_start + vm.sram_bytes - 1;
+            let stack = |sp: u16| top.saturating_sub(sp as u32).min(u16::MAX as u32) as u16;
+            let mut next = self
+                .debug_ram_history
+                .last()
+                .map(|(c, _)| c + SAMPLE_INTERVAL)
+                .unwrap_or(0);
+            for _ in 0..count {
+                if !vm.running || vm.unknown_opcode {
+                    break;
+                }
+                vm.step();
+                steps += 1;
+                if vm.cycles >= next {
+                    samples.push((vm.cycles, stack(vm.sp)));
+                    next = vm.cycles + SAMPLE_INTERVAL;
+                }
+            }
+            samples.push((vm.cycles, stack(vm.sp)));
+            status = if vm.unknown_opcode {
+                "unknown opcode"
+            } else if !vm.running {
+                "halted"
+            } else {
+                "running"
+            }
+            .to_string();
+        }
+        self.debug_ram_history.extend(samples);
+        // Drop samples older than the visible window (keep one just before it for
+        // a continuous left edge).
+        if let Some(&(latest, _)) = self.debug_ram_history.last() {
+            let cutoff = latest.saturating_sub(DEBUG_RAM_WINDOW_CYCLES);
+            let first_in = self.debug_ram_history.partition_point(|(c, _)| *c < cutoff);
+            if first_in > 1 {
+                self.debug_ram_history.drain(0..first_in - 1);
+            }
+        }
+        self.debug_executed += steps;
+        self.debug_status = status;
+    }
+
     pub fn pump_serial(&mut self) {
         let mut msgs = Vec::new();
         if let Some(conn) = &self.serial {
@@ -2407,6 +2565,13 @@ impl eframe::App for IkIdeApp {
                         runner::spawn_simulate(self.workspace_dir.clone(), path, text, self.task_tx.clone(), self.sim_config(), cancel);
                         ui.close_menu();
                     }
+                    if ui.add_enabled(!self.is_busy && self.active_tab.is_some(), egui::Button::new("◻ Debug (step)")).clicked() {
+                        if let Err(e) = self.start_debug() {
+                            self.debug_status = e;
+                            self.show_debugger = true;
+                        }
+                        ui.close_menu();
+                    }
                     if ui.add_enabled(!self.is_busy, egui::Button::new("◻ Run Tests")).clicked() {
                         self.save_active_file();
                         let cancel = self.begin_task(false);
@@ -2725,6 +2890,10 @@ impl eframe::App for IkIdeApp {
         explorer::render(self, ctx);
         if self.show_vm_trace || self.show_ai_chat {
             right_panel::render(self, ctx);
+        }
+        self.maybe_autoload_debugger();
+        if self.show_debugger {
+            crate::ui::debugger::render(self, ctx);
         }
         crate::ui::serial::render(self, ctx);
         crate::ui::breadboard::render(self, ctx);
