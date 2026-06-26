@@ -118,6 +118,12 @@ pub fn render(app: &mut IkIdeApp, ctx: &egui::Context) {
                     });
                     ui.separator();
                 }
+                // Compiled .hex files open as a read-only AVR disassembly.
+                if tab.path.extension().map_or(false, |e| e.eq_ignore_ascii_case("hex")) {
+                    render_hex_disasm(ui, &tab.path, &tab.content, app.show_minimap);
+                    return;
+                }
+
                 // Only ik8b sources get syntax styling and language features;
                 // any other file is shown as plain text.
                 let is_ik = crate::app::is_ik_file(&tab.path);
@@ -705,6 +711,150 @@ fn reindent(content: &str, sel_min: usize, sel_max: usize, dedent: bool) -> (Str
     let new_min = (smin as isize + dmin).max(0) as usize;
     let new_max = (smax as isize + dmax).max(0) as usize;
     (out.into_iter().collect(), new_min, new_max)
+}
+
+/// Read-only AVR disassembly view for a `.hex` file. The listing is decoded from
+/// the in-memory content (the file is never modified), cached per path, syntax
+/// coloured, and shown with a synced minimap.
+fn render_hex_disasm(ui: &mut egui::Ui, path: &std::path::Path, content: &str, show_minimap: bool) {
+    let key = egui::Id::new("hex_disasm").with(path);
+    let cached: Option<(usize, std::sync::Arc<String>)> = ui.data(|d| d.get_temp(key));
+    let listing = match cached {
+        Some((len, text)) if len == content.len() => text,
+        _ => {
+            let text = std::sync::Arc::new(ik8bvm::disasm::disassemble_ihex(content));
+            ui.data_mut(|d| d.insert_temp(key, (content.len(), text.clone())));
+            text
+        }
+    };
+
+    // Scroll state captured from the main view last frame, for the minimap.
+    let offset_y: f32 = ui.data(|d| d.get_temp(egui::Id::new("hex_y_offset")).unwrap_or(0.0));
+    let content_h: f32 = ui.data(|d| d.get_temp(egui::Id::new("hex_content_h")).unwrap_or(1.0));
+    let view_h: f32 = ui.data(|d| d.get_temp(egui::Id::new("hex_view_h")).unwrap_or(1.0));
+
+    if show_minimap {
+        egui::SidePanel::right("hex_minimap_panel")
+            .resizable(true)
+            .default_width(120.0)
+            .min_width(60.0)
+            .max_width(260.0)
+            .show_inside(ui, |ui| {
+                egui::ScrollArea::both()
+                    .id_salt("hex_minimap_scroll")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        let resp = ui.add(
+                            egui::Label::new(highlight_asm(&listing, 3.0))
+                                .selectable(false)
+                                .sense(egui::Sense::click_and_drag()),
+                        );
+                        if content_h > 0.0 {
+                            let rect_y = resp.rect.top() + resp.rect.height() * (offset_y / content_h);
+                            let rect_h = resp.rect.height() * (view_h / content_h);
+                            ui.painter().rect_filled(
+                                egui::Rect::from_min_size(
+                                    egui::pos2(resp.rect.left(), rect_y),
+                                    egui::vec2(resp.rect.width(), rect_h),
+                                ),
+                                0.0,
+                                egui::Color32::from_white_alpha(30),
+                            );
+                            if resp.dragged() || resp.clicked() {
+                                if let Some(pos) = resp.interact_pointer_pos() {
+                                    let ratio = (pos.y - resp.rect.top()) / resp.rect.height();
+                                    let target = (ratio * content_h - view_h / 2.0)
+                                        .clamp(0.0, (content_h - view_h).max(0.0));
+                                    ui.data_mut(|d| d.insert_temp(egui::Id::new("hex_force_scroll"), target));
+                                    ui.ctx().request_repaint();
+                                }
+                            }
+                        }
+                    });
+            });
+    }
+
+    let force = ui.data_mut(|d| {
+        let v = d.get_temp::<f32>(egui::Id::new("hex_force_scroll"));
+        if v.is_some() {
+            d.remove_temp::<f32>(egui::Id::new("hex_force_scroll"));
+        }
+        v
+    });
+    let mut scroll = egui::ScrollArea::both().id_salt("hex_scroll").auto_shrink([false, false]);
+    if let Some(target) = force {
+        scroll = scroll.vertical_scroll_offset(target);
+    }
+    let out = scroll.show(ui, |ui| {
+        ui.add(egui::Label::new(highlight_asm(&listing, 14.0)).wrap_mode(egui::TextWrapMode::Extend));
+    });
+    ui.data_mut(|d| {
+        d.insert_temp(egui::Id::new("hex_y_offset"), out.state.offset.y);
+        d.insert_temp(egui::Id::new("hex_content_h"), out.content_size.y);
+        d.insert_temp(egui::Id::new("hex_view_h"), out.inner_rect.height());
+    });
+}
+
+/// Colour an AVR disassembly listing: address/byte columns dimmed, mnemonics,
+/// registers and hex literals each in their own colour.
+fn highlight_asm(text: &str, size: f32) -> egui::text::LayoutJob {
+    use egui::text::{LayoutJob, TextFormat};
+    let font = egui::FontId::monospace(size);
+    let fmt = |c: egui::Color32| TextFormat::simple(font.clone(), c);
+    let prefix = egui::Color32::from_gray(110);
+    let instr = egui::Color32::from_rgb(120, 190, 255);
+    let reg = egui::Color32::from_rgb(150, 220, 150);
+    let num = egui::Color32::from_rgb(230, 180, 110);
+    let def = egui::Color32::from_gray(205);
+
+    let mut job = LayoutJob::default();
+    for line in text.lines() {
+        // Lines are "AAAAAA:  WWWW WWWW  MNEMONIC operands"; the 20-char prefix is
+        // the address and byte columns. Anything else is shown plain.
+        if line.len() >= 20 && line.as_bytes().get(6) == Some(&b':') {
+            job.append(&line[..20], 0.0, fmt(prefix));
+            let rest = &line[20..];
+            let mut first = true;
+            let mut i = 0;
+            while i < rest.len() {
+                let c = rest[i..].chars().next().unwrap();
+                if c.is_alphanumeric() || c == '_' || c == '.' {
+                    let start = i;
+                    while i < rest.len() {
+                        let cc = rest[i..].chars().next().unwrap();
+                        if cc.is_alphanumeric() || cc == '_' || cc == '.' {
+                            i += cc.len_utf8();
+                        } else {
+                            break;
+                        }
+                    }
+                    let tok = &rest[start..i];
+                    let color = if first {
+                        first = false;
+                        instr
+                    } else if is_reg(tok) {
+                        reg
+                    } else if tok.starts_with("0x") || tok.starts_with("0X") {
+                        num
+                    } else {
+                        def
+                    };
+                    job.append(tok, 0.0, fmt(color));
+                } else {
+                    job.append(&rest[i..i + c.len_utf8()], 0.0, fmt(def));
+                    i += c.len_utf8();
+                }
+            }
+        } else {
+            job.append(line, 0.0, fmt(def));
+        }
+        job.append("\n", 0.0, fmt(def));
+    }
+    job
+}
+
+fn is_reg(tok: &str) -> bool {
+    tok.len() > 1 && tok.starts_with('R') && tok[1..].bytes().all(|b| b.is_ascii_digit())
 }
 
 #[cfg(test)]
