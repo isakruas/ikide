@@ -226,7 +226,9 @@ pub fn render(app: &mut IkIdeApp, ctx: &egui::Context) {
                         let gutter_x = ui.cursor().min.x;
                         ui.add_space(gutter_w + 8.0); // column + gap for the divider
 
-                        let text_edit_id = ui.id().with("editor_multiline");
+                        // Key the editor (and thus its undo/redo and cursor state)
+                        // by file path, so each tab has its own independent history.
+                        let text_edit_id = ui.id().with("editor_multiline").with(&tab.path);
                         let mut layouter = |ui: &egui::Ui, string: &str, wrap_width: f32| {
                             let mut selection = None;
                             if let Some(state) = egui::TextEdit::load_state(ui.ctx(), text_edit_id) {

@@ -87,6 +87,9 @@ in the breadboard catalog); the compiled `.hex` is written to `build/` by ide_co
 artifact, so never hand-write or edit it. Set up the breadboard with the `ide_breadboard_catalog` / \
 `ide_breadboard_set` tools rather than writing board files by hand; an exported board is a `.json` \
 (e.g. `breadboard.json`). \
+Whenever you write or edit ik code, include clear, technical, descriptive comments at the appropriate \
+places — explaining what each section does and the intent behind it — so the user can follow what the \
+program is doing. The point is to teach, not just to produce working code. \
 Reply in PLAIN TEXT only, suitable for a narrow side panel: no Markdown at all — no **bold**, no #headings, \
 no `backticks` or code fences, no tables, no bullet/list markup. Keep replies short and focused on what you \
 did and why.";
@@ -99,8 +102,8 @@ fn build_guidance(language: &str, extra_context: &str) -> String {
     let lang = language.trim();
     if !lang.is_empty() && !lang.eq_ignore_ascii_case("auto") {
         out.push_str(&format!(
-            " Always write your replies to the user in {}, regardless of the language of their message \
-(keep code, identifiers and tool arguments unchanged).",
+            " Always write both your replies to the user and the comments inside any ik code you produce \
+in {}, regardless of the language of their message (keep code, identifiers and tool arguments unchanged).",
             lang
         ));
     }
