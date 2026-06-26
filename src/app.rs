@@ -2519,15 +2519,15 @@ impl eframe::App for IkIdeApp {
                     ui.separator();
                     
                     ui.label(egui::RichText::new("Vision").strong());
-                    ui.label("IK was created to push the true capabilities of 8-bit AVR microcontrollers to their limits. By breaking free from traditional, heavy abstractions, it empowers developers to deeply understand and optimize their hardware at the lowest level.");
+                    ui.label("IK exists to make 8-bit AVR microcontrollers approachable without hiding them. It drops the heavy abstractions of typical toolchains so you can read, understand, and tune exactly what runs on the chip.");
                     ui.add_space(4.0);
 
                     ui.label(egui::RichText::new("Purpose").strong());
-                    ui.label("A core goal of the IK language is true portability. It is designed to target a common subset of AVR instructions, ensuring that code can run seamlessly across a wide variety of chips without requiring massive rewrites when changing hardware.");
+                    ui.label("IK is built for portability. By targeting a common subset of AVR instructions, the same program runs across a wide range of chips, so changing hardware rarely means rewriting your code.");
                     ui.add_space(4.0);
 
                     ui.label(egui::RichText::new("Philosophy").strong());
-                    ui.label("True understanding comes from looking 'under the hood'. Built entirely in Rust for frictionless cross-platform development, the IK ecosystem provides cycle-accurate simulation, real-time resource statistics, and transparent bootloader flashing in a single cohesive environment.");
+                    ui.label("Real understanding comes from seeing what the hardware actually does. IK brings cycle-accurate simulation, live resource statistics, and transparent bootloader flashing together in one environment — from source to silicon, with nothing hidden.");
                     ui.add_space(8.0);
                     
                     ui.label(egui::RichText::new("Project Links").strong());
