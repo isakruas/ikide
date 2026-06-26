@@ -19,11 +19,14 @@ pub fn render(app: &mut IkIdeApp, ctx: &egui::Context) {
     egui::SidePanel::left("left_panel")
         .resizable(true)
         .default_width(app.left_panel_width)
+        .min_width(180.0)
+        .max_width((ctx.screen_rect().width() * 0.4).clamp(240.0, 480.0))
         .show(ctx, |ui| {
             if app.show_stats {
                 egui::TopBottomPanel::bottom("left_bottom_stats")
                     .resizable(true)
                     .min_height(100.0)
+                    .max_height(360.0)
                     .show_inside(ui, |ui| {
                         ui.label(egui::RichText::new("Resource Usage").strong());
                         ui.separator();
@@ -229,6 +232,19 @@ fn render_node(
                 }
             });
 
+        // The folder header is a selectable target for the drag rubber-band. The
+        // workspace root is excluded so it can't be swept into a bulk delete.
+        if !is_root {
+            row_rects.push((node.path.clone(), header.header_response.rect));
+            if selection.contains(&node.path) {
+                ui.painter().rect_filled(
+                    header.header_response.rect,
+                    2.0,
+                    egui::Color32::from_rgba_unmultiplied(100, 150, 255, 40),
+                );
+            }
+        }
+
         header.header_response.context_menu(|ui| {
             if ui.button("📄 New File").clicked() {
                 *action_popup = ActionPopup::CreateFile {
@@ -258,7 +274,7 @@ fn render_node(
                     ui.close_menu();
                 }
                 ui.separator();
-                if ui.button("Delete").clicked() {
+                if ui.button("◻ Delete").clicked() {
                     *action_popup = ActionPopup::Delete {
                         paths: vec![node.path.clone()],
                     };
@@ -298,7 +314,7 @@ fn render_node(
                 };
                 ui.close_menu();
             }
-            if ui.button("Duplicate").clicked() {
+            if ui.button("◻ Duplicate").clicked() {
                 let dst = duplicate_target(&node.path);
                 if std::fs::copy(&node.path, &dst).is_ok() {
                     *needs_refresh = true;
@@ -312,9 +328,9 @@ fn render_node(
             ui.separator();
             let multi = selection.len() > 1 && selection.contains(&node.path);
             let label = if multi {
-                format!("Delete {} selected", selection.len())
+                format!("◻ Delete {} selected", selection.len())
             } else {
-                "Delete".to_string()
+                "◻ Delete".to_string()
             };
             if ui.button(label).clicked() {
                 let paths = if multi {

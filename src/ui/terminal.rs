@@ -21,6 +21,7 @@ pub fn render(app: &mut IkIdeApp, ctx: &egui::Context) {
     egui::TopBottomPanel::bottom("terminal_panel")
         .resizable(true)
         .min_height(100.0)
+        .max_height((ctx.screen_rect().height() * 0.6).clamp(160.0, 520.0))
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("Output").strong());
@@ -45,7 +46,7 @@ pub fn render(app: &mut IkIdeApp, ctx: &egui::Context) {
                     if ui.button("✖").clicked() {
                         app.show_terminal = false;
                     }
-                    if ui.button("Clear").clicked() {
+                    if ui.button("◻ Clear").clicked() {
                         app.terminal_output.clear();
                     }
                     // Copy the whole output/VM log to the clipboard — handy when it

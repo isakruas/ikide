@@ -286,6 +286,11 @@ pub fn render(app: &mut IkIdeApp, ctx: &egui::Context) {
         .resizable(true)
         .default_width(780.0)
         .default_height(520.0)
+        .min_size([480.0, 320.0])
+        .max_size([
+            (ctx.screen_rect().width() * 0.95).max(780.0),
+            (ctx.screen_rect().height() * 0.95).max(520.0),
+        ])
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("🔌 Breadboard").strong());
@@ -311,7 +316,7 @@ pub fn render(app: &mut IkIdeApp, ctx: &egui::Context) {
                         act.start = true;
                     }
                 } else {
-                    if ui.button("Stop").clicked() {
+                    if ui.button("◻ Stop").clicked() {
                         act.stop = true;
                     }
                     let (txt, col) = if app.live_running {
@@ -515,8 +520,8 @@ pub fn render(app: &mut IkIdeApp, ctx: &egui::Context) {
 
             ui.separator();
             ui.horizontal(|ui| {
-                ui.selectable_value(&mut app.bb_tab, BreadboardTab::Schematic, "Board");
-                ui.selectable_value(&mut app.bb_tab, BreadboardTab::Uart, "UART");
+                ui.selectable_value(&mut app.bb_tab, BreadboardTab::Schematic, "◻ Board");
+                ui.selectable_value(&mut app.bb_tab, BreadboardTab::Uart, "◻ UART");
                 ui.selectable_value(&mut app.bb_tab, BreadboardTab::Spi, "🔗 SPI");
                 ui.selectable_value(&mut app.bb_tab, BreadboardTab::I2c, "🔗 I2C");
             });

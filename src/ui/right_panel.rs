@@ -46,7 +46,7 @@ pub fn render(app: &mut IkIdeApp, ctx: &egui::Context) {
                         if ui.button("✖").on_hover_text("Close").clicked() {
                             app.show_vm_trace = false;
                         }
-                        if ui.button("Clear").clicked() {
+                        if ui.button("◻ Clear").clicked() {
                             app.vm_output.clear();
                             app.vm_result = None;
                         }
@@ -92,10 +92,10 @@ fn render_ai_chat(ui: &mut egui::Ui, app: &mut IkIdeApp, ctx: &egui::Context) {
             if ui.button("✖").on_hover_text("Close").clicked() {
                 app.show_ai_chat = false;
             }
-            if ui.button("Clear").on_hover_text("Clear conversation").clicked() {
+            if ui.button("◻ Clear").on_hover_text("Clear conversation").clicked() {
                 app.ai_chat_history.clear();
             }
-            let eye = if app.agent_hide_system { "Show" } else { "Hide" };
+            let eye = if app.agent_hide_system { "◻ Show" } else { "◻ Hide" };
             let hint = if app.agent_hide_system {
                 "Show tool/system activity"
             } else {

@@ -134,6 +134,8 @@ pub fn render(app: &mut IkIdeApp, ctx: &egui::Context) {
                     egui::SidePanel::right("minimap_panel")
                         .resizable(true)
                         .default_width(120.0)
+                        .min_width(60.0)
+                        .max_width(260.0)
                         .show_inside(ui, |ui| {
                             egui::ScrollArea::both()
                                 .id_salt("minimap_scroll")

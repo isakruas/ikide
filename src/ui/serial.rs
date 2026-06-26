@@ -28,6 +28,11 @@ pub fn render(app: &mut IkIdeApp, ctx: &egui::Context) {
         .resizable(true)
         .default_width(520.0)
         .default_height(360.0)
+        .min_size([360.0, 220.0])
+        .max_size([
+            (ctx.screen_rect().width() * 0.9).max(520.0),
+            (ctx.screen_rect().height() * 0.9).max(360.0),
+        ])
         .show(ctx, |ui| {
             // Header styled like the rest of the UI (normal-size strong label),
             // not egui's large window title.
@@ -83,7 +88,7 @@ pub fn render(app: &mut IkIdeApp, ctx: &egui::Context) {
                 });
 
                 if connected {
-                    if ui.button("Disconnect").clicked() {
+                    if ui.button("◻ Disconnect").clicked() {
                         app.serial = None; // Drop stops the reader thread.
                         app.serial_output.push_str(&format!("{} --- disconnected ---\n", crate::app::now_ts()));
                     }
@@ -108,7 +113,7 @@ pub fn render(app: &mut IkIdeApp, ctx: &egui::Context) {
                 }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Clear").clicked() {
+                    if ui.button("◻ Clear").clicked() {
                         app.serial_output.clear();
                     }
                 });
@@ -206,7 +211,7 @@ pub fn render_plotter(app: &mut IkIdeApp, ui: &mut egui::Ui) {
 
     // Top control bar
     ui.horizontal(|ui| {
-        if ui.button("Clear Plot").clicked() {
+        if ui.button("◻ Clear Plot").clicked() {
             app.plot_history.clear();
             app.plot_labels.clear();
             app.plot_visible.clear();
@@ -215,7 +220,7 @@ pub fn render_plotter(app: &mut IkIdeApp, ui: &mut egui::Ui) {
         
         ui.separator();
         
-        ui.menu_button("Settings", |ui| {
+        ui.menu_button("◻ Settings", |ui| {
             ui.checkbox(&mut app.plot_grid, "Grid View");
             ui.checkbox(&mut app.plot_center_line, "Center Line");
             ui.checkbox(&mut app.plot_show_stats, "Show Stats Table");

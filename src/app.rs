@@ -2378,7 +2378,7 @@ impl eframe::App for IkIdeApp {
                         runner::spawn_simulate(self.workspace_dir.clone(), path, text, self.task_tx.clone(), self.sim_config(), cancel);
                         ui.close_menu();
                     }
-                    if ui.add_enabled(!self.is_busy, egui::Button::new("Run Tests")).clicked() {
+                    if ui.add_enabled(!self.is_busy, egui::Button::new("◻ Run Tests")).clicked() {
                         self.save_active_file();
                         let cancel = self.begin_task(false);
                         self.show_terminal = true;
@@ -2431,7 +2431,7 @@ impl eframe::App for IkIdeApp {
                 
                 if self.is_busy {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Stop").on_hover_text("Cancel the running task").clicked() {
+                        if ui.button("◻ Stop").on_hover_text("Cancel the running task").clicked() {
                             self.abandon_task();
                         }
                         ui.label("Working...");
@@ -2513,7 +2513,7 @@ impl eframe::App for IkIdeApp {
                 .resizable(false)
                 .default_width(450.0)
                 .show(ctx, |ui| {
-                    ui.label(egui::RichText::new("ℹ About IK IDE").strong().size(18.0));
+                    ui.label(egui::RichText::new("ℹ About IK IDE").strong());
                     ui.add_space(4.0);
                     ui.label(egui::RichText::new("Version 0.1.0").weak());
                     ui.separator();
