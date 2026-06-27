@@ -1530,6 +1530,18 @@ impl IkIdeApp {
             .unwrap_or(false)
     }
 
+    /// True when the active tab can be flashed to a board: an .ik source (whose
+    /// `build/<name>.hex` is uploaded) or a .hex file (uploaded directly).
+    pub fn active_is_uploadable(&self) -> bool {
+        self.active_tab
+            .and_then(|i| self.open_tabs.get(i))
+            .map(|t| {
+                is_ik_file(&t.path)
+                    || t.path.extension().map_or(false, |e| e.eq_ignore_ascii_case("hex"))
+            })
+            .unwrap_or(false)
+    }
+
     /// All diagnostics to display: the compiler's (debounced) plus the IDE's
     /// instant lints on the active buffer. When both flag the same line, the
     /// precise lint wins so the squiggle lands on the exact token.
@@ -1646,7 +1658,7 @@ impl IkIdeApp {
             self.active_tab = Some(self.open_tabs.len() - 1);
         } else {
             self.terminal_output.push_str(&format!("{} Failed to load file: {:?}\n", now_ts(), path));
-            if !self.output_dismissed { self.show_terminal = true; }
+            self.show_terminal = true;
         }
     }
 
@@ -1661,7 +1673,7 @@ impl IkIdeApp {
             }
             if let Err(e) = std::fs::write(&tab.path, &tab.content) {
                 self.terminal_output.push_str(&format!("{} Failed to save file: {}\n", now_ts(), e));
-                if !self.output_dismissed { self.show_terminal = true; }
+                self.show_terminal = true;
             } else {
                 tab.is_modified = false;
                 tab.is_disk_different = false;
@@ -1933,8 +1945,11 @@ changes) were really carried out:\n\n{}",
                     self.vm_result = Some(res);
                 }
                 TaskMsg::Upload(out) => {
+                    // Upload/burn progress is always surfaced — it streams a result
+                    // the user needs to see even if they had hidden the Output.
                     self.terminal_output.push_str(&stamp(&out));
-                    if !self.output_dismissed { self.show_terminal = true; }
+                    self.show_terminal = true;
+                    self.output_dismissed = false;
                 }
                 TaskMsg::Test(out) => {
                     if let Some(p) = &mut self.pending_agent {
@@ -2575,7 +2590,8 @@ impl eframe::App for IkIdeApp {
                     if ui.add_enabled(!self.is_busy, egui::Button::new("◻ Run Tests")).clicked() {
                         self.save_active_file();
                         let cancel = self.begin_task(false);
-                        if !self.output_dismissed { self.show_terminal = true; }
+                        self.show_terminal = true;
+                        self.output_dismissed = false;
                         self.terminal_output.clear();
                         self.terminal_output.push_str(&format!("{} --- Running Tests ---\n", now_ts()));
                         let target = if self.avrdude_target.is_empty() {
@@ -2586,16 +2602,46 @@ impl eframe::App for IkIdeApp {
                         crate::core::testbed::spawn_run_tests(self.workspace_dir.clone(), target, self.task_tx.clone(), cancel);
                         ui.close_menu();
                     }
-                    if ui.add_enabled(!self.is_busy && self.active_is_ik(), egui::Button::new("🔌 Upload to Board")).clicked() {
+                    if ui.add_enabled(!self.is_busy && self.active_is_uploadable(), egui::Button::new("🔌 Upload to Board")).clicked() {
                         self.save_active_file();
                         let _ = self.begin_task(false);
-                        if !self.output_dismissed { self.show_terminal = true; }
+                        // An explicit upload always surfaces its progress/result,
+                        // even if the user had previously dismissed the Output.
+                        self.show_terminal = true;
+                        self.output_dismissed = false;
                         self.terminal_output.clear();
                         let path = self.active_tab.map(|idx| self.open_tabs[idx].path.clone());
+                        // The bootloader needs the program's own target (page size,
+                        // boot section), read from the source's `target` directive —
+                        // not the avrdude part preference. Fall back to that only for
+                        // a raw .hex with no target to read.
+                        let device = self
+                            .active_tab
+                            .and_then(|i| self.open_tabs.get(i))
+                            .and_then(|t| crate::core::board::target_of(&t.content))
+                            .unwrap_or_else(|| self.avrdude_target.clone());
                         if self.use_bootloader {
+                            // The serial monitor and the bootloader can't share the
+                            // port; free it first or the bootloader's sync is eaten.
+                            if self.serial.as_ref().map_or(false, |c| c.port == self.bootloader_port) {
+                                self.serial = None;
+                                self.terminal_output.push_str(&format!(
+                                    "{} Disconnected serial monitor to free {}.\n",
+                                    now_ts(),
+                                    self.bootloader_port
+                                ));
+                            }
                             self.terminal_output.push_str(&format!("{} --- Uploading (bootloader) ---\n", now_ts()));
-                            runner::spawn_bootloader_upload(self.workspace_dir.clone(), path, self.bootloader_port.clone(), self.bootloader_baud, self.task_tx.clone());
+                            runner::spawn_bootloader_upload(self.workspace_dir.clone(), path, device, self.bootloader_port.clone(), self.bootloader_baud, self.task_tx.clone());
                         } else {
+                            if self.serial.as_ref().map_or(false, |c| c.port == self.avrdude_port) {
+                                self.serial = None;
+                                self.terminal_output.push_str(&format!(
+                                    "{} Disconnected serial monitor to free {}.\n",
+                                    now_ts(),
+                                    self.avrdude_port
+                                ));
+                            }
                             self.terminal_output.push_str(&format!("{} --- Uploading (avrdude) ---\n", now_ts()));
                             runner::spawn_upload(self.workspace_dir.clone(), path, self.avrdude_path.clone(), self.avrdude_target.clone(), self.avrdude_programmer.clone(), self.avrdude_port.clone(), self.avrdude_baudrate.clone(), self.avrdude_additional_flags.clone(), self.task_tx.clone());
                         }

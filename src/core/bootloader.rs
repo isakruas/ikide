@@ -14,10 +14,17 @@
 
 //! Host side of the on-board ik serial-bootloader protocol.
 //!
-//! Frame  host -> target:  `0x1B 'i' 'k'  CMD  LEN_HI LEN_LO  payload  CRC_HI CRC_LO`
+//! Frame  host -> target:  `0x1B 'i' 'k'  CMD  payload  CRC8`
 //! Reply  target -> host:  `ACK (0x06)` or `NAK (0x15)`, then command-specific bytes.
-//! The CRC is CRC-16/ARC (poly 0xA001, init 0) over `CMD,LEN_HI,LEN_LO,payload`,
-//! the same algorithm the device's `std/crc` `@crc16` uses.
+//! The CRC is CRC-8/MAXIM (poly 0x8C reflected, init 0) over the payload only
+//! (not CMD), the same algorithm the device's `std/crc` `@crc8` uses.
+//!
+//! There is no HELLO handshake and no length field: each command's payload
+//! length is fixed (RUN: none; WRITE: 2 address bytes + one flash page), so the
+//! device reads exactly the right number of bytes from the command alone. The
+//! host derives the page size and boot-section start from the selected MCU
+//! (`bootloader_params`) instead of querying the device, and detects a live
+//! loader by retrying the first WRITE across the board-reset window.
 
 use std::fs;
 use std::path::Path;
@@ -26,40 +33,53 @@ use std::time::{Duration, Instant};
 const SOF: [u8; 3] = [0x1B, b'i', b'k'];
 const ACK: u8 = 0x06;
 const NAK: u8 = 0x15;
-const CMD_HELLO: u8 = 0x01;
 const CMD_WRITE: u8 = 0x02;
 const CMD_RUN: u8 = 0x04;
 
-/// CRC-16/ARC — must match `std/crc`'s `@crc16` on the device.
-fn crc16(data: &[u8]) -> u16 {
-    let mut crc: u16 = 0;
+/// CRC-8/MAXIM (Dallas/Maxim) — must match `std/crc`'s `@crc8` on the device.
+fn crc8(data: &[u8]) -> u8 {
+    let mut crc: u8 = 0;
     for &b in data {
-        crc ^= b as u16;
+        crc ^= b;
         for _ in 0..8 {
             let odd = crc & 1;
             crc >>= 1;
             if odd != 0 {
-                crc ^= 0xA001;
+                crc ^= 0x8C;
             }
         }
     }
     crc
 }
 
-/// Build a complete on-wire frame (sync prefix + body + CRC).
+/// Build a complete on-wire frame: sync prefix + CMD + payload + CRC8.
+/// The CRC covers the payload only, matching the device.
 fn frame(cmd: u8, payload: &[u8]) -> Vec<u8> {
-    let mut body = Vec::with_capacity(3 + payload.len());
-    body.push(cmd);
-    body.push((payload.len() >> 8) as u8);
-    body.push((payload.len() & 0xFF) as u8);
-    body.extend_from_slice(payload);
-    let crc = crc16(&body);
-    let mut f = Vec::with_capacity(3 + body.len() + 2);
+    let mut f = Vec::with_capacity(SOF.len() + 1 + payload.len() + 1);
     f.extend_from_slice(&SOF);
-    f.extend_from_slice(&body);
-    f.push((crc >> 8) as u8);
-    f.push((crc & 0xFF) as u8);
+    f.push(cmd);
+    f.extend_from_slice(payload);
+    f.push(crc8(payload));
     f
+}
+
+/// Flash page size and boot-section start for a supported MCU, mirroring the
+/// per-target blocks in `std/bootloader.ik`. `None` if unsupported.
+fn bootloader_params(device: &str) -> Option<(usize, usize)> {
+    let d = device.trim().to_lowercase();
+    if !has_bootloader_support(&d) {
+        return None;
+    }
+    // 64 KB parts use 256-byte pages; the 32 KB mega parts use 128-byte pages.
+    // at90can32 is the only 32 KB part with 256-byte pages and a 0x6000 boot.
+    let params = match d.as_str() {
+        "at90can32" => (256, 0x6000),
+        "at90can64" => (256, 0xE000),
+        "atmega64" | "atmega64a" | "atmega640" | "atmega644" | "atmega644a" | "atmega644p" | "atmega644pa" | "atmega645" | "atmega645a" | "atmega645p" | "atmega6450" | "atmega6450a" | "atmega6450p" | "atmega649" | "atmega649a" | "atmega649p" | "atmega6490" | "atmega6490a" | "atmega6490p" => (256, 0xE000),
+        "atmega32" | "atmega32a" => (128, 0x7800),
+        _ => (128, 0x7000),
+    };
+    Some(params)
 }
 
 /// Decode an Intel HEX image into a flat byte vector starting at address 0.
@@ -140,63 +160,43 @@ fn exchange(port: &mut Port, f: &[u8], reply_timeout: Duration) -> Result<bool, 
     }
 }
 
-/// Device parameters returned by HELLO.
-struct Hello {
-    version: u8,
-    page_size: usize,
-    app_end: usize,
-}
-
-/// Handshake, retrying for `window` to cover the user resetting the board.
-fn hello(port: &mut Port, window: Duration, log: &dyn Fn(String)) -> Result<Hello, String> {
-    let f = frame(CMD_HELLO, &[]);
-    let deadline = Instant::now() + window;
-    log("Waiting for the bootloader — reset the board if nothing happens…".into());
-    while Instant::now() < deadline {
-        // Discard anything stale before each probe so a buffered reply from an
-        // earlier HELLO can't desync the rest of the session.
-        let _ = port.clear(serialport::ClearBuffer::Input);
-        if port.write_all(&f).is_ok() {
-            let _ = port.flush();
-            if read_byte(port, Instant::now() + Duration::from_millis(300)) == Some(ACK) {
-                let info_deadline = Instant::now() + Duration::from_millis(500);
-                let mut info = [0u8; 5];
-                let mut got = 0;
-                while got < 5 {
-                    match read_byte(port, info_deadline) {
-                        Some(b) => {
-                            info[got] = b;
-                            got += 1;
-                        }
-                        None => break,
-                    }
-                }
-                if got == 5 {
-                    // Drain any extra ACKs from HELLOs the device buffered while
-                    // it was starting up, so WRITE starts on a clean stream.
-                    std::thread::sleep(Duration::from_millis(50));
-                    let _ = port.clear(serialport::ClearBuffer::Input);
-                    return Ok(Hello {
-                        version: info[0],
-                        page_size: ((info[1] as usize) << 8) | info[2] as usize,
-                        app_end: ((info[3] as usize) << 8) | info[4] as usize,
-                    });
-                }
-            }
-        }
-    }
-    Err("no response from the bootloader (is it running, baud correct, board reset?)".into())
-}
-
-/// Write one page with retries.
-fn write_page(port: &mut Port, addr: u16, page: &[u8], log: &dyn Fn(String)) -> Result<(), String> {
+/// Build the WRITE frame for one page at `addr` (`page` already padded).
+fn write_frame(addr: u16, page: &[u8]) -> Vec<u8> {
     let mut payload = Vec::with_capacity(2 + page.len());
     payload.push((addr >> 8) as u8);
     payload.push((addr & 0xFF) as u8);
     payload.extend_from_slice(page);
-    let f = frame(CMD_WRITE, &payload);
+    frame(CMD_WRITE, &payload)
+}
+
+/// Write the first page, retrying across `window` to cover the user resetting
+/// the board. Any ACK proves the loader is live; this replaces the old HELLO
+/// probe — the first page is real work, not a throwaway handshake.
+fn write_first_page(port: &mut Port, f: &[u8], window: Duration, log: &dyn Fn(String)) -> Result<(), String> {
+    log("Waiting for the bootloader — reset the board if nothing happens…".into());
+    let deadline = Instant::now() + window;
+    loop {
+        // Drop stale input so a reply buffered during reset can't desync us.
+        let _ = port.clear(serialport::ClearBuffer::Input);
+        if port.write_all(f).is_ok() {
+            let _ = port.flush();
+            match read_byte(port, Instant::now() + Duration::from_millis(400)) {
+                Some(ACK) => return Ok(()),
+                Some(NAK) => {} // alive but rejected (CRC/garbled) — resend
+                Some(other) => return Err(format!("unexpected reply 0x{:02X}", other)),
+                None => {}
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err("no response from the bootloader (is it running, baud correct, board reset?)".into());
+        }
+    }
+}
+
+/// Write one page with retries (used after the board is known to be live).
+fn write_page(port: &mut Port, addr: u16, f: &[u8], log: &dyn Fn(String)) -> Result<(), String> {
     for attempt in 1..=5 {
-        match exchange(port, &f, Duration::from_millis(800)) {
+        match exchange(port, f, Duration::from_millis(800)) {
             Ok(true) => return Ok(()),
             Ok(false) => log(format!("  page @0x{:04X}: device NAK (attempt {}/5)", addr, attempt)),
             Err(e) => log(format!("  page @0x{:04X}: {} (attempt {}/5)", addr, e, attempt)),
@@ -205,12 +205,23 @@ fn write_page(port: &mut Port, addr: u16, page: &[u8], log: &dyn Fn(String)) -> 
     Err(format!("page @0x{:04X} failed after 5 attempts", addr))
 }
 
-/// Drive the whole upload. `log` receives human-readable progress lines.
-pub fn upload(port_name: &str, baud: u32, hex_path: &Path, log: &dyn Fn(String)) -> Result<(), String> {
+/// Drive the whole upload. `device` selects the page size and boot-section start
+/// (there is no on-wire HELLO). `log` receives human-readable progress lines.
+pub fn upload(device: &str, port_name: &str, baud: u32, hex_path: &Path, log: &dyn Fn(String)) -> Result<(), String> {
+    let (page_size, app_end) = bootloader_params(device)
+        .ok_or_else(|| format!("{} is not supported by the serial bootloader", device))?;
+
     let text = fs::read_to_string(hex_path).map_err(|e| format!("cannot read {:?}: {}", hex_path, e))?;
     let image = parse_ihex(&text)?;
     if image.is_empty() {
         return Err("the compiled image is empty".into());
+    }
+    if image.len() > app_end {
+        return Err(format!(
+            "image is {} B but the application section is only {} B — too large for this bootloader",
+            image.len(),
+            app_end
+        ));
     }
 
     let mut port: Port = serialport::new(port_name, baud)
@@ -218,20 +229,12 @@ pub fn upload(port_name: &str, baud: u32, hex_path: &Path, log: &dyn Fn(String))
         .open()
         .map_err(|e| format!("cannot open {} @ {} baud: {}", port_name, baud, e))?;
 
-    let info = hello(&mut port, Duration::from_secs(8), log)?;
     log(format!(
-        "Bootloader v{} — page {} B, application section ends at 0x{:04X}.",
-        info.version, info.page_size, info.app_end
+        "Bootloader target {} — page {} B, application section ends at 0x{:04X}.",
+        device, page_size, app_end
     ));
-    if image.len() > info.app_end {
-        return Err(format!(
-            "image is {} B but the application section is only {} B — too large for this bootloader",
-            image.len(),
-            info.app_end
-        ));
-    }
 
-    let page = info.page_size.max(2);
+    let page = page_size.max(2);
     let pages = image.len().div_ceil(page);
     log(format!("Programming {} B in {} page(s)…", image.len(), pages));
     for p in 0..pages {
@@ -239,7 +242,14 @@ pub fn upload(port_name: &str, baud: u32, hex_path: &Path, log: &dyn Fn(String))
         let mut chunk = vec![0xFFu8; page]; // pad the last page with the erased value
         let n = (image.len() - addr).min(page);
         chunk[..n].copy_from_slice(&image[addr..addr + n]);
-        write_page(&mut port, addr as u16, &chunk, log)?;
+        let f = write_frame(addr as u16, &chunk);
+        // The first page doubles as the liveness probe: retry it across the
+        // reset window. Once the board ACKs it, the rest use the normal retry.
+        if p == 0 {
+            write_first_page(&mut port, &f, Duration::from_secs(8), log)?;
+        } else {
+            write_page(&mut port, addr as u16, &f, log)?;
+        }
         log(format!("  page {}/{} @ 0x{:04X} ok", p + 1, pages, addr));
     }
 
@@ -308,9 +318,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn crc16_matches_std_arc() {
-        // CRC-16/ARC check value for "123456789" is 0xBB3D.
-        assert_eq!(crc16(b"123456789"), 0xBB3D);
+    fn crc8_matches_std_maxim() {
+        // CRC-8/MAXIM check value for "123456789" is 0xA1.
+        assert_eq!(crc8(b"123456789"), 0xA1);
     }
 
     #[test]
@@ -322,13 +332,27 @@ mod tests {
     }
 
     #[test]
-    fn frame_has_sync_and_crc() {
-        let f = frame(CMD_HELLO, &[]);
+    fn frame_has_sync_and_payload_crc() {
+        // RUN: empty payload, so the CRC over nothing is the init value 0.
+        let f = frame(CMD_RUN, &[]);
         assert_eq!(&f[0..3], &SOF);
-        assert_eq!(f[3], CMD_HELLO);
-        assert_eq!(&f[4..6], &[0x00, 0x00]); // len = 0
-        let crc = crc16(&[CMD_HELLO, 0x00, 0x00]);
-        assert_eq!(f[6], (crc >> 8) as u8);
-        assert_eq!(f[7], (crc & 0xFF) as u8);
+        assert_eq!(f[3], CMD_RUN);
+        assert_eq!(f[4], 0x00);
+        assert_eq!(f.len(), 5);
+
+        // WRITE: CRC covers the payload only, not CMD.
+        let payload = [0x12u8, 0x34, 0xAB, 0xCD];
+        let w = frame(CMD_WRITE, &payload);
+        assert_eq!(w[3], CMD_WRITE);
+        assert_eq!(&w[4..8], &payload);
+        assert_eq!(w[8], crc8(&payload));
+    }
+
+    #[test]
+    fn params_track_supported_parts() {
+        assert_eq!(bootloader_params("atmega328p"), Some((128, 0x7000)));
+        assert_eq!(bootloader_params("atmega640"), Some((256, 0xE000)));
+        assert_eq!(bootloader_params("at90can32"), Some((256, 0x6000)));
+        assert_eq!(bootloader_params("attiny85"), None);
     }
 }

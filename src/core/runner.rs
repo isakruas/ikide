@@ -44,6 +44,16 @@ fn out_hex_path(workspace_dir: &Option<PathBuf>, path: &PathBuf) -> PathBuf {
     }
 }
 
+/// HEX to flash for `selected_file`: the file itself when it is already a `.hex`,
+/// otherwise the compiled `build/<name>.hex` for an `.ik` source.
+fn upload_hex_path(workspace_dir: &Option<PathBuf>, path: &PathBuf) -> PathBuf {
+    if path.extension().map_or(false, |e| e.eq_ignore_ascii_case("hex")) {
+        path.clone()
+    } else {
+        out_hex_path(workspace_dir, path)
+    }
+}
+
 fn stats_from(a: &BuildArtifact) -> StatsData {
     let pct = |used: u32, total: u32| if total == 0 { 0 } else { used * 100 / total };
     StatsData {
@@ -448,10 +458,10 @@ mod avrdude_tests {
 
 /// Flash the already-built HEX through the ik serial bootloader running on the
 /// board, instead of an external programmer.
-pub fn spawn_bootloader_upload(workspace_dir: Option<PathBuf>, selected_file: Option<PathBuf>, port: String, baud: u32, tx: Sender<TaskMsg>) {
+pub fn spawn_bootloader_upload(workspace_dir: Option<PathBuf>, selected_file: Option<PathBuf>, device: String, port: String, baud: u32, tx: Sender<TaskMsg>) {
     thread::spawn(move || {
         if let Some(path) = selected_file {
-            let out_hex = out_hex_path(&workspace_dir, &path);
+            let out_hex = upload_hex_path(&workspace_dir, &path);
             let _ = tx.send(TaskMsg::Upload(format!(
                 "Flashing {:?} via the serial bootloader on {} @ {} baud…\n",
                 out_hex, port, baud
@@ -460,7 +470,7 @@ pub fn spawn_bootloader_upload(workspace_dir: Option<PathBuf>, selected_file: Op
             let log = move |line: String| {
                 let _ = log_tx.send(TaskMsg::Upload(format!("{}\n", line)));
             };
-            match crate::core::bootloader::upload(&port, baud, &out_hex, &log) {
+            match crate::core::bootloader::upload(&device, &port, baud, &out_hex, &log) {
                 Ok(()) => {}
                 Err(e) => {
                     let _ = tx.send(TaskMsg::Upload(format!("Bootloader upload failed: {}\n", e)));
@@ -476,7 +486,7 @@ pub fn spawn_bootloader_upload(workspace_dir: Option<PathBuf>, selected_file: Op
 pub fn spawn_upload(workspace_dir: Option<PathBuf>, selected_file: Option<PathBuf>, avrdude_path: String, target: String, programmer: String, port: String, baudrate: String, additional_flags: String, tx: Sender<TaskMsg>) {
     thread::spawn(move || {
         if let Some(path) = selected_file {
-            let out_hex = out_hex_path(&workspace_dir, &path);
+            let out_hex = upload_hex_path(&workspace_dir, &path);
             let part = avrdude_part(&target);
             let _ = tx.send(TaskMsg::Upload(format!("Uploading {:?} to board (target {} -> avrdude -p{})...\n", out_hex, target, part)));
 
